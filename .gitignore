@@ -1,0 +1,7 @@
+**/*.log
+*.cfg
+*.bin
+*.safetensors
+wandb/
+.envrc
+__pycache__/
