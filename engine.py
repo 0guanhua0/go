@@ -4,6 +4,13 @@ import sys
 import argparse
 from safetensors.torch import load_file
 
+# --- New Imports for TPU Support ---
+try:
+    import torch_xla.core.xla_model as xm
+    _TPU_AVAILABLE = True
+except ImportError:
+    _TPU_AVAILABLE = False
+
 # Local project imports
 import config
 from game import GoGameState
@@ -161,7 +168,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_simulations", type=int, default=config.NUM_SIMULATIONS_PLAY, help="Number of MCTS simulations per move.")
     args = parser.parse_args()
 
-    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    # --- Modified Device Selection for TPU ---
+    if _TPU_AVAILABLE:
+        device = xm.xla_device()
+    else:
+        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+
     sys.stderr.write(f"GoZero Engine using device: {device}\n")
     sys.stderr.write(f"MCTS simulations per move: {args.num_simulations}\n")
     sys.stderr.flush()

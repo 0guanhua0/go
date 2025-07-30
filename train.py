@@ -13,6 +13,13 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from safetensors.torch import save_file, load_file
 
+# --- New Imports for TPU Support ---
+try:
+    import torch_xla.core.xla_model as xm
+    _TPU_AVAILABLE = True
+except ImportError:
+    _TPU_AVAILABLE = False
+
 # Local project imports
 import config
 from game import GoGameState
@@ -129,14 +136,28 @@ def train_step(model, optimizer, replay_buffer, device):
     total_loss = policy_loss + value_loss
 
     total_loss.backward()
-    optimizer.step()
+
+    # --- Use xm.optimizer_step for TPU, standard optimizer.step for others ---
+    if _TPU_AVAILABLE and 'xla' in str(device):
+        # barrier=True is needed for multi-core, but safe for single-core.
+        xm.optimizer_step(optimizer, barrier=True)
+    else:
+        optimizer.step()
 
     return total_loss.item()
 
 def main():
     """Main training loop."""
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    # --- Modified Device Selection for TPU ---
+    if _TPU_AVAILABLE:
+        # Note: To use multiple TPU cores, you would use `torch_xla.distributed.xla_multiprocessing.spawn`
+        # and get the device with `device = xm.xla_device()` in each spawned process.
+        # For simplicity, this script is configured for a single TPU core.
+        device = xm.xla_device()
+    else:
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Using device: {device} ---")
+
 
     run = wandb.init(project=config.WANDB_PROJECT_NAME, id=config.WANDB_RUN_ID, resume="allow", job_type="training")
 
@@ -170,7 +191,11 @@ def main():
             scheduler.step() # Step scheduler once per training phase
 
             if last_loss is not None:
-                 print(f"  Training complete. Last loss: {last_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+                 # On TPU, use master_print to avoid interleaved output from multiple cores
+                 if _TPU_AVAILABLE:
+                     xm.master_print(f"  Training complete. Last loss: {last_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+                 else:
+                     print(f"  Training complete. Last loss: {last_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
         else:
             print("  Skipping training, replay buffer not full enough.")
 
@@ -183,6 +208,12 @@ def main():
         if game_num % config.CHECKPOINT_INTERVAL == 0:
             print(f"Checkpoint at game {game_num}. Saving model to W&B.")
             model_filename = "alphago-zero.safetensors"
+
+            # When using TPUs, xm.save is recommended. It handles saving from the XLA device.
+            # However, `model.state_dict()` will move tensors to CPU first, so safetensors should work fine.
+            if _TPU_AVAILABLE:
+                # On a multi-core setup, this should be guarded by `if xm.is_master_ordinal():`
+                pass
 
             save_file(model.state_dict(), model_filename)
 
