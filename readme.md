@@ -25,4 +25,7 @@
 
 # network
 residual network
+
 policy and value in one network
+
+# data pipeline
