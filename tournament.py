@@ -1,340 +1,296 @@
+import argparse
 import subprocess
-import sgfmill
 import sys
 import time
-import argparse
-import shlex  # Import shlex
 import os
-from sgfmill import sgf, sgf_moves, common
-from elo import Rating, rate_1vs1
+from itertools import combinations
 
-class GtpProcessPlayer:
-    """A wrapper for a Go engine that communicates via the Go Text Protocol (GTP)."""
-    def __init__(self, name, command):
+# sgfmill is used for robust SGF file creation
+from sgfmill import sgf
+
+# Local project imports
+from game import GoGameState # Uses the provided game logic for internal validation
+import config
+
+class Player:
+    """Represents a player (Go engine) in the tournament."""
+    def __init__(self, name, cmd, elo=1500):
         self.name = name
+        self.cmd = cmd.split()
+        self.elo = elo
+        self.process = None
+        self.gtp_log_file = None
 
-        # The command is now a single string from argparse.
-        # We must split it into a list for subprocess.Popen.
-        cmd_list = shlex.split(command)
-        if not cmd_list:
-            raise RuntimeError(f"Engine command for '{self.name}' is empty.")
+    def start(self):
+        """Starts the engine process."""
+        log_path = f"{self.name}_gtp.log"
+        self.gtp_log_file = open(log_path, "w")
+        self.process = subprocess.Popen(
+            self.cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.gtp_log_file,
+            text=True,
+            bufsize=1
+        )
 
-        try:
-            self.process = subprocess.Popen(
-                cmd_list,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # Line buffered
-                universal_newlines=True # Ensures cross-platform newline handling
-            )
-        except FileNotFoundError:
-             # Use the first element of the split command list for the error message
-             raise RuntimeError(f"Engine command not found for '{self.name}': {cmd_list[0]}")
-
-
-        # Health check: Give the process a moment to start up or fail.
-        time.sleep(1) # Increased for potentially slower-loading engines
-        if self.process.poll() is not None:
-            # The process terminated prematurely. Read stderr to find out why.
-            stderr_output = self.process.stderr.read()
-            raise RuntimeError(
-                f"Engine '{self.name}' failed to start. "
-                f"Return code: {self.process.poll()}\n"
-                # Use the original command string for the error message
-                f"Command: {command}\n"
-                f"Stderr:\n{stderr_output}"
-            )
+    def stop(self):
+        """Stops the engine process."""
+        if self.process:
+            try:
+                # Nicely ask the engine to quit
+                self.process.stdin.write("quit\n")
+                self.process.stdin.flush()
+                # Wait for a moment for a clean shutdown
+                self.process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, BrokenPipeError):
+                # If it doesn't respond, force it to stop
+                self.process.kill()
+            self.process = None
+        if self.gtp_log_file:
+            self.gtp_log_file.close()
+            self.gtp_log_file = None
 
     def send_command(self, command):
-        """Sends a GTP command and returns the engine's response."""
-        if self.process.poll() is not None:
-            sys.stderr.write(f"Cannot send command to '{self.name}', process has terminated.\n")
-            return "error"
-
+        """Sends a GTP command to the engine."""
+        if not self.process or self.process.poll() is not None:
+            print(f"Error: Process for {self.name} is not running.", file=sys.stderr)
+            return ""
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
 
         response = ""
-        # Read until the double newline that signifies the end of a GTP response
-        while not response.endswith("\n\n"):
+        while True:
             line = self.process.stdout.readline()
-            if not line:
-                # This can happen if the process dies while we are waiting for a response
-                if self.process.poll() is not None:
-                    sys.stderr.write(f"Engine '{self.name}' terminated unexpectedly.\n")
-                    # Try to get any final error messages
-                    stderr_output = self.process.stderr.read()
-                    if stderr_output:
-                        sys.stderr.write(f"Stderr from {self.name}:\n{stderr_output}\n")
+            if not line.strip():
+                # Empty line signifies end of response in GTP
                 break
             response += line
+        return response
 
-        response = response.strip()
+def parse_gtp_response(response):
+    """Parses a GTP response to extract the move or an error."""
+    lines = response.strip().split('\n')
+    for line in lines:
+        if line.startswith('='):
+            return line[1:].strip().lower()
+        if line.startswith('?'):
+            return f"ERROR: {line[1:].strip()}"
+    return "ERROR: No valid response"
 
-        # GTP responses start with '=' for success or '?' for failure
-        if response.startswith("="):
-            return response[1:].strip()
-        else:
-            sys.stderr.write(f"Error response from {self.name} for command '{command}': {response}\n")
-            return "error"
-
-    def close(self):
-        """Closes the engine process."""
-        if self.process.poll() is None:
-            try:
-                self.send_command("quit")
-            except BrokenPipeError:
-                # Process might have already died, which is fine.
-                pass
-            self.process.terminate()
-            # Wait a moment to ensure it closes
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-
-
-def play_game(black_player, white_player, board_size, komi):
+def update_elo(rating1, rating2, score1):
     """
-    Orchestrates a single game between two GTP players.
-    Returns the winner ('B' or 'W'), final score, reason, and the SGF game object.
+    Updates Elo ratings for two players based on a game result.
+    score1: 1 for player1 win, 0.5 for draw, 0 for player1 loss.
     """
-    # --- SGF Setup ---
-    game = sgf.Sgf_game(size=board_size)
+    K = 32 # K-factor, same as used in chess
+    expected1 = 1 / (1 + 10**((rating2 - rating1) / 400))
+    new_rating1 = rating1 + K * (score1 - expected1)
+    # The total change is zero-sum
+    new_rating2 = rating2 - (new_rating1 - rating1)
+    return round(new_rating1), round(new_rating2)
+
+def run_game(black_player, white_player, game_num, total_games, sgf_dir):
+    """
+    Manages a single game between two players, returns the winner ('B' or 'W').
+    This version uses the sgfmill library for robust SGF generation.
+    """
+    print(f"\n--- Game {game_num}/{total_games} ---")
+    print(f"Black: {black_player.name} ({black_player.elo}), White: {white_player.name} ({white_player.elo})")
+
+    black_player.start()
+    white_player.start()
+
+    internal_state = GoGameState(config.BOARD_SIZE)
+    GTP_COORD = "ABCDEFGHJKLMNOPQRST"
+
+    # --- SGFmill setup ---
+    game = sgf.Sgf_game(size=config.BOARD_SIZE)
     root_node = game.get_root()
     root_node.set('PB', black_player.name)
     root_node.set('PW', white_player.name)
-    root_node.set('KM', str(komi))
-    root_node.set('RU', 'Chinese') # A common default for AI games
-    current_sgf_node = root_node
+    root_node.set('KM', 7.5)
+    root_node.set('RU', 'Chinese')
+    current_node = root_node
+    winner = 'D' # Default to Draw
+    result_string = "0" # SGF result for Draw
 
-    # --- Engine Setup ---
-    for p in [black_player, white_player]:
-        p.send_command(f"boardsize {board_size}")
-        p.send_command(f"komi {komi}")
-        p.send_command("clear_board")
-
-    players = {'B': black_player, 'W': white_player}
-    colors = ['B', 'W']
-    passes = 0
-    turn = 0
-    move_log = []
-
-    winner, score_str, reason = None, "N/A", ""
-
-    while turn < (board_size * board_size * 2): # Add move limit to prevent infinite games
-        color_char = colors[turn % 2]
-        current_player = players[color_char]
-        other_player = players[colors[(turn + 1) % 2]]
-
-        move_cmd = f"genmove {color_char.lower()}"
-        raw_move = current_player.send_command(move_cmd)
-
-        if raw_move == "error":
-            print(f"Turn {turn+1}: {current_player.name} ({color_char}) returned an error. Game over.")
-            winner = colors[(turn + 1) % 2]
-            reason = "error"
-            break
-
-        # Sanitize move: some engines return comments after the move, e.g. 'Q16 # blah'
-        # We take only the first part.
-        try:
-            move = raw_move.split()[0]
-        except IndexError:
-            print(f"Turn {turn+1}: {current_player.name} ({color_char}) returned an empty move. Game over.")
-            winner = colors[(turn + 1) % 2]
-            reason = "illegal_move"
-            break
-
-        if move.lower() == "resign":
-            winner = colors[(turn + 1) % 2]
-            reason = "resign"
-            break
-
-        # SGF node creation
-        new_node = current_sgf_node.new_child()
-
-        try:
-            # Convert GTP vertex (e.g., "A19") to SGF coordinates (e.g., (0,0))
-            coordinates = common.move_from_vertex(move, board_size)
-            if coordinates is None:
-                # This handles 'pass', case-insensitively
-                passes += 1
-                new_node.set(color_char, None)
-            else:
-                passes = 0
-                new_node.set(color_char, coordinates)
-        except ValueError:
-            print(f"Turn {turn+1}: {current_player.name} ({color_char}) played illegal move (invalid format) {raw_move}. Game over.")
-            winner = colors[(turn + 1) % 2]
-            reason = "illegal_move"
-            break
-        current_sgf_node = new_node
-
-        play_cmd = f"play {color_char.lower()} {move}"
-        response = other_player.send_command(play_cmd)
-
-        move_log.append(f"Turn {turn+1}: {current_player.name} ({color_char}) plays {move}")
-        print(move_log[-1])
-
-        if response == "error":
-            print(f"Turn {turn+1}: {current_player.name} ({color_char}) played illegal move {move} (rejected by opponent). Game over.")
-            winner = colors[(turn + 1) % 2]
-            reason = "illegal_move"
-            break
-
-        if passes >= 2:
-            score_str = white_player.send_command("final_score")
-            print(f"Final Score: {score_str}")
-            reason = "score"
-            if score_str.upper().startswith('W'):
-                winner = 'W'
-            elif score_str.upper().startswith('B'):
-                winner = 'B'
-            else: # Draw or unknown format
-                winner = None
-                reason = "pass"
-            break
-
-        turn += 1
-
-    # --- Finalize SGF and Return ---
-    result_sgf_str = ""
-    if winner:
-        if reason == 'resign':
-            result_sgf_str = f"{winner}+R"
-        elif reason == 'illegal_move':
-            result_sgf_str = f"{winner}+Forfeit"
-        elif reason == 'score':
-            result_sgf_str = score_str # e.g., "B+10.5"
-    elif reason == 'pass': # Draw
-        result_sgf_str = "0"
-
-    if result_sgf_str:
-        root_node.set('RE', result_sgf_str)
-        root_node.set('GC', f"Game {len(move_log)} moves. {reason.capitalize()}.")
-
-    return winner, score_str, reason, game
-
-def run_tournament(args):
-    """Main function to run the tournament."""
     try:
-        player1 = GtpProcessPlayer(args.p1_name, args.p1_cmd)
-        player2 = GtpProcessPlayer(args.p2_name, args.p2_cmd)
-    except RuntimeError as e:
-        print(f"FATAL: Could not initialize an engine.\n{e}", file=sys.stderr)
-        sys.exit(1)
+        # Standard GTP setup
+        for p in [black_player, white_player]:
+            p.send_command(f"boardsize {config.BOARD_SIZE}")
+            p.send_command(f"komi 7.5")
+            p.send_command("clear_board")
 
-    # --- SGF Directory Setup ---
-    if args.sgf_dir:
+        for turn in range(1, config.BOARD_SIZE * config.BOARD_SIZE * 2 + 1):
+            player = black_player if internal_state.get_current_player() == 1 else white_player
+            opponent = white_player if internal_state.get_current_player() == 1 else black_player
+            color_char = 'B' if internal_state.get_current_player() == 1 else 'W'
+            color_lower = color_char.lower()
+
+            command = f"genmove {color_char}"
+            response = player.send_command(command)
+            move_str = parse_gtp_response(response)
+
+            print(f"Turn {turn}: {player.name} ({color_char}) plays {move_str}")
+
+            if move_str.startswith("ERROR"):
+                print(f"Error from {player.name}: {move_str}")
+                winner = 'W' if color_char == 'B' else 'B' # Opponent wins on error
+                result_string = f"{winner}+F" # Win by Forfeit
+                break
+            if move_str == "resign":
+                winner = 'W' if color_char == 'B' else 'B'
+                result_string = f"{winner}+R" # Win by Resignation
+                break
+
+            # Convert GTP move to coordinates for sgfmill and internal state
+            sgf_move = None # For pass
+            if move_str == "pass":
+                action = config.BOARD_SIZE * config.BOARD_SIZE
+            else:
+                try:
+                    col = GTP_COORD.find(move_str[0].upper())
+                    row = config.BOARD_SIZE - int(move_str[1:])
+                    if not (0 <= col < config.BOARD_SIZE and 0 <= row < config.BOARD_SIZE):
+                        raise ValueError("Coordinates out of bounds")
+                    action = row * config.BOARD_SIZE + col
+                    sgf_move = (row, col)
+                except (ValueError, IndexError):
+                    print(f"Illegal move format from {player.name}: {move_str}")
+                    winner = 'W' if color_char == 'B' else 'B'
+                    result_string = f"{winner}+F"
+                    break
+
+            # Validate and apply move internally
+            if action not in internal_state.get_legal_moves():
+                print(f"Illegal move by {player.name}: {move_str}")
+                winner = 'W' if color_char == 'B' else 'B' # Opponent wins
+                result_string = f"{winner}+F"
+                break
+
+            # Add the move to the SGF tree
+            new_node = current_node.new_child()
+            new_node.set_move(color_lower, sgf_move)
+            current_node = new_node
+
+            internal_state.apply_move(action)
+
+            # Inform opponent of the move
+            opponent.send_command(f"play {color_char} {move_str}")
+
+            game_over, winner_val = internal_state.is_game_over()
+            if game_over:
+                score = internal_state._get_winner()
+                winner = 'B' if score == 1 else 'W'
+                # We don't have the exact score from the game state, so we mark win by points.
+                result_string = f"{winner}+T" # Win by time/points
+                break
+        else: # Loop finished without a break (max moves reached)
+            winner = 'D'
+            result_string = "0"
+
+    finally:
+        # Set the final result in the SGF root node
+        root_node.set('RE', result_string)
+
+        # Save SGF file
+        sgf_filename = os.path.join(sgf_dir, f"{black_player.name}_vs_{white_player.name}_{int(time.time())}.sgf")
         try:
-            os.makedirs(args.sgf_dir, exist_ok=True)
-            print(f"Saving SGF files to '{os.path.abspath(args.sgf_dir)}'")
-        except OSError as e:
-            print(f"FATAL: Could not create SGF directory '{args.sgf_dir}': {e}", file=sys.stderr)
-            sys.exit(1)
-
-    # --- ELO RATING SETUP ---
-    p1_rating = Rating(args.p1_rating)
-    p2_rating = Rating(args.p2_rating)
-
-    print(f"--- Starting Tournament: {player1.name} vs {player2.name} ---")
-    print(f"Initial Ratings: {player1.name} = {p1_rating.rating:.0f}, {player2.name} = {p2_rating.rating:.0f}\n")
-
-    for i in range(args.num_games):
-        print(f"\n--- Game {i+1}/{args.num_games} ---")
-        if i % 2 == 0:
-            black_player, white_player = player1, player2
-            black_rating, white_rating = p1_rating, p2_rating
-        else:
-            black_player, white_player = player2, player1
-            black_rating, white_rating = p2_rating, p1_rating
-
-        print(f"Black: {black_player.name} ({black_rating.rating:.0f}), White: {white_player.name} ({white_rating.rating:.0f})")
-
-        try:
-            winner, score_str, reason, sgf_game = play_game(
-                black_player, white_player, args.board_size, args.komi
-            )
+            with open(sgf_filename, "wb") as f:
+                f.write(game.serialise())
+            print(f"SGF file saved to {sgf_filename}")
         except Exception as e:
-            print(f"An error occurred during game {i+1}: {e}", file=sys.stderr)
-            print("Aborting tournament.")
-            break
+            print(f"Error saving SGF file: {e}", file=sys.stderr)
 
-        # --- Save SGF ---
-        if args.sgf_dir and sgf_game:
-            # Sanitize player names for filename
-            b_sanitized = "".join(c for c in black_player.name if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
-            w_sanitized = "".join(c for c in white_player.name if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
-            ts = int(time.time())
-            filename = f"{b_sanitized}_vs_{w_sanitized}_{ts}.sgf"
-            filepath = os.path.join(args.sgf_dir, filename)
-            try:
-                with open(filepath, "wb") as f:
-                    f.write(sgf_game.serialise())
-                print(f"SGF file saved to {filepath}")
-            except IOError as e:
-                print(f"Error saving SGF file to {filepath}: {e}", file=sys.stderr)
+        # Ensure processes are stopped
+        black_player.stop()
+        white_player.stop()
 
-        # --- ELO RATING UPDATE ---
-        if winner == 'B':
-            print(f"Result: Black ({black_player.name}) wins by {reason}.")
-            black_rating, white_rating = rate_1vs1(black_rating, white_rating)
-        elif winner == 'W':
-            print(f"Result: White ({white_player.name}) wins by {reason}.")
-            white_rating, black_rating = rate_1vs1(white_rating, black_rating)
-        else:
-            print(f"Result: Draw (ended by {reason}).")
-            black_rating, white_rating = rate_1vs1(black_rating, white_rating, drawn=True)
+    return winner
 
-        # Update the main rating objects to reflect the new ratings for the next game
-        if black_player.name == player1.name:
-            p1_rating, p2_rating = black_rating, white_rating
-        else:
-            p2_rating, p1_rating = black_rating, white_rating
-
-        print(f"New Ratings: {player1.name} = {p1_rating.rating:.0f}, {player2.name} = {p2_rating.rating:.0f}")
-
-    player1.close()
-    player2.close()
-    print("\n--- Tournament Finished ---")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run a Go tournament between two GTP engines.",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="""
-Example - GoZero vs katago:
-  python tournament.py \\
-    --p1-name "GoZero" --p1-cmd "python engine.py --model_path alphago-zero.safetensors" \\
-    --p2-name "katago" --p2-cmd "katago gtp -model kata1-b28c512nbt-s9584861952-d4960414494.bin -config gtp_example.cfg"
-
-Example - katago vs katago:
-  python tournament.py \\
-    --p1-name "katago" --p1-cmd "katago gtp -model kata1-b28c512nbt-s9584861952-d4960414494.bin -config gtp_example.cfg" \\
-    --p2-name "katago" --p2-cmd "katago gtp -model kata1-b28c512nbt-s9584861952-d4960414494.bin -config gtp_example.cfg"
-
-Note: The command for each player (`--p1-cmd`, `--p2-cmd`) must be a single string.
-If the command contains spaces, it MUST be enclosed in quotes ("...").
-"""
-    )
-    parser.add_argument("--num_games", type=int, default=2, help="Number of games to play.")
-    parser.add_argument("--sgf-dir", type=str, default="sgf_games", help="Directory to save SGF game records. If not specified, defaults to 'sgf_games/'.")
-    parser.add_argument("--board-size", type=int, default=19, help="Board size for the games.")
-    parser.add_argument("--komi", type=float, default=7.5, help="Komi for the games.")
-
-
-    # Player 1 arguments
-    parser.add_argument("--p1-name", type=str, required=True, help="Name for player 1.")
-    parser.add_argument("--p1-cmd", type=str, required=True, help="Command to run player 1 engine (must be quoted).")
-    parser.add_argument("--p1-rating", type=int, default=1500, help="Initial ELO rating for player 1.")
-
-    # Player 2 arguments
-    parser.add_argument("--p2-name", type=str, required=True, help="Name for player 2.")
-    parser.add_argument("--p2-cmd", type=str, required=True, help="Command to run player 2 engine (must be quoted).")
-    parser.add_argument("--p2-rating", type=int, default=1500, help="Initial ELO rating for player 2.")
+def main():
+    parser = argparse.ArgumentParser(description="Round-robin Go tournament manager.")
+    parser.add_argument('--player', nargs=2, action='append', metavar=('NAME', 'CMD'),
+                        help='Add a player by name and command. Can be used multiple times.')
+    parser.add_argument('--games', type=int, default=2, help='Number of games per matchup.')
+    parser.add_argument('--sgf_dir', type=str, default='sgf_games', help='Directory to save SGF files.')
 
     args = parser.parse_args()
-    run_tournament(args)
+
+    if not args.player or len(args.player) < 2:
+        print("Please specify at least two players using --player NAME CMD", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.sgf_dir, exist_ok=True)
+    print(f"Saving SGF files to '{args.sgf_dir}'")
+
+    players = [Player(name, cmd) for name, cmd in args.player]
+
+    matchups = list(combinations(players, 2))
+    total_games = len(matchups) * args.games
+
+    print(f"--- Starting Tournament ---")
+    print(f"Players: {[p.name for p in players]}")
+    print(f"Matchups: {len(matchups)}, Games per matchup: {args.games}, Total games: {total_games}")
+
+    game_count = 0
+    for p1, p2 in matchups:
+        for i in range(args.games):
+            game_count += 1
+            # Alternate who plays black
+            black_player = p1 if i % 2 == 0 else p2
+            white_player = p2 if i % 2 == 0 else p1
+
+            winner = run_game(black_player, white_player, game_count, total_games, args.sgf_dir)
+
+            if winner == 'B':
+                print(f"Result: Black ({black_player.name}) wins.")
+                black_score, white_score = 1.0, 0.0
+            elif winner == 'W':
+                print(f"Result: White ({white_player.name}) wins.")
+                black_score, white_score = 0.0, 1.0
+            else: # Draw
+                print("Result: Draw.")
+                black_score, white_score = 0.5, 0.5
+
+            # Update Elo
+            b_elo, w_elo = black_player.elo, white_player.elo
+            black_player.elo, white_player.elo = update_elo(b_elo, w_elo, black_score)
+            print(f"New Ratings: {black_player.name} = {black_player.elo}, {white_player.name} = {white_player.elo}")
+
+
+    print("\n--- Tournament Finished ---")
+    print("Final Standings:")
+    sorted_players = sorted(players, key=lambda p: p.elo, reverse=True)
+    for p in sorted_players:
+        print(f"  {p.name}: {p.elo}")
+
+if __name__ == "__main__":
+    main()
+
+"""
+https://katagotraining.org/networks/
+
+kata1-b28c512nbt-s9914646272-d5047971554
+2025-07-26 11:37:06 UTC
+14055.6 ± 20.2 - (1,626 games)
+https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b28c512nbt-s9914646272-d5047971554.bin.gz
+
+https://raw.githubusercontent.com/lightvector/KataGo/refs/heads/master/cpp/configs/gtp_example.cfg
+"""
+
+"""
+python tournament.py \
+    --player "GoZero" "python engine.py --model_path alphago-zero.safetensors" \
+    --player "katago" "katago gtp -model <path_to_your_kata_model.bin.gz> -config <path_to_your_gtp_config.cfg>" \
+    --player "gnugo" "gnugo --mode gtp" \
+    --games 2
+"""
+"""
+python tournament.py \
+    --player "GoZero" "python engine.py --model_path alphago-zero.safetensors" \
+    --player "katago" "katago gtp -model kata1-b28c512nbt-s9914646272-d5047971554.bin.gz -config gtp_example.cfg" \
+    --player "gnugo" "gnugo --mode gtp" \
+    --games 2
+"""

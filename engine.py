@@ -15,7 +15,9 @@ except ImportError:
 import config
 from game import GoGameState
 from mcts_wrapper import NetworkWrapper
-from search import MCTS, MCTSNode
+# from search import MCTS, MCTSNode
+from go_zero_mcts_rs import MCTS, MCTSNode
+
 from network import AlphaGoZeroNet
 
 
@@ -98,9 +100,9 @@ class GTPEngine:
             return
 
         self.game_state.apply_move(best_action)
-        self.root_node = self.root_node.children.get(best_action, MCTSNode())
-        if self.root_node.parent:
-            self.root_node.parent = None # Prune the tree
+        child_node = self.root_node.get_child(best_action)
+        self.root_node = child_node if child_node is not None else MCTSNode()
+ 
 
         if best_action == self.board_size * self.board_size:
             self.respond("pass")
@@ -138,9 +140,9 @@ class GTPEngine:
         self.game_state.apply_move(action)
 
         # Advance the MCTS tree to the new state
-        if action in self.root_node.children:
-            self.root_node = self.root_node.children[action]
-            self.root_node.parent = None
+        child_node = self.root_node.get_child(action)
+        if child_node is not None:
+            self.root_node = child_node
         else:
             # If the opponent's move was not in our search tree, we must start a new tree
             self.root_node = MCTSNode()

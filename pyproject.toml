@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin"]
+build-backend = "maturin"
+
+[project]
+name = "go-zero-mcts-rs"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: implementation :: CPython",
+    "Programming Language :: Python :: implementation :: PyPy",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "go_zero_mcts_rs"
