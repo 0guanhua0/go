@@ -22,6 +22,15 @@ class MCTSNode:
         self.mean_action_value = {}  # Q: mean action-value for each action
         self.prior_prob = {}         # P: prior probability for each action
 
+    def get_child(self, action):
+        """
+        Retrieves the child node corresponding to a given action.
+        Matches the API used by mcts_rs.
+        :param action: The action leading to the child node.
+        :return: The child MCTSNode, or None if it doesn't exist.
+        """
+        return self.children.get(action)
+
     def is_leaf(self):
         """Checks if the node is a leaf node (i.e., has no children)."""
         return not self.children
@@ -128,6 +137,8 @@ class MCTS:
             state = root_state.clone()
             while not node.is_leaf():
                 action = node.select_action(self.c_puct)
+                if action is None: # Can happen if node has children but all have 0 prior
+                    break
                 path.append((node, action))
                 node = node.children[action]
                 state.apply_move(action)
@@ -218,7 +229,7 @@ class MCTS:
         powered_counts = {action: count**(1.0 / temp) for action, count in visit_counts.items()}
         total_powered_count = sum(powered_counts.values())
 
-        if total_powered_count == 0:
+        if total_powered_count < 1e-9:
             num_legal = len(visit_counts)
             return {action: 1.0 / num_legal for action in visit_counts} if num_legal > 0 else {}
 
