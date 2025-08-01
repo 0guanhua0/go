@@ -152,18 +152,13 @@ impl MCTS {
 
             let policy_item = result_tuple.get_item(0)?;
 
-            // --- FIX STARTS HERE ---
-            // The predict function always returns a 2D array, even for a single state.
-            // We must downcast to PyArray2 and then take the first row.
             let policy_array_2d = policy_item.downcast::<PyArray2<f32>>()?;
             let policy_readonly_2d = policy_array_2d.readonly();
             let policy_view = policy_readonly_2d.as_array();
 
-            // Extract the policy slice for the single root node from the (1, N) shaped array.
             let policy_slice = policy_view.row(0).to_slice().ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err("Could not get policy slice for root node.")
             })?;
-            // --- FIX ENDS HERE ---
 
             self._expand_node(root_state, root_node, policy_slice)?;
             self._add_dirichlet_noise(root_node);
