@@ -4,6 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "go-zero-mcts-rs"
+dependencies = [
+    "numpy",
+    "numba",
+    "pandas",
+    "sgfmill",
+    "requests",
+    "safetensors",
+    "torch",
+    "wandb",
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: implementation :: CPython",
@@ -13,3 +23,4 @@ classifiers = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "go_zero_mcts_rs"
+manifest-path = "mcts_rs/Cargo.toml"

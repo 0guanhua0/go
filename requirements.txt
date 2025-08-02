@@ -1,9 +1,0 @@
-numpy
-maturin
-numba
-pandas
-sgfmill
-requests
-safetensors
-torch
-wandb

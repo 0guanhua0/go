@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import sys
 import argparse
@@ -14,11 +15,37 @@ except ImportError:
 # Local project imports
 import config
 from game import GoGameState
-from mcts_wrapper import NetworkWrapper
-# from search import MCTS, MCTSNode
+# from mcts_wrapper import NetworkWrapper # <--- REMOVED THIS LINE
 from go_zero_mcts_rs import MCTS, MCTSNode
-
 from network import AlphaGoZeroNet
+
+
+class NetworkWrapper:
+    """
+    A simple wrapper for the neural network that matches the interface
+    expected by the MCTS implementation. It runs inference directly
+    on the model in the same process, suitable for a standalone GTP engine.
+    """
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+    def predict(self, state_tensor_batch):
+        """
+        Runs a forward pass on the network.
+        Args:
+            state_tensor_batch (torch.Tensor): A batch of state representations.
+        Returns:
+            tuple[np.ndarray, np.ndarray]: A tuple containing policy probabilities
+                                          and the predicted value for the batch.
+        """
+        input_tensor = state_tensor_batch.to(self.device)
+        with torch.no_grad():
+            policy_logits, value_preds = self.model(input_tensor)
+            # The MCTS expects numpy arrays
+            policy_probs_batch = F.softmax(policy_logits, dim=1).cpu().numpy()
+            value_preds_batch = value_preds.cpu().numpy()
+        return policy_probs_batch, value_preds_batch
 
 
 class GTPEngine:
@@ -42,6 +69,7 @@ class GTPEngine:
 
         # MCTS attributes
         self.num_simulations = num_simulations
+        # This now uses the new, local NetworkWrapper and will work correctly.
         wrapped_network = NetworkWrapper(self.model, self.device)
         self.mcts = MCTS(wrapped_network, config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
         self.root_node = MCTSNode()
@@ -102,7 +130,7 @@ class GTPEngine:
         self.game_state.apply_move(best_action)
         child_node = self.root_node.get_child(best_action)
         self.root_node = child_node if child_node is not None else MCTSNode()
- 
+
 
         if best_action == self.board_size * self.board_size:
             self.respond("pass")
