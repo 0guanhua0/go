@@ -191,25 +191,25 @@ def _get_representation_numba(board, history_list, current_player, board_size):
     """
     A fast, JIT-compiled version to create the 17-plane network input.
     """
-    state_tensor = np.zeros((1, 17, board_size, board_size), dtype=np.float32)
+    state_tensor = np.zeros((17, board_size, board_size), dtype=np.float32)
 
-    # Current board state (T=0)
-    state_tensor[0, 0, :, :] = (board == current_player)
-    state_tensor[0, 8, :, :] = (board == -current_player)
+    state_tensor[0, :, :] = (board == current_player)
+    state_tensor[8, :, :] = (board == -current_player)
 
     # History states (T-1 to T-7)
     # The history list is ordered from most recent (T-1) to oldest.
     history_len = min(7, len(history_list))
     for i in range(history_len):
         past_board = history_list[i]
-        state_tensor[0, i + 1, :, :] = (past_board == current_player)
-        state_tensor[0, 8 + i + 1, :, :] = (past_board == -current_player)
+        state_tensor[i + 1, :, :] = (past_board == current_player)
+        state_tensor[8 + i + 1, :, :] = (past_board == -current_player)
 
     # Color plane
     if current_player == 1: # Black to play
-        state_tensor[0, 16, :, :] = 1.0
+        state_tensor[16, :, :] = 1.0
 
     return state_tensor
+
 
 # --- GoGameState Class ---
 # The main class now acts as a wrapper around the fast JIT-compiled functions.

@@ -38,3 +38,6 @@ numba
 self play - 1 network forward pass + mcts
 train - loss + backpropagation
 eval - 2 networks forward pass + mcts
+
+
+Compact State Representation

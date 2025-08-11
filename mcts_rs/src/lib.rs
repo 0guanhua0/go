@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use numpy::{PyArray1, PyArray2, PyArrayMethods};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyListMethods};
 use pyo3::{Py, PyAny, Python};
@@ -147,7 +147,9 @@ impl MCTS {
         // --- 1. Root Expansion and Noise ---
         if root_node.is_leaf() {
             let state_repr = root_state.call_method0("get_representation")?;
-            let result_obj = self.network.call_method1(py, "predict", (state_repr,))?;
+            let batch_repr = state_repr.call_method1("unsqueeze", (0,))?;
+            let result_obj = self.network.call_method1(py, "predict", (batch_repr,))?;
+
             let result_tuple = result_obj.bind(py);
 
             let policy_item = result_tuple.get_item(0)?;
@@ -230,9 +232,8 @@ impl MCTS {
             }
 
             let torch = PyModule::import(py, "torch")?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("dim", 0)?;
-            let batch_tensor = torch.call_method("cat", (state_reps_list,), Some(&kwargs))?;
+            let batch_tensor = torch.call_method("stack", (state_reps_list, 0), None)?;
+
 
             let result_obj = self.network.call_method1(py, "predict", (batch_tensor,))?;
             let result_tuple = result_obj.bind(py);
@@ -242,14 +243,43 @@ impl MCTS {
             let policies = policies_array.readonly();
 
             let value_item = result_tuple.get_item(1)?;
-            let value_vec: Vec<f32> = if let Ok(arr2d) = value_item.downcast::<PyArray2<f32>>() {
-                arr2d.readonly().as_slice()?.to_vec()
-            } else {
-                let arr1d = value_item.downcast::<PyArray1<f32>>()?;
+            let value_vec: Vec<f32> = if let Ok(arr1d) = value_item.downcast::<PyArray1<f32>>() {
+                // This is the expected case: a 1D f32 array.
                 arr1d.readonly().as_slice()?.to_vec()
+            } else if let Ok(arr2d) = value_item.downcast::<PyArray2<f32>>() {
+                // This is a fallback for a 2D array of shape (N, 1).
+                if arr2d.ndim() == 2 && arr2d.shape()[1] == 1 {
+                    arr2d.readonly().as_slice()?.to_vec()
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "Value array from network has invalid 2D shape: {:?}, expected (N, 1)",
+                        arr2d.shape()
+                    )));
+                }
+            } else {
+                // If it's neither, raise a clear error.
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "Value from network must be a 1D or 2D NumPy array of f32.",
+                ));
             };
 
             let policies_view = policies.as_array();
+
+            let num_results = policies_view.shape()[0];
+            if num_results != leaves_to_evaluate.len() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Network returned {} results, but {} states were sent for evaluation. Mismatch.",
+                    num_results, leaves_to_evaluate.len()
+                )));
+            }
+
+            if policies_view.shape()[0] != value_vec.len() {
+                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Policy batch size ({}) and value batch size ({}) do not match.",
+                    policies_view.shape()[0], value_vec.len()
+                )));
+            }
+
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
                 let policy_row = policies_view.row(i);
                 let policy_slice = policy_row.to_slice().ok_or_else(|| {
