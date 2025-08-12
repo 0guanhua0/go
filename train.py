@@ -131,11 +131,8 @@ def init_worker(request_queue, result_pipes, shared_replay_buffer):
     g_result_pipes = result_pipes
     g_shared_replay_buffer = shared_replay_buffer
 
-# =================================================================================
-# === ACCELERATOR WORKER: THE CENTRALIZED DEVICE PROCESS (GPU/TPU) ==============
-# =================================================================================
 
-class AcceleratorWorker(Process):
+class gpu_worker(Process):
     """
     A single, dedicated process for ALL accelerator operations (GPU or TPU).
     It handles inference, training, and model weight management.
@@ -162,10 +159,10 @@ class AcceleratorWorker(Process):
             import torch_xla.core.xla_model as xm
             self.xm = xm
             self.device = self.xm.xla_device()
-            print(f"AcceleratorWorker: Initializing for TPU on device: {self.device}")
+            print(f"gpu_worker: Initializing for TPU on device: {self.device}")
         else:
             self.device = torch.device(self.device_str)
-            print(f"AcceleratorWorker: Initializing for {self.device_str.upper()} on device: {self.device}")
+            print(f"gpu_worker: Initializing for {self.device_str.upper()} on device: {self.device}")
 
         # --- Step 2: Initialize Models ---
         common_args = (config.BOARD_SIZE, config.NUM_RES_BLOCKS, config.IN_CHANNELS, config.NUM_FILTERS)
@@ -178,87 +175,68 @@ class AcceleratorWorker(Process):
             model.eval()
 
         # --- Step 3: Initialize Optimizer ---
-        print("AcceleratorWorker: Initializing optimizer and scheduler...")
+        print("gpu_worker: Initializing optimizer and scheduler...")
         self.optimizer = optim.SGD(self.models['next'].parameters(), lr=config.INITIAL_LR, momentum=0.9, weight_decay=config.L2_REGULARIZATION)
         self.scheduler = MultiStepLR(self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1)
-        print("AcceleratorWorker: Initialization complete.")
+        print("gpu_worker: Initialization complete.")
 
 
     def run(self):
         self._initialize_hardware_and_models()
 
-        BATCHING_WINDOW_SECONDS = 0.1
-
         while not self.stop_event.is_set():
-            requests_by_model = {'best': [], 'next': []}
-
-            # Wait for the first item without a busy-wait
             try:
+                # Wait for a single request from any worker.
                 command, payload = self.request_queue.get(timeout=0.1)
             except Empty:
                 continue
 
-            # 2. Handle the first request received.
+            # Process the received request.
             if command == 'INFER':
+                # This is an inference request. Process it immediately without
+                # waiting to batch it with other incoming requests.
                 worker_id, model_name, tensor = payload
+                requests_by_model = {'best': [], 'next': []}
                 if model_name in requests_by_model:
                     requests_by_model[model_name].append((worker_id, tensor))
+                self._process_inference_batch(requests_by_model)
             else:
-                # If it's a high-priority command (not inference), handle it and loop again.
+                # This is a high-priority command (training, checkpointing, etc.).
                 self._handle_command(command, payload)
-                continue
-
-            # 3. Collect more inference requests to form a batch.
-            start_time = time.time()
-            while time.time() - start_time < BATCHING_WINDOW_SECONDS:
-                try:
-                    command, payload = self.request_queue.get(block=False)
-                    if command == 'INFER':
-                        worker_id, model_name, tensor = payload
-                        if model_name in requests_by_model:
-                            requests_by_model[model_name].append((worker_id, tensor))
-                    else:
-                        self._handle_command(command, payload)
-                        break # Stop collecting after a high-priority command
-                except Empty:
-                    break # Queue is empty, stop collecting
-
-            # 4. Process the completed inference batch.
-            self._process_inference_batch(requests_by_model)
 
     def _handle_command(self, command, payload):
-        """Handles non-inference commands directed to the AcceleratorWorker."""
+        """Handles non-inference commands directed to the gpu_worker."""
         if command == 'TRAIN_BATCH':
             loss = self._train_step(*payload)
             self.main_pipe.send({'status': 'TRAIN_DONE', 'loss': loss})
         elif command == 'PROMOTE_NEXT':
             self.models['best'].load_state_dict(self.models['next'].state_dict())
             self.models['best'].eval()
-            print("AcceleratorWorker: Promoted 'next' to 'best'.")
+            print("gpu_worker: Promoted 'next' to 'best'.")
         elif command == 'RESET_NEXT':
             self.models['next'].load_state_dict(self.models['best'].state_dict())
-            print("AcceleratorWorker: Reset 'next' weights to 'best'.")
+            print("gpu_worker: Reset 'next' weights to 'best'.")
         elif command == 'STEP_SCHEDULER':
             self.scheduler.step()
-            print(f"AcceleratorWorker: Stepped LR scheduler. New LR: {self.scheduler.get_last_lr()[0]:.2e}")
+            print(f"gpu_worker: Stepped LR scheduler. New LR: {self.scheduler.get_last_lr()[0]:.2e}")
         elif command == 'GET_CHECKPOINT_DATA':
-            print("AcceleratorWorker: Gathering best model state for lightweight checkpoint...")
+            print("gpu_worker: Gathering best model state for lightweight checkpoint...")
             states = {
                 'best_model_state_dict': {k: v.cpu() for k, v in self.models['best'].state_dict().items()}
             }
             self.main_pipe.send(states)
         elif command == 'LOAD_CHECKPOINT_DATA':
             states = payload
-            print("AcceleratorWorker: Loading best model state from lightweight checkpoint...")
+            print("gpu_worker: Loading best model state from lightweight checkpoint...")
             self.models['best'].load_state_dict(states['best_model_state_dict'])
             self.models['best'].eval()
-            print("AcceleratorWorker: Resetting 'next' model, optimizer, and scheduler based on new 'best' model.")
+            print("gpu_worker: Resetting 'next' model, optimizer, and scheduler based on new 'best' model.")
             self.models['next'].load_state_dict(self.models['best'].state_dict())
             self.models['next'].eval()
             self.optimizer = optim.SGD(self.models['next'].parameters(), lr=config.INITIAL_LR, momentum=0.9, weight_decay=config.L2_REGULARIZATION)
             self.scheduler = MultiStepLR(self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1)
             self.main_pipe.send({'status': 'LOAD_DONE'})
-            print("AcceleratorWorker: Lightweight checkpoint loading complete.")
+            print("gpu_worker: Lightweight checkpoint loading complete.")
         elif command == 'STOP':
             self.stop()
     def _process_inference_batch(self, requests_by_model):
@@ -319,7 +297,7 @@ class AcceleratorWorker(Process):
 # === CPU POOL TASKS & DATA COMPONENTS (No changes needed here) ===================
 # =================================================================================
 class NetworkWrapper:
-    """A proxy to the AcceleratorWorker for model inference."""
+    """A proxy to the gpu_worker for model inference."""
     def __init__(self, worker_id, model_id):
         self.worker_id = worker_id
         self.model_id = model_id
@@ -327,7 +305,7 @@ class NetworkWrapper:
 
     def predict(self, state_tensor_batch):
         """
-        Sends an inference request to the AcceleratorWorker and waits for the result.
+        Sends an inference request to the gpu_worker and waits for the result.
         This method now assumes the input tensor ALWAYS has a batch dimension.
         """
         if not isinstance(state_tensor_batch, torch.Tensor):
@@ -459,16 +437,16 @@ def main(args):
         print(f"  Loaded ELO for 'best' model: {start_elo:.0f}")
         print("  Replay buffer will be populated by new self-play games.")
         gpu_states = {'best_model_state_dict': checkpoint['best_model_state_dict']}
-        print("  Requesting AcceleratorWorker to load best model state...")
+        print("  Requesting gpu_worker to load best model state...")
         gpu_request_queue.put(('LOAD_CHECKPOINT_DATA', gpu_states))
         response = main_gpu_pipe_recv.recv()
-        if response.get('status') != 'LOAD_DONE': raise RuntimeError(f"Failed to load checkpoint on AcceleratorWorker. Response: {response}")
-        print("  AcceleratorWorker confirmed state load.")
+        if response.get('status') != 'LOAD_DONE': raise RuntimeError(f"Failed to load checkpoint on gpu_worker. Response: {response}")
+        print("  gpu_worker confirmed state load.")
         print(f"--- Resuming training from generation {start_generation} ---")
         return start_generation, start_elo
 
     # --- START ACCELERATOR WORKER ---
-    accelerator_worker = AcceleratorWorker(gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device)
+    accelerator_worker = gpu_worker(gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device)
     accelerator_worker.daemon = True
     accelerator_worker.start()
 
@@ -476,7 +454,7 @@ def main(args):
     shared_replay_buffer = SharedReplayBuffer( capacity=config.REPLAY_BUFFER_SIZE, board_size=config.BOARD_SIZE, in_channels=config.IN_CHANNELS )
     pool_init_args = (gpu_request_queue, worker_conns, shared_replay_buffer)
     cpu_worker_pool = Pool( processes=num_cpu_workers, initializer=init_worker, initargs=pool_init_args )
-    print(f"Started a CPU worker pool with {num_cpu_workers} workers and 1 AcceleratorWorker process.")
+    print(f"Started a CPU worker pool with {num_cpu_workers} workers and 1 gpu_worker process.")
 
     start_generation = 1
     best_model_elo = config.ELO_INITIAL
@@ -575,7 +553,7 @@ def main(args):
         final_model_artifact.add_file("alphago-zero.safetensors")
         run.log_artifact(final_model_artifact)
         print("  Final model artifact uploaded to W&B.")
-    else: print("  Could not retrieve model state from AcceleratorWorker.")
+    else: print("  Could not retrieve model state from gpu_worker.")
     if 'generation' in locals(): save_checkpoint(final_generation, best_model_elo, run, config)
     cpu_worker_pool.terminate(); cpu_worker_pool.join(); accelerator_worker.terminate(); accelerator_worker.join()
     gpu_request_queue.close(); gpu_request_queue.join_thread()
