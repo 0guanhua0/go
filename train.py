@@ -136,7 +136,8 @@ class gpu_worker(Process):
     """
     A single, dedicated process for ALL accelerator operations (GPU or TPU).
     It handles inference, training, and model weight management.
-    It listens for commands on a single request queue.
+    It listens for commands on a single request queue and uses dynamic
+    batching to maximize inference throughput.
     """
     def __init__(self, request_queue, result_pipes, main_pipe, device_str):
         super().__init__()
@@ -184,25 +185,52 @@ class gpu_worker(Process):
     def run(self):
         self._initialize_hardware_and_models()
 
+        # --- Constants for Dynamic Batching ---
+        # Max batch size should be tuned. A good start is the training batch size.
+        MAX_INFERENCE_BATCH_SIZE = config.BATCH_SIZE
+        # Max time to wait to fill a batch (in seconds). Balances latency and throughput.
+        MAX_WAIT_TIME_S = 0.005 # 5 milliseconds
+
+        # State for the current accumulating batch
+        requests_by_model = {'best': [], 'next': []}
+        current_batch_size = 0
+
         while not self.stop_event.is_set():
             try:
-                # Wait for a single request from any worker.
-                command, payload = self.request_queue.get(timeout=0.1)
-            except Empty:
-                continue
+                # If we have a partial batch, use a short timeout.
+                # Otherwise, wait longer for the first request to arrive.
+                timeout = MAX_WAIT_TIME_S if current_batch_size > 0 else 0.1
+                command, payload = self.request_queue.get(timeout=timeout)
 
-            # Process the received request.
-            if command == 'INFER':
-                # This is an inference request. Process it immediately without
-                # waiting to batch it with other incoming requests.
-                worker_id, model_name, tensor = payload
-                requests_by_model = {'best': [], 'next': []}
-                if model_name in requests_by_model:
-                    requests_by_model[model_name].append((worker_id, tensor))
-                self._process_inference_batch(requests_by_model)
-            else:
-                # This is a high-priority command (training, checkpointing, etc.).
-                self._handle_command(command, payload)
+                if command == 'INFER':
+                    worker_id, model_name, tensor = payload
+                    if model_name in requests_by_model:
+                        requests_by_model[model_name].append((worker_id, tensor))
+                        current_batch_size += tensor.shape[0]
+                else:
+                    # A high-priority command was received.
+                    # First, process any pending inference requests.
+                    if current_batch_size > 0:
+                        self._process_inference_batch(requests_by_model)
+                        requests_by_model = {'best': [], 'next': []}
+                        current_batch_size = 0
+                    # Then, handle the high-priority command.
+                    self._handle_command(command, payload)
+                    continue # Restart the loop
+
+                # If the batch is full, process it immediately.
+                if current_batch_size >= MAX_INFERENCE_BATCH_SIZE:
+                    self._process_inference_batch(requests_by_model)
+                    requests_by_model = {'best': [], 'next': []}
+                    current_batch_size = 0
+
+            except Empty:
+                # This exception means the queue.get() timed out.
+                # Process whatever we have accumulated so far.
+                if current_batch_size > 0:
+                    self._process_inference_batch(requests_by_model)
+                    requests_by_model = {'best': [], 'next': []}
+                    current_batch_size = 0
 
     def _handle_command(self, command, payload):
         """Handles non-inference commands directed to the gpu_worker."""
@@ -239,6 +267,7 @@ class gpu_worker(Process):
             print("gpu_worker: Lightweight checkpoint loading complete.")
         elif command == 'STOP':
             self.stop()
+
     def _process_inference_batch(self, requests_by_model):
         """Runs inference for a batch of requests for each model."""
         for model_name, model_requests in requests_by_model.items():
@@ -260,6 +289,8 @@ class gpu_worker(Process):
                 end_index = start_index + num_samples
                 policy_result = policy_probs_batch[start_index:end_index]
                 value_result = value_preds_batch[start_index:end_index]
+                # In the original code, the value had an extra dimension.
+                # Squeezing it here simplifies downstream processing.
                 self.result_pipes[worker_id].send((policy_result, value_result.squeeze(-1)))
                 start_index = end_index
 
@@ -461,7 +492,6 @@ def main(args):
     if run.resumed:
         start_generation, best_model_elo = load_checkpoint(run, config)
 
-    # --- MAIN TRAINING LOOP (No major changes needed) ---
     active_sp_tasks = {}
     def dispatch_sp_task(worker_id, gen_num): return cpu_worker_pool.apply_async(play_game_task, args=(worker_id, gen_num))
     min_initial_data = config.BATCH_SIZE * 20
