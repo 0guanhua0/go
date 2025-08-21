@@ -16,9 +16,10 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue, Event, set_start_method, Pipe, Pool
 
 import config
-from game import GoGameState
+# from game import GoGameState # This is now replaced by the faster Rust version
 from network import AlphaGoZeroNet
-from go_zero_mcts_rs import MCTS, MCTSNode
+# Import the Rust implementation of GoGameState along with MCTS components
+from go_zero_mcts_rs import GoGameState, MCTS, MCTSNode
 from elo import Rating, update_ratings, calculate_expected_score
 import wandb
 
@@ -41,13 +42,14 @@ class SharedReplayBuffer:
         value_shape = (capacity, 1)
 
         # Calculate approximate memory size for user feedback
-        state_bytes = capacity * in_channels * board_size * board_size * 1 # torch.uint8 = 1 byte
-        policy_bytes = capacity * (board_size * board_size + 1) * 4       # torch.float32 = 4 bytes
-        value_bytes = capacity * 1 * 4                                    # torch.float32 = 4 bytes
+        state_bytes = capacity * in_channels * board_size * board_size * 4
+        policy_bytes = capacity * (board_size * board_size + 1) * 4
+        value_bytes = capacity * 1 * 4
+
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
         print(f"Allocating shared memory for replay buffer (~{total_gb:.2f} GB)...")
 
-        self.states = torch.zeros(state_shape, dtype=torch.uint8)
+        self.states = torch.zeros(state_shape, dtype=torch.float32)
         self.policies = torch.zeros(policy_shape, dtype=torch.float32)
         self.values = torch.zeros(value_shape, dtype=torch.float32)
 
@@ -64,7 +66,7 @@ class SharedReplayBuffer:
         # Convert data to tensors before acquiring lock
         states, policies, values = zip(*game_data)
 
-        state_tensors = torch.stack(states).to(torch.uint8)
+        state_tensors = torch.stack(states)
 
         policy_tensors = torch.from_numpy(np.array(policies, dtype=np.float32))
         value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(1)
@@ -126,11 +128,9 @@ def init_worker(request_queue, result_pipes, shared_replay_buffer):
     Stores shared resources as global variables in the worker's context.
     """
     global g_request_queue, g_result_pipes, g_shared_replay_buffer
-    print(f"Initializing worker {os.getpid()}...")
     g_request_queue = request_queue
     g_result_pipes = result_pipes
     g_shared_replay_buffer = shared_replay_buffer
-
 
 class gpu_worker(Process):
     """
@@ -179,58 +179,70 @@ class gpu_worker(Process):
         print("gpu_worker: Initializing optimizer and scheduler...")
         self.optimizer = optim.SGD(self.models['next'].parameters(), lr=config.INITIAL_LR, momentum=0.9, weight_decay=config.L2_REGULARIZATION)
         self.scheduler = MultiStepLR(self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1)
-        print("gpu_worker: Initialization complete.")
+        print("gpu_worker: Initialization complete.", flush=True)
 
+    # =========================================================================
+    # === REVISED METHODS START HERE ==========================================
+    # =========================================================================
 
     def run(self):
+        """Main loop: waits for commands and processes them in batches."""
         self._initialize_hardware_and_models()
 
-        # --- Constants for Dynamic Batching ---
-        # Max batch size should be tuned. A good start is the training batch size.
-        MAX_INFERENCE_BATCH_SIZE = config.BATCH_SIZE
-        # Max time to wait to fill a batch (in seconds). Balances latency and throughput.
-        MAX_WAIT_TIME_S = 0.005 # 5 milliseconds
-
-        # State for the current accumulating batch
-        requests_by_model = {'best': [], 'next': []}
-        current_batch_size = 0
-
         while not self.stop_event.is_set():
+            # This loop implements dynamic batching. It will wait for the first
+            # request and then gather any other requests that have arrived in
+            # the meantime, up to a small timeout.
             try:
-                # If we have a partial batch, use a short timeout.
-                # Otherwise, wait longer for the first request to arrive.
-                timeout = MAX_WAIT_TIME_S if current_batch_size > 0 else 0.1
-                command, payload = self.request_queue.get(timeout=timeout)
-
-                if command == 'INFER':
-                    worker_id, model_name, tensor = payload
-                    if model_name in requests_by_model:
-                        requests_by_model[model_name].append((worker_id, tensor))
-                        current_batch_size += tensor.shape[0]
-                else:
-                    # A high-priority command was received.
-                    # First, process any pending inference requests.
-                    if current_batch_size > 0:
-                        self._process_inference_batch(requests_by_model)
-                        requests_by_model = {'best': [], 'next': []}
-                        current_batch_size = 0
-                    # Then, handle the high-priority command.
-                    self._handle_command(command, payload)
-                    continue # Restart the loop
-
-                # If the batch is full, process it immediately.
-                if current_batch_size >= MAX_INFERENCE_BATCH_SIZE:
-                    self._process_inference_batch(requests_by_model)
-                    requests_by_model = {'best': [], 'next': []}
-                    current_batch_size = 0
-
+                # Block until the first command arrives.
+                command, payload = self.request_queue.get(timeout=1.0)
             except Empty:
-                # This exception means the queue.get() timed out.
-                # Process whatever we have accumulated so far.
-                if current_batch_size > 0:
-                    self._process_inference_batch(requests_by_model)
-                    requests_by_model = {'best': [], 'next': []}
-                    current_batch_size = 0
+                continue # No requests, just loop back and wait.
+
+            # We have at least one command. Drain the queue for more.
+            other_commands, requests_by_model = self._drain_queue(command, payload)
+
+            # Process the batch of inference requests first.
+            if requests_by_model:
+                self._process_inference_batch(requests_by_model)
+
+            # Then, handle any other commands (training, checkpointing, etc.)
+            for cmd, pld in other_commands:
+                self._handle_command(cmd, pld)
+
+    def _drain_queue(self, first_cmd, first_payload):
+        """
+        Gathers all pending commands from the queue.
+        Separates inference requests from other commands.
+        """
+        other_commands = []
+        requests_by_model = {'best': [], 'next': []}
+
+        # Process the first command we already received
+        if first_cmd == 'INFER':
+            worker_id, model_name, numpy_array = first_payload
+            requests_by_model[model_name].append((worker_id, numpy_array))
+        else:
+            other_commands.append((first_cmd, first_payload))
+
+        # Non-blockingly check for any other commands in the queue.
+        while True:
+            try:
+                command, payload = self.request_queue.get_nowait()
+                if command == 'INFER':
+                    worker_id, model_name, numpy_array = payload
+                    requests_by_model[model_name].append((worker_id, numpy_array))
+                else:
+                    other_commands.append((command, payload))
+            except Empty:
+                # The queue is empty, we've gathered all pending requests.
+                break
+
+        return other_commands, requests_by_model
+
+    # =========================================================================
+    # === UNCHANGED METHODS (But included for completeness) ===================
+    # =========================================================================
 
     def _handle_command(self, command, payload):
         """Handles non-inference commands directed to the gpu_worker."""
@@ -274,8 +286,12 @@ class gpu_worker(Process):
             if not model_requests:
                 continue
 
-            worker_ids, tensors = zip(*model_requests)
-            batch = torch.cat(tensors, dim=0).to(self.device, non_blocking=True).float()
+            worker_ids, numpy_arrays = zip(*model_requests)
+
+            batch_numpy = np.concatenate(numpy_arrays, axis=0)
+            batch_tensor = torch.from_numpy(batch_numpy).float()
+            batch = batch_tensor.to(self.device)
+
             model = self.models[model_name]
 
             with torch.no_grad():
@@ -285,12 +301,10 @@ class gpu_worker(Process):
 
             start_index = 0
             for i, worker_id in enumerate(worker_ids):
-                num_samples = tensors[i].shape[0]
+                num_samples = numpy_arrays[i].shape[0]
                 end_index = start_index + num_samples
                 policy_result = policy_probs_batch[start_index:end_index]
                 value_result = value_preds_batch[start_index:end_index]
-                # In the original code, the value had an extra dimension.
-                # Squeezing it here simplifies downstream processing.
                 self.result_pipes[worker_id].send((policy_result, value_result.squeeze(-1)))
                 start_index = end_index
 
@@ -333,17 +347,25 @@ class NetworkWrapper:
         self.worker_id = worker_id
         self.model_id = model_id
         assert self.model_id in ['best', 'next'], "NetworkWrapper model_id must be 'best' or 'next'."
-
-    def predict(self, state_tensor_batch):
+    def predict(self, state_batch):
         """
         Sends an inference request to the gpu_worker and waits for the result.
-        This method now assumes the input tensor ALWAYS has a batch dimension.
+        The input from Rust can be a NumPy array or a torch.Tensor. We ensure
+        it is a NumPy array before sending it over the queue.
         """
-        if not isinstance(state_tensor_batch, torch.Tensor):
-            state_tensor_batch = torch.from_numpy(state_tensor_batch)
+        # --- CHANGE STARTS HERE ---
+        if isinstance(state_batch, torch.Tensor):
+            # If Rust somehow created a tensor, convert it back to numpy for serialization
+            state_batch = state_batch.cpu().numpy()
 
-        assert state_tensor_batch.ndim == 4, "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
-        g_request_queue.put(('INFER', (self.worker_id, self.model_id, state_tensor_batch)))
+        # We now know state_batch is a NumPy array
+        assert isinstance(state_batch, np.ndarray), "Input to predict must be a NumPy array."
+        assert state_batch.ndim == 4, "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
+
+        # Send the NumPy array, NOT a torch tensor.
+        g_request_queue.put(('INFER', (self.worker_id, self.model_id, state_batch)))
+        # --- CHANGE ENDS HERE ---
+
         policy_probs, value = g_result_pipes[self.worker_id].recv()
         return policy_probs, value
 
@@ -352,7 +374,9 @@ def play_game_task(worker_id, generation_num):
     game_data = play_game(network_wrapper, generation_num)
     if game_data:
         g_shared_replay_buffer.add(game_data)
+        print(f"  [CPU Worker {worker_id}] Game finished ({len(game_data)} moves). Buffer size: {len(g_shared_replay_buffer)}", flush=True)
         return len(game_data)
+    print(f"  [CPU Worker {worker_id}] Game finished with no data.", flush=True)
     return 0
 
 def evaluate_game_task(worker_id, is_next_black):
@@ -360,21 +384,30 @@ def evaluate_game_task(worker_id, is_next_black):
     best_wrapper = NetworkWrapper(worker_id, model_id='best')
     winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
     return winner_result
-
 def play_game(network_wrapper, generation_num):
+    # This now correctly creates an instance of the fast Rust GoGameState
     game_state = GoGameState(config.BOARD_SIZE)
-    mcts = MCTS(network_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
+    mcts = MCTS(network_wrapper, config.C_PUCT
+, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
     root_node = MCTSNode()
     game_history = []
+    # get_representation() now correctly returns a NumPy array from Rust
     state_repr = game_state.get_representation()
+
     while True:
         game_over, winner = game_state.is_game_over()
         if game_over: break
-        mcts.run_simulations(root_node, game_state.clone(), config.NUM_SIMULATIONS_TRAIN)
+
+        # ----- CHANGE 2: Remove unnecessary clone in Python -----
+        # The Rust code already clones the state internally where needed.
+        # This avoids cloning the object twice.
+        mcts.run_simulations(root_node, game_state, config.NUM_SIMULATIONS)
+
         if generation_num > 5 and not root_node.is_leaf():
             move_probs_det = mcts.get_move_probs(root_node, temp=0)
             if move_probs_det:
                 best_action = max(move_probs_det, key=move_probs_det.get)
+                # Note: .mean_action_value is a getter that returns a dict
                 root_value = root_node.mean_action_value.get(best_action, -1.0)
                 if root_value < config.RESIGNATION_THRESHOLD:
                     winner = -game_state.get_current_player(); break
@@ -382,17 +415,23 @@ def play_game(network_wrapper, generation_num):
         move_probs = mcts.get_move_probs(root_node, temp)
         policy_target = np.zeros(config.BOARD_SIZE * config.BOARD_SIZE + 1, dtype=np.float32)
         for action, prob in move_probs.items(): policy_target[action] = prob
+
+        # The rest of this function works correctly now because state_repr is a numpy array
         game_history.append((state_repr, policy_target, game_state.get_current_player()))
         action_to_play = np.random.choice(len(policy_target), p=policy_target)
         game_state.apply_move(action_to_play)
         state_repr = game_state.get_representation()
         child_node = root_node.get_child(action_to_play)
         root_node = child_node if child_node is not None else MCTSNode()
+
     training_data = []
     for state_repr_hist, policy, player in game_history:
         z = 1 if winner is not None and player == winner else -1 if winner is not None else 0
-        training_data.append((torch.from_numpy(state_repr_hist.astype(np.uint8)), policy, z))
+        # This line now works as intended, as state_repr_hist is a numpy array
+        # We convert the numpy array to a tensor here before appending
+        training_data.append((torch.from_numpy(state_repr_hist.astype(np.float32)), policy, z))
     return training_data
+
 
 def evaluate_game(next_wrapper, best_wrapper, is_next_black):
     if is_next_black: black_player, white_player = next_wrapper, best_wrapper
@@ -408,7 +447,10 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
             next_won = (winner == 1 and is_next_black) or (winner == -1 and not is_next_black)
             return 1 if next_won else -1
         mcts, root, current_player_is_black = (black_mcts, black_root, True) if game_state.get_current_player() == 1 else (white_mcts, white_root, False)
-        mcts.run_simulations(root, game_state.clone(), config.NUM_SIMULATIONS_PLAY)
+
+        # ----- CHANGE 3: Remove unnecessary clone in Python -----
+        mcts.run_simulations(root, game_state, config.NUM_SIMULATIONS)
+
         move_probs = mcts.get_move_probs(root, temp=0)
         action_to_play = max(move_probs, key=move_probs.get) if move_probs else (config.BOARD_SIZE**2)
         game_state.apply_move(action_to_play)
@@ -485,7 +527,7 @@ def main(args):
     shared_replay_buffer = SharedReplayBuffer( capacity=config.REPLAY_BUFFER_SIZE, board_size=config.BOARD_SIZE, in_channels=config.IN_CHANNELS )
     pool_init_args = (gpu_request_queue, worker_conns, shared_replay_buffer)
     cpu_worker_pool = Pool( processes=num_cpu_workers, initializer=init_worker, initargs=pool_init_args )
-    print(f"Started a CPU worker pool with {num_cpu_workers} workers and 1 gpu_worker process.")
+    print(f"Started a CPU worker pool with {num_cpu_workers} workers and 1 gpu_worker process.", flush=True)
 
     start_generation = 1
     best_model_elo = config.ELO_INITIAL
@@ -496,7 +538,7 @@ def main(args):
     def dispatch_sp_task(worker_id, gen_num): return cpu_worker_pool.apply_async(play_game_task, args=(worker_id, gen_num))
     min_initial_data = config.BATCH_SIZE * 20
     if len(shared_replay_buffer) < min_initial_data:
-        print(f"--- Starting initial replay buffer fill (current: {len(shared_replay_buffer)}) ---")
+        print(f"--- Starting initial replay buffer fill (current: {len(shared_replay_buffer)}) ---", flush=True)
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks: active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, 0)
         while len(shared_replay_buffer) < min_initial_data:

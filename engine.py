@@ -195,7 +195,7 @@ class GTPEngine:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A Go engine using AlphaGo Zero principles.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model (.safetensors file).")
-    parser.add_argument("--num_simulations", type=int, default=config.NUM_SIMULATIONS_PLAY, help="Number of MCTS simulations per move.")
+    parser.add_argument("--num_simulations", type=int, default=config.NUM_SIMULATIONS, help="Number of MCTS simulations per move.")
     args = parser.parse_args()
 
     # --- Modified Device Selection for TPU ---

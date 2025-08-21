@@ -1,9 +1,10 @@
 [build-system]
-requires = ["maturin"]
+requires = ["maturin>=1.9.2"]
 build-backend = "maturin"
 
 [project]
 name = "go-zero-mcts-rs"
+dynamic = ["version"]
 dependencies = [
     "numpy",
     "numba",
