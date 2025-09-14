@@ -78,19 +78,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "go_zero_mcts_rs"
-version = "0.1.0"
-dependencies = [
- "dashmap",
- "numpy",
- "once_cell",
- "pyo3",
- "rand",
- "rand_distr",
- "rayon",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -138,6 +125,19 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
+]
+
+[[package]]
+name = "mcts_rs"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "numpy",
+ "once_cell",
+ "pyo3",
+ "rand",
+ "rand_distr",
+ "rayon",
 ]
 
 [[package]]

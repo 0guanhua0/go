@@ -1,12 +1,10 @@
-import torch
-import torch.nn.functional as F
-
 class NetworkWrapper:
     """
     Acts as a client to the InferenceServer.
     Instead of running the model locally, it sends inference requests
     to the central server process via multiprocessing queues/pipes.
     """
+
     def __init__(self, worker_id, request_queue, result_pipe):
         self.worker_id = worker_id
         self.request_queue = request_queue

@@ -1,5 +1,3 @@
-import math
-
 class Rating:
     """
     Represents a player's Elo rating.
@@ -9,9 +7,11 @@ class Rating:
         k_factor (int): A constant that determines how strongly a result impacts ratings.
                         Higher values mean ratings change more quickly.
     """
+
     def __init__(self, rating=1500, k_factor=32):
         self.rating = float(rating)
         self.k_factor = k_factor
+
 
 def calculate_expected_score(rating1: float, rating2: float) -> float:
     """
@@ -25,9 +25,12 @@ def calculate_expected_score(rating1: float, rating2: float) -> float:
     Returns:
         float: The expected score for player 1 (a value between 0 and 1).
     """
-    return 1 / (1 + 10**((rating2 - rating1) / 400))
+    return 1 / (1 + 10 ** ((rating2 - rating1) / 400))
 
-def update_ratings(player1: Rating, player2: Rating, score1: float) -> tuple[Rating, Rating]:
+
+def update_ratings(
+    player1: Rating, player2: Rating, score1: float
+) -> tuple[Rating, Rating]:
     """
     Updates the Elo ratings for two players based on an actual score.
     This is suitable for batch results, where `score1` can be a win rate.
@@ -59,7 +62,9 @@ def update_ratings(player1: Rating, player2: Rating, score1: float) -> tuple[Rat
     return Rating(new_rating1, player1.k_factor), Rating(new_rating2, player2.k_factor)
 
 
-def rate_1vs1(player1: Rating, player2: Rating, drawn: bool = False) -> tuple[Rating, Rating]:
+def rate_1vs1(
+    player1: Rating, player2: Rating, drawn: bool = False
+) -> tuple[Rating, Rating]:
     """
     Calculates and returns the new ratings for two players after a single game.
     If not a draw, player1 is assumed to be the winner.
@@ -75,19 +80,21 @@ def rate_1vs1(player1: Rating, player2: Rating, drawn: bool = False) -> tuple[Ra
     # Determine actual score for player 1 based on the game outcome
     if drawn:
         actual_score1 = 0.5
-    else: # Player 1 is the winner
+    else:  # Player 1 is the winner
         actual_score1 = 1.0
 
     return update_ratings(player1, player2, actual_score1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # --- Example Usage ---
     # Create two players with initial ratings
     player_a = Rating(rating=1600, k_factor=32)
     player_b = Rating(rating=1800, k_factor=32)
 
-    print(f"Initial Ratings: Player A = {player_a.rating:.0f}, Player B = {player_b.rating:.0f}")
+    print(
+        f"Initial Ratings: Player A = {player_a.rating:.0f}, Player B = {player_b.rating:.0f}"
+    )
 
     # --- Scenario 1: Lower-rated player A wins ---
     print("\n--- Player A wins ---")

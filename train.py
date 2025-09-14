@@ -1,33 +1,28 @@
-import torch
-
-import torch.nn.functional as F
-import os
-import time
-import numpy as np
 import argparse
-from queue import Empty
 import logging
+import os
+import queue
 import sys
+import time
 
-import torch.optim as optim
-from torch.optim.lr_scheduler import MultiStepLR
-from safetensors.torch import save_file
-import torch.multiprocessing as mp
-from torch.multiprocessing import Process, Event, set_start_method, Pipe, Pool
+import numpy as np
+import safetensors
+import torch
+from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 
 import config
-from network import AlphaGoZeroNet
-from go_zero_mcts_rs import GoGameState, MCTS, MCTSNode
-from elo import Rating, update_ratings, calculate_expected_score
 import wandb
+from elo import Rating, calculate_expected_score, update_ratings
+from mcts_rs import MCTS, GoGameState, MCTSNode
+from network import AlphaGoZeroNet
 
 
-class SharedReplayBuffer:
+class ReplayBuffer:
     def __init__(self, capacity, board_size, in_channels):
-        self.lock = mp.Lock()
+        self.lock = torch.multiprocessing.Lock()
         self.capacity = capacity
-        self.size = mp.Value("i", 0)
-        self.head = mp.Value("i", 0)
+        self.size = torch.multiprocessing.Value("i", 0)
+        self.head = torch.multiprocessing.Value("i", 0)
 
         state_shape = (capacity, in_channels, board_size, board_size)
         policy_shape = (capacity, board_size * board_size + 1)
@@ -38,9 +33,7 @@ class SharedReplayBuffer:
         value_bytes = capacity * 1 * 4
 
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
-        logging.info(
-            f"Allocating shared memory for replay buffer (~{total_gb:.2f} GB)..."
-        )
+        logging.info(f"Allocating replay buffer (~{total_gb:.2f} GB)...")
 
         self.states = torch.zeros(state_shape, dtype=torch.float32)
         self.policies = torch.zeros(policy_shape, dtype=torch.float32)
@@ -49,7 +42,7 @@ class SharedReplayBuffer:
         self.states.share_memory_()
         self.policies.share_memory_()
         self.values.share_memory_()
-        logging.info("Shared memory allocation complete.")
+        logging.info("replay buffer allocation complete.")
 
     def add(self, game_data):
         num_steps = len(game_data)
@@ -104,14 +97,14 @@ class SharedReplayBuffer:
 
 g_request_queue = None
 g_result_pipes = None
-g_shared_replay_buffer = None
+g_replay_buffer = None
 
 
-def init_worker(request_queue, result_pipes, shared_replay_buffer):
-    global g_request_queue, g_result_pipes, g_shared_replay_buffer
+def init_worker(request_queue, result_pipes, replay_buffer):
+    global g_request_queue, g_result_pipes, g_replay_buffer
     g_request_queue = request_queue
     g_result_pipes = result_pipes
-    g_shared_replay_buffer = shared_replay_buffer
+    g_replay_buffer = replay_buffer
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
@@ -160,13 +153,13 @@ class gpu_worker(Process):
             model.eval()
 
         logging.info("Initializing optimizer and scheduler...")
-        self.optimizer = optim.SGD(
+        self.optimizer = torch.optim.SGD(
             self.models["next"].parameters(),
             lr=config.INITIAL_LR,
             momentum=0.9,
             weight_decay=config.L2_REGULARIZATION,
         )
-        self.scheduler = MultiStepLR(
+        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
         )
         logging.info("Initialization complete.")
@@ -182,7 +175,7 @@ class gpu_worker(Process):
         while not self.stop_event.is_set():
             try:
                 command, payload = self.request_queue.get(timeout=1.0)
-            except Empty:
+            except queue.Empty:
                 continue
 
             other_commands, requests_by_model = self._drain_queue(command, payload)
@@ -211,7 +204,7 @@ class gpu_worker(Process):
                     requests_by_model[model_name].append((worker_id, numpy_array))
                 else:
                     other_commands.append((command, payload))
-            except Empty:
+            except queue.Empty:
                 break
 
         return other_commands, requests_by_model
@@ -250,13 +243,13 @@ class gpu_worker(Process):
             )
             self.models["next"].load_state_dict(self.models["best"].state_dict())
             self.models["next"].eval()
-            self.optimizer = optim.SGD(
+            self.optimizer = torch.optim.SGD(
                 self.models["next"].parameters(),
                 lr=config.INITIAL_LR,
                 momentum=0.9,
                 weight_decay=config.L2_REGULARIZATION,
             )
-            self.scheduler = MultiStepLR(
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
             )
             self.main_pipe.send({"status": "LOAD_DONE"})
@@ -279,7 +272,9 @@ class gpu_worker(Process):
 
             with torch.no_grad():
                 policy_logits, value_preds = model(batch)
-                policy_probs_batch = F.softmax(policy_logits, dim=1).cpu().numpy()
+                policy_probs_batch = (
+                    torch.nn.functional.softmax(policy_logits, dim=1).cpu().numpy()
+                )
                 value_preds_batch = value_preds.cpu().numpy()
 
             start_index = 0
@@ -304,8 +299,10 @@ class gpu_worker(Process):
 
         policy_pred_logits, value_pred = self.models["next"](state_tensors)
 
-        policy_loss = F.cross_entropy(policy_pred_logits, policy_targets)
-        value_loss = F.mse_loss(value_pred, value_targets)
+        policy_loss = torch.nn.functional.cross_entropy(
+            policy_pred_logits, policy_targets
+        )
+        value_loss = torch.nn.functional.mse_loss(value_pred, value_targets)
         loss = policy_loss + value_loss
 
         loss.backward()
@@ -351,9 +348,9 @@ def play_game_task(worker_id, generation_num):
     network_wrapper = NetworkWrapper(worker_id, model_id="best")
     game_data = play_game(network_wrapper, generation_num)
     if game_data:
-        g_shared_replay_buffer.add(game_data)
+        g_replay_buffer.add(game_data)
         logging.info(
-            f"Game finished ({len(game_data)} moves). Buffer size: {len(g_shared_replay_buffer)}"
+            f"Game finished ({len(game_data)} moves). Buffer size: {len(g_replay_buffer)}"
         )
         return len(game_data)
     logging.info("Game finished with no data.")
@@ -486,8 +483,8 @@ def main(args):
         job_type="training",
     )
 
-    num_cpu_workers = mp.cpu_count()
-    gpu_request_queue = mp.Queue()
+    num_cpu_workers = torch.multiprocessing.cpu_count()
+    gpu_request_queue = torch.multiprocessing.Queue()
     all_pipes = [Pipe(duplex=False) for _ in range(num_cpu_workers)]
     worker_conns = [p[0] for p in all_pipes]
     gpu_result_conns = [p[1] for p in all_pipes]
@@ -555,12 +552,12 @@ def main(args):
     accelerator_worker.daemon = True
     accelerator_worker.start()
 
-    shared_replay_buffer = SharedReplayBuffer(
+    replay_buffer = ReplayBuffer(
         capacity=config.REPLAY_BUFFER_SIZE,
         board_size=config.BOARD_SIZE,
         in_channels=config.IN_CHANNELS,
     )
-    pool_init_args = (gpu_request_queue, worker_conns, shared_replay_buffer)
+    pool_init_args = (gpu_request_queue, worker_conns, replay_buffer)
     cpu_worker_pool = Pool(
         processes=num_cpu_workers, initializer=init_worker, initargs=pool_init_args
     )
@@ -579,14 +576,14 @@ def main(args):
         return cpu_worker_pool.apply_async(play_game_task, args=(worker_id, gen_num))
 
     min_initial_data = config.BATCH_SIZE * 20
-    if len(shared_replay_buffer) < min_initial_data:
+    if len(replay_buffer) < min_initial_data:
         logging.info(
-            f"--- Starting initial replay buffer fill (current: {len(shared_replay_buffer)}) ---"
+            f"--- Starting initial replay buffer fill (current: {len(replay_buffer)}) ---"
         )
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
                 active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, 0)
-        while len(shared_replay_buffer) < min_initial_data:
+        while len(replay_buffer) < min_initial_data:
             done_workers = [
                 worker_id
                 for worker_id, result in active_sp_tasks.items()
@@ -594,7 +591,7 @@ def main(args):
             ]
             for worker_id in done_workers:
                 active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, 0)
-            logging.info(f"Buffer size: {len(shared_replay_buffer)}/{min_initial_data}")
+            logging.info(f"Buffer size: {len(replay_buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
 
@@ -613,13 +610,13 @@ def main(args):
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks or active_sp_tasks[worker_id].ready():
                 active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, generation)
-        if len(shared_replay_buffer) < config.BATCH_SIZE:
+        if len(replay_buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
             time.sleep(10)
             continue
         total_loss, batches_done = 0.0, 0
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
-            batch = shared_replay_buffer.sample(config.BATCH_SIZE)
+            batch = replay_buffer.sample(config.BATCH_SIZE)
             if batch is None:
                 logging.warning(
                     "\nBuffer size fell below batch size. Pausing training."
@@ -632,13 +629,13 @@ def main(args):
                 batches_done += 1
             if (i + 1) % 50 == 0:
                 logging.info(
-                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(shared_replay_buffer)}"
+                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(replay_buffer)}"
                 )
 
         gpu_request_queue.put(("STEP_SCHEDULER", None))
         avg_loss = total_loss / batches_done if batches_done > 0 else 0
         log_data.update(
-            {"training_loss": avg_loss, "replay_buffer_size": len(shared_replay_buffer)}
+            {"training_loss": avg_loss, "replay_buffer_size": len(replay_buffer)}
         )
         logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
         for res in active_sp_tasks.values():
@@ -725,7 +722,7 @@ def main(args):
     gpu_state = main_gpu_pipe_recv.recv()
     best_model_state_dict = gpu_state.get("best_model_state_dict")
     if best_model_state_dict:
-        save_file(best_model_state_dict, "alphago-zero.safetensors")
+        safetensors.torch.save_file(best_model_state_dict, "alphago-zero.safetensors")
         logging.info("Final model saved successfully to alphago-zero.safetensors.")
         final_model_artifact = wandb.Artifact(
             "final-model",

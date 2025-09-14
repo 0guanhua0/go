@@ -1,6 +1,8 @@
 import math
+
 import numpy as np
 import torch
+
 
 class MCTSNode:
     """
@@ -17,10 +19,10 @@ class MCTSNode:
         self.children = {}  # A map from action to MCTSNode
 
         # N(s,a), W(s,a), Q(s,a), P(s,a) from the AlphaGo Zero paper
-        self.visit_count = {}        # N: visit count for each action
-        self.total_action_value = {} # W: total action-value for each action
+        self.visit_count = {}  # N: visit count for each action
+        self.total_action_value = {}  # W: total action-value for each action
         self.mean_action_value = {}  # Q: mean action-value for each action
-        self.prior_prob = {}         # P: prior probability for each action
+        self.prior_prob = {}  # P: prior probability for each action
 
     def get_child(self, action):
         """
@@ -44,7 +46,7 @@ class MCTSNode:
         :param c_puct: A constant determining the level of exploration.
         :return: The best action to take.
         """
-        best_score = -float('inf')
+        best_score = -float("inf")
         best_action = None
 
         # Total visits from this node is the sum of visits for all its actions
@@ -55,8 +57,12 @@ class MCTSNode:
             q_value = self.mean_action_value.get(action, 0.0)
 
             # U(s,a) is the exploration bonus
-            u_value = (c_puct * self.prior_prob.get(action, 0) *
-                       math.sqrt(total_visits_from_node) / (1 + self.visit_count.get(action, 0)))
+            u_value = (
+                c_puct
+                * self.prior_prob.get(action, 0)
+                * math.sqrt(total_visits_from_node)
+                / (1 + self.visit_count.get(action, 0))
+            )
 
             score = q_value + u_value
 
@@ -86,10 +92,13 @@ class MCTSNode:
         :param action: The action taken.
         :param value: The value (e.g., win/loss) from the simulation, from the perspective of the current player at this node.
         """
-        if action not in self.visit_count: return
+        if action not in self.visit_count:
+            return
         self.visit_count[action] += 1
         self.total_action_value[action] += value
-        self.mean_action_value[action] = self.total_action_value[action] / self.visit_count[action]
+        self.mean_action_value[action] = (
+            self.total_action_value[action] / self.visit_count[action]
+        )
 
 
 class MCTS:
@@ -137,7 +146,9 @@ class MCTS:
             state = root_state.clone()
             while not node.is_leaf():
                 action = node.select_action(self.c_puct)
-                if action is None: # Can happen if node has children but all have 0 prior
+                if (
+                    action is None
+                ):  # Can happen if node has children but all have 0 prior
                     break
                 path.append((node, action))
                 node = node.children[action]
@@ -155,12 +166,16 @@ class MCTS:
                 self._backup(path, value)
             else:
                 # If not terminal, add to batch for network evaluation.
-                leaves_to_evaluate.append({'path': path, 'leaf_node': node, 'state': state})
+                leaves_to_evaluate.append(
+                    {"path": path, "leaf_node": node, "state": state}
+                )
         # --- 4. Batch Expansion and Evaluation ---
 
         if leaves_to_evaluate:
             # Prepare batch for network
-            state_representations = [item['state'].get_representation() for item in leaves_to_evaluate]
+            state_representations = [
+                item["state"].get_representation() for item in leaves_to_evaluate
+            ]
             batch_tensor = torch.cat(state_representations, dim=0)
 
             # Get network predictions for the entire batch
@@ -168,31 +183,42 @@ class MCTS:
 
             # Process each leaf in the batch
             for i, item in enumerate(leaves_to_evaluate):
-                self._expand_node(item['leaf_node'], item['state'], policy_batch[i])
+                self._expand_node(item["leaf_node"], item["state"], policy_batch[i])
                 # Backup the network's value prediction
-                self._backup(item['path'], value_batch[i][0])
+                self._backup(item["path"], value_batch[i][0])
 
     def _add_dirichlet_noise(self, node):
         """Adds Dirichlet noise to a node's prior probabilities for exploration."""
-        if not node.prior_prob: return
+        if not node.prior_prob:
+            return
         actions = list(node.prior_prob.keys())
         noise = np.random.dirichlet([self.dirichlet_alpha] * len(actions))
         for i, action in enumerate(actions):
-            node.prior_prob[action] = (1 - self.epsilon) * node.prior_prob[action] + self.epsilon * noise[i]
+            node.prior_prob[action] = (1 - self.epsilon) * node.prior_prob[
+                action
+            ] + self.epsilon * noise[i]
 
     def _expand_node(self, node, state, policy_raw):
         """Expands a leaf node, creating children and setting their prior probabilities."""
         legal_actions = state.get_legal_moves()
-        action_priors = {action: prob for action, prob in enumerate(policy_raw) if action in legal_actions}
+        action_priors = {
+            action: prob
+            for action, prob in enumerate(policy_raw)
+            if action in legal_actions
+        }
 
         # Re-normalize probabilities over legal moves
         prob_sum = sum(action_priors.values())
         if prob_sum > 1e-6:
             for action in action_priors:
                 action_priors[action] /= prob_sum
-        else: # Fallback to uniform if network assigns ~0 to all legal moves
+        else:  # Fallback to uniform if network assigns ~0 to all legal moves
             num_legal = len(legal_actions)
-            action_priors = {action: 1.0 / num_legal for action in legal_actions} if num_legal > 0 else {}
+            action_priors = (
+                {action: 1.0 / num_legal for action in legal_actions}
+                if num_legal > 0
+                else {}
+            )
 
         node.expand(action_priors)
 
@@ -226,12 +252,21 @@ class MCTS:
             return probs
 
         # Apply temperature
-        powered_counts = {action: count**(1.0 / temp) for action, count in visit_counts.items()}
+        powered_counts = {
+            action: count ** (1.0 / temp) for action, count in visit_counts.items()
+        }
         total_powered_count = sum(powered_counts.values())
 
         if total_powered_count < 1e-9:
             num_legal = len(visit_counts)
-            return {action: 1.0 / num_legal for action in visit_counts} if num_legal > 0 else {}
+            return (
+                {action: 1.0 / num_legal for action in visit_counts}
+                if num_legal > 0
+                else {}
+            )
 
-        probs = {action: count / total_powered_count for action, count in powered_counts.items()}
+        probs = {
+            action: count / total_powered_count
+            for action, count in powered_counts.items()
+        }
         return probs

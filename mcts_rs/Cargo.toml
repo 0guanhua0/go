@@ -1,10 +1,10 @@
 [package]
-name = "go_zero_mcts_rs"
+name = "mcts_rs"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "go_zero_mcts_rs"
+name = "mcts_rs"
 crate-type = ["cdylib"]
 
 [dependencies]

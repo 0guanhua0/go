@@ -856,7 +856,7 @@ impl MCTS {
 }
 
 #[pymodule]
-fn go_zero_mcts_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn mcts_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MCTS>()?;
     m.add_class::<MCTSNode>()?;
     m.add_class::<GoGameState>()?;

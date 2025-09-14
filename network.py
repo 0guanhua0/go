@@ -2,17 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class ResBlock(nn.Module):
     """
     A single residual block as described in the AlphaGo Zero paper.
     Each block consists of two convolutional layers with batch normalization
     and ReLU activations, and a skip connection.
     """
+
     def __init__(self, num_filters=256):
         super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(num_filters, num_filters, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(
+            num_filters, num_filters, kernel_size=3, stride=1, padding=1, bias=False
+        )
         self.bn1 = nn.BatchNorm2d(num_filters)
-        self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(
+            num_filters, num_filters, kernel_size=3, stride=1, padding=1, bias=False
+        )
         self.bn2 = nn.BatchNorm2d(num_filters)
 
     def forward(self, x):
@@ -26,6 +32,7 @@ class ResBlock(nn.Module):
         out = F.relu(out)
         return out
 
+
 class AlphaGoZeroNet(nn.Module):
     """
     The full neural network for AlphaGo Zero. It consists of a residual tower
@@ -37,15 +44,20 @@ class AlphaGoZeroNet(nn.Module):
         in_channels (int): The number of input feature planes (17 in the paper).
         num_filters (int): The number of filters used in convolutional layers (256 in the paper).
     """
-    def __init__(self, board_size=19, num_res_blocks=19, in_channels=17, num_filters=256):
+
+    def __init__(
+        self, board_size=19, num_res_blocks=19, in_channels=17, num_filters=256
+    ):
         super(AlphaGoZeroNet, self).__init__()
         self.board_size = board_size
 
         # Initial convolutional block
         self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels, num_filters, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(
+                in_channels, num_filters, kernel_size=3, stride=1, padding=1, bias=False
+            ),
             nn.BatchNorm2d(num_filters),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
         # Residual tower
@@ -53,9 +65,13 @@ class AlphaGoZeroNet(nn.Module):
         self.res_tower = nn.Sequential(*res_tower)
 
         # Policy head
-        self.policy_conv = nn.Conv2d(num_filters, 2, kernel_size=1, stride=1, bias=False)
+        self.policy_conv = nn.Conv2d(
+            num_filters, 2, kernel_size=1, stride=1, bias=False
+        )
         self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * board_size * board_size, board_size * board_size + 1)
+        self.policy_fc = nn.Linear(
+            2 * board_size * board_size, board_size * board_size + 1
+        )
 
         # Value head
         self.value_conv = nn.Conv2d(num_filters, 1, kernel_size=1, stride=1, bias=False)
@@ -92,7 +108,8 @@ class AlphaGoZeroNet(nn.Module):
 
         return policy_logits, value
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     # The paper describes two main versions of the network:
     # 1. 20-block network (1 conv block + 19 res blocks) used for the 3-day run.
     # 2. 40-block network (1 conv block + 39 res blocks) used for the 40-day run.
@@ -104,12 +121,12 @@ if __name__ == '__main__':
     # Let's test the 20-block network with a dummy input
     batch_size = 8
     board_size = 19
-    in_channels = 17 # 8 planes for player stones, 8 for opponent, 1 for color
+    in_channels = 17  # 8 planes for player stones, 8 for opponent, 1 for color
 
     # Create a dummy input tensor
     dummy_input = torch.randn(batch_size, in_channels, board_size, board_size)
 
-    print(f"\n--- Testing the 20-block network ---")
+    print("\n--- Testing the 20-block network ---")
     print(f"Input shape: {dummy_input.shape}")
 
     # Pass the input through the network
@@ -119,22 +136,30 @@ if __name__ == '__main__':
     # The policy head outputs logits for each of the 19x19=361 moves + 1 pass move
     policy_size = board_size * board_size + 1
 
-    print(f"Output policy logits shape: {policy_logits.shape} (Expected: ({batch_size}, {policy_size}))")
+    print(
+        f"Output policy logits shape: {policy_logits.shape} (Expected: ({batch_size}, {policy_size}))"
+    )
     print(f"Output value shape: {value.shape} (Expected: ({batch_size}, 1))")
 
     # The policy logits would then be passed through a softmax function to get probabilities.
     # The value is already in the range [-1, 1] due to the tanh activation.
     policy_probs = F.softmax(policy_logits, dim=1)
     print(f"\nPolicy probabilities shape after softmax: {policy_probs.shape}")
-    print(f"Sum of probabilities for the first sample in batch: {torch.sum(policy_probs[0]).item():.2f}")
+    print(
+        f"Sum of probabilities for the first sample in batch: {torch.sum(policy_probs[0]).item():.2f}"
+    )
     print(f"Example value output for the first sample: {value[0].item():.4f}")
 
     # --- Parameter Count ---
     # Quick check on the number of parameters
-    num_params_20 = sum(p.numel() for p in net_20_blocks.parameters() if p.requires_grad)
+    num_params_20 = sum(
+        p.numel() for p in net_20_blocks.parameters() if p.requires_grad
+    )
     print(f"\nTotal trainable parameters in 20-block network: {num_params_20:,}")
 
     # Create and check the 40-block network
     net_40_blocks = AlphaGoZeroNet(board_size=19, num_res_blocks=39, in_channels=17)
-    num_params_40 = sum(p.numel() for p in net_40_blocks.parameters() if p.requires_grad)
+    num_params_40 = sum(
+        p.numel() for p in net_40_blocks.parameters() if p.requires_grad
+    )
     print(f"Total trainable parameters in 40-block network: {num_params_40:,}")

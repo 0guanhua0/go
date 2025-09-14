@@ -29,5 +29,5 @@ dev = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "go_zero_mcts_rs"
+module-name = "mcts_rs"
 manifest-path = "mcts_rs/Cargo.toml"

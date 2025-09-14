@@ -1,11 +1,13 @@
-import torch
+from collections import deque
+
 import numba
 import numpy as np
-from collections import deque
+import torch
 
 # --- JIT-COMPILED HELPER FUNCTIONS ---
 # These functions are designed to be fast and operate only on NumPy arrays
 # and primitive types, making them ideal for Numba's nopython mode.
+
 
 @numba.jit(nopython=True, cache=True)
 def _get_group_numba(y, x, board, board_size):
@@ -41,6 +43,7 @@ def _get_group_numba(y, x, board, board_size):
                 group_stones.add((ny, nx))
                 q.append((ny, nx))
     return group_stones, liberties
+
 
 @numba.jit(nopython=True, cache=True)
 def _get_legal_moves_numba(board, current_player, ko_point, board_size):
@@ -83,10 +86,12 @@ def _get_legal_moves_numba(board, current_player, ko_point, board_size):
                     continue
 
                 if temp_board[ny, nx] == -current_player:
-                    _, opponent_liberties = _get_group_numba(ny, nx, temp_board, board_size)
+                    _, opponent_liberties = _get_group_numba(
+                        ny, nx, temp_board, board_size
+                    )
                     if len(opponent_liberties) == 0:
                         captures_made = True
-                        break # Found a capture, so the move is legal.
+                        break  # Found a capture, so the move is legal.
 
             if captures_made:
                 legal_mask[y * board_size + x] = True
@@ -111,7 +116,7 @@ def _apply_move_numba(board, action, current_player, board_size):
     new_board[y, x] = current_player
 
     captured_stones_total = 0
-    single_captured_group = set([(0,0)])
+    single_captured_group = set([(0, 0)])
     single_captured_group.clear()
 
     # Check for captures of opponent groups
@@ -132,13 +137,17 @@ def _apply_move_numba(board, action, current_player, board_size):
     # which results in the board state returning to the previous position.
     new_ko_point = None
     my_group, my_liberties = _get_group_numba(y, x, new_board, board_size)
-    if (captured_stones_total == 1 and len(my_group) == 1 and
-        len(my_liberties) == 0 and len(single_captured_group) == 1):
-            # This is a potential ko situation. The captured stone's position is the new ko point.
-            # Numba can't return a set, so we extract the tuple.
-            for ko_pos in single_captured_group:
-                new_ko_point = ko_pos
-                break # there's only one
+    if (
+        captured_stones_total == 1
+        and len(my_group) == 1
+        and len(my_liberties) == 0
+        and len(single_captured_group) == 1
+    ):
+        # This is a potential ko situation. The captured stone's position is the new ko point.
+        # Numba can't return a set, so we extract the tuple.
+        for ko_pos in single_captured_group:
+            new_ko_point = ko_pos
+            break  # there's only one
 
     return new_board, new_ko_point
 
@@ -155,7 +164,7 @@ def _find_territory_numba(board, board_size):
             if territory_mask[y, x] == 0:
                 q = [(y, x)]
                 visited = set([(y, x)])
-                borders = {'black': False, 'white': False}
+                borders = {"black": False, "white": False}
 
                 while len(q) > 0:
                     cy, cx = q.pop(0)
@@ -168,23 +177,24 @@ def _find_territory_numba(board, board_size):
                         # Numba can't use dictionary literals directly inside the loop like this
                         # for type inference, so pre-defining helps.
                         if neighbor_val == 1:
-                            borders['black'] = True
+                            borders["black"] = True
                         elif neighbor_val == -1:
-                            borders['white'] = True
+                            borders["white"] = True
                         elif neighbor_val == 0 and (ny, nx) not in visited:
                             visited.add((ny, nx))
                             q.append((ny, nx))
 
                 owner = 0
-                if borders['black'] and not borders['white']:
+                if borders["black"] and not borders["white"]:
                     owner = 1
-                elif borders['white'] and not borders['black']:
+                elif borders["white"] and not borders["black"]:
                     owner = -1
 
                 if owner != 0:
                     for ry, rx in visited:
                         territory_mask[ry, rx] = owner
     return territory_mask
+
 
 @numba.jit(nopython=True, cache=True)
 def _get_representation_numba(board, history_list, current_player, board_size):
@@ -193,19 +203,19 @@ def _get_representation_numba(board, history_list, current_player, board_size):
     """
     state_tensor = np.zeros((17, board_size, board_size), dtype=np.float32)
 
-    state_tensor[0, :, :] = (board == current_player)
-    state_tensor[8, :, :] = (board == -current_player)
+    state_tensor[0, :, :] = board == current_player
+    state_tensor[8, :, :] = board == -current_player
 
     # History states (T-1 to T-7)
     # The history list is ordered from most recent (T-1) to oldest.
     history_len = min(7, len(history_list))
     for i in range(history_len):
         past_board = history_list[i]
-        state_tensor[i + 1, :, :] = (past_board == current_player)
-        state_tensor[8 + i + 1, :, :] = (past_board == -current_player)
+        state_tensor[i + 1, :, :] = past_board == current_player
+        state_tensor[8 + i + 1, :, :] = past_board == -current_player
 
     # Color plane
-    if current_player == 1: # Black to play
+    if current_player == 1:  # Black to play
         state_tensor[16, :, :] = 1.0
 
     return state_tensor
@@ -214,21 +224,25 @@ def _get_representation_numba(board, history_list, current_player, board_size):
 # --- GoGameState Class ---
 # The main class now acts as a wrapper around the fast JIT-compiled functions.
 
+
 class GoGameState:
     """
     A functional Go game state implementation with proper capture and suicide rules.
     This class manages the board, move history, and game-over conditions.
     """
+
     def __init__(self, board_size=19):
         self.board_size = board_size
         self.board = np.zeros((board_size, board_size), dtype=np.int8)
         self.current_player = 1  # 1 for Black, -1 for White
         # We need a history of raw numpy arrays for Numba
-        self.history_boards = deque([np.zeros_like(self.board) for _ in range(8)], maxlen=8)
+        self.history_boards = deque(
+            [np.zeros_like(self.board) for _ in range(8)], maxlen=8
+        )
         self.consecutive_passes = 0
         self.max_moves = board_size * board_size * 2
         self.move_count = 0
-        self.ko_point = None # Stores a (y, x) tuple of a forbidden ko point
+        self.ko_point = None  # Stores a (y, x) tuple of a forbidden ko point
 
     def clone(self):
         """Creates a deep copy of the game state for simulations."""
@@ -245,14 +259,18 @@ class GoGameState:
         """
         Returns a list of legal moves by calling the fast Numba helper.
         """
-        legal_mask = _get_legal_moves_numba(self.board, self.current_player, self.ko_point, self.board_size)
+        legal_mask = _get_legal_moves_numba(
+            self.board, self.current_player, self.ko_point, self.board_size
+        )
         # Convert the boolean mask to a list of integer actions
         return np.where(legal_mask)[0].tolist()
 
     def apply_move(self, action):
         """Applies a move by calling the fast Numba helper, then updates state."""
         # The Numba function handles board changes and ko calculation.
-        new_board, new_ko_point = _apply_move_numba(self.board, action, self.current_player, self.board_size)
+        new_board, new_ko_point = _apply_move_numba(
+            self.board, action, self.current_player, self.board_size
+        )
 
         self.board = new_board
         self.ko_point = new_ko_point
@@ -297,7 +315,7 @@ class GoGameState:
         """A simplified scoring method (area scoring)."""
         territory_mask = _find_territory_numba(self.board, self.board_size)
         final_black_score = np.sum(territory_mask == 1)
-        final_white_score = np.sum(territory_mask == -1) + 7.5 # Komi
+        final_white_score = np.sum(territory_mask == -1) + 7.5  # Komi
 
         if final_black_score > final_white_score:
             return 1
