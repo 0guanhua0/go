@@ -23,6 +23,8 @@
 [Monte Carlo tree search](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search)
 - [Batch Monte Carlo Tree Search](https://arxiv.org/abs/2104.04278)
 
+[Zobrist hashing](https://en.wikipedia.org/wiki/Zobrist_hashing)
+
 # network
 residual network
 

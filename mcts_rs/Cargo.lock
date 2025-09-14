@@ -83,6 +83,7 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "numpy",
+ "once_cell",
  "pyo3",
  "rand",
  "rand_distr",

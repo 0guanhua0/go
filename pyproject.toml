@@ -21,6 +21,12 @@ classifiers = [
     "Programming Language :: Python :: implementation :: PyPy",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pre-commit",
+]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "go_zero_mcts_rs"
