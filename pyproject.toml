@@ -6,12 +6,11 @@ build-backend = "maturin"
 name = "go-zero-mcts-rs"
 dynamic = ["version"]
 dependencies = [
-    "numpy",
     "numba",
+    "numpy",
     "pandas",
-    "sgfmill",
     "requests",
-    "safetensors",
+    "sgfmill",
     "torch",
     "wandb",
 ]

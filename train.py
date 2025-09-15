@@ -2,11 +2,9 @@ import argparse
 import logging
 import os
 import queue
-import sys
 import time
 
 import numpy as np
-import safetensors
 import torch
 from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 
@@ -33,7 +31,6 @@ class ReplayBuffer:
         value_bytes = capacity * 1 * 4
 
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
-        logging.info(f"Allocating replay buffer (~{total_gb:.2f} GB)...")
 
         self.states = torch.zeros(state_shape, dtype=torch.float32)
         self.policies = torch.zeros(policy_shape, dtype=torch.float32)
@@ -42,77 +39,88 @@ class ReplayBuffer:
         self.states.share_memory_()
         self.policies.share_memory_()
         self.values.share_memory_()
-        logging.info("replay buffer allocation complete.")
+        logging.info(f"init replay buffer(~{total_gb:.2f} GB)")
 
     def add(self, game_data):
-        num_steps = len(game_data)
-        if num_steps == 0:
-            return
-
         states, policies, values = zip(*game_data)
-
         state_tensors = torch.stack(states)
-
         policy_tensors = torch.from_numpy(np.array(policies, dtype=np.float32))
         value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(1)
 
         with self.lock:
-            start_idx = self.head.value
-            end_idx = start_idx + num_steps
+            idx = (
+                torch.arange(self.head.value, self.head.value + len(game_data))
+                % self.capacity
+            )
 
-            if end_idx <= self.capacity:
-                self.states[start_idx:end_idx] = state_tensors
-                self.policies[start_idx:end_idx] = policy_tensors
-                self.values[start_idx:end_idx] = value_tensors
-            else:
-                end_idx %= self.capacity
-                part1_len = self.capacity - start_idx
-                self.states[start_idx:] = state_tensors[:part1_len]
-                self.policies[start_idx:] = policy_tensors[:part1_len]
-                self.values[start_idx:] = value_tensors[:part1_len]
+            self.states[idx] = state_tensors
+            self.policies[idx] = policy_tensors
+            self.values[idx] = value_tensors
 
-                self.states[:end_idx] = state_tensors[part1_len:]
-                self.policies[:end_idx] = policy_tensors[part1_len:]
-                self.values[:end_idx] = value_tensors[part1_len:]
-
-            self.head.value = end_idx
-            self.size.value = min(self.capacity, self.size.value + num_steps)
+            self.head.value = (self.head.value + len(game_data)) % self.capacity
+            self.size.value = min(self.capacity, self.size.value + len(game_data))
 
     def sample(self, batch_size):
         with self.lock:
             if self.size.value < batch_size:
                 return None
-
-            indices = torch.randint(0, self.size.value, (batch_size,))
-
-            batch_states = self.states[indices]
-            batch_policies = self.policies[indices]
-            batch_values = self.values[indices]
-
-        return batch_states, batch_policies, batch_values
+            idx = torch.randint(0, self.size.value, (batch_size,))
+            return self.states[idx], self.policies[idx], self.values[idx]
 
     def __len__(self):
         return self.size.value
 
 
-g_request_queue = None
-g_result_pipes = None
-g_replay_buffer = None
+class CPUWorker:
+    request_queue = None
+    result_pipes = None
+    replay_buffer = None
+
+    @classmethod
+    def init(cls, request_queue, result_pipes, replay_buffer):
+        cls.request_queue = request_queue
+        cls.result_pipes = result_pipes
+        cls.replay_buffer = replay_buffer
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
+        )
+
+    def __init__(self, worker_id):
+        self.worker_id = worker_id
+
+    def play_game(self, generation_num):
+        network_wrapper = NetworkWrapper(
+            self.worker_id,
+            model_id="best",
+            request_queue=self.request_queue,
+            result_pipe=self.result_pipes[self.worker_id],
+        )
+        game_data = play_game(network_wrapper, generation_num)
+        self.replay_buffer.add(game_data)
+        logging.info(
+            f"Game finished ({len(game_data)} moves). Buffer size: {len(self.replay_buffer)}"
+        )
+        return len(game_data)
+
+    def evaluate_game(self, is_next_black):
+        next_wrapper = NetworkWrapper(
+            self.worker_id,
+            model_id="next",
+            request_queue=self.request_queue,
+            result_pipe=self.result_pipes[self.worker_id],
+        )
+        best_wrapper = NetworkWrapper(
+            self.worker_id,
+            model_id="best",
+            request_queue=self.request_queue,
+            result_pipe=self.result_pipes[self.worker_id],
+        )
+        winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
+        return winner_result
 
 
-def init_worker(request_queue, result_pipes, replay_buffer):
-    global g_request_queue, g_result_pipes, g_replay_buffer
-    g_request_queue = request_queue
-    g_result_pipes = result_pipes
-    g_replay_buffer = replay_buffer
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-        stream=sys.stdout,
-    )
-
-
-class gpu_worker(Process):
+class GPUWorker(Process):
     def __init__(self, request_queue, result_pipes, main_pipe, device_str):
         super().__init__()
         self.request_queue = request_queue
@@ -122,21 +130,12 @@ class gpu_worker(Process):
         self.stop_event = Event()
 
         self.device = None
-        self.xm = None
-        self.is_tpu = "tpu" in self.device_str
 
     def _initialize_hardware_and_models(self):
-        if self.is_tpu:
-            import torch_xla.core.xla_model as xm
-
-            self.xm = xm
-            self.device = self.xm.xla_device()
-            logging.info(f"Initializing for TPU on device: {self.device}")
-        else:
-            self.device = torch.device(self.device_str)
-            logging.info(
-                f"Initializing for {self.device_str.upper()} on device: {self.device}"
-            )
+        self.device = torch.device(self.device_str)
+        logging.info(
+            f"Initializing for {self.device_str.upper()} on device: {self.device}"
+        )
 
         common_args = (
             config.BOARD_SIZE,
@@ -152,7 +151,6 @@ class gpu_worker(Process):
         for model in self.models.values():
             model.eval()
 
-        logging.info("Initializing optimizer and scheduler...")
         self.optimizer = torch.optim.SGD(
             self.models["next"].parameters(),
             lr=config.INITIAL_LR,
@@ -168,7 +166,6 @@ class gpu_worker(Process):
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-            stream=sys.stdout,
         )
         self._initialize_hardware_and_models()
 
@@ -307,10 +304,7 @@ class gpu_worker(Process):
 
         loss.backward()
 
-        if self.is_tpu:
-            self.xm.optimizer_step(self.optimizer, barrier=True)
-        else:
-            self.optimizer.step()
+        self.optimizer.step()
 
         self.models["next"].eval()
         return loss.item()
@@ -320,48 +314,35 @@ class gpu_worker(Process):
 
 
 class NetworkWrapper:
-    def __init__(self, worker_id, model_id):
+    def __init__(self, worker_id, model_id, request_queue, result_pipe):
         self.worker_id = worker_id
         self.model_id = model_id
-        assert self.model_id in ["best", "next"], (
-            "NetworkWrapper model_id must be 'best' or 'next'."
-        )
+        self.request_queue = request_queue
+        self.result_pipe = result_pipe
+        assert self.model_id in ["best", "next"]
 
     def predict(self, state_batch):
         if isinstance(state_batch, torch.Tensor):
             state_batch = state_batch.cpu().numpy()
 
-        assert isinstance(state_batch, np.ndarray), (
-            "Input to predict must be a NumPy array."
-        )
+        assert isinstance(state_batch, np.ndarray)
         assert state_batch.ndim == 4, (
             "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
         )
 
-        g_request_queue.put(("INFER", (self.worker_id, self.model_id, state_batch)))
-
-        policy_probs, value = g_result_pipes[self.worker_id].recv()
+        self.request_queue.put(("INFER", (self.worker_id, self.model_id, state_batch)))
+        policy_probs, value = self.result_pipe.recv()
         return policy_probs, value
 
 
 def play_game_task(worker_id, generation_num):
-    network_wrapper = NetworkWrapper(worker_id, model_id="best")
-    game_data = play_game(network_wrapper, generation_num)
-    if game_data:
-        g_replay_buffer.add(game_data)
-        logging.info(
-            f"Game finished ({len(game_data)} moves). Buffer size: {len(g_replay_buffer)}"
-        )
-        return len(game_data)
-    logging.info("Game finished with no data.")
-    return 0
+    worker = CPUWorker(worker_id)
+    return worker.play_game(generation_num)
 
 
 def evaluate_game_task(worker_id, is_next_black):
-    next_wrapper = NetworkWrapper(worker_id, model_id="next")
-    best_wrapper = NetworkWrapper(worker_id, model_id="best")
-    winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
-    return winner_result
+    worker = CPUWorker(worker_id)
+    return worker.evaluate_game(is_next_black)
 
 
 def play_game(network_wrapper, generation_num):
@@ -407,13 +388,7 @@ def play_game(network_wrapper, generation_num):
 
     training_data = []
     for state_repr_hist, policy, player in game_history:
-        z = (
-            1
-            if winner is not None and player == winner
-            else -1
-            if winner is not None
-            else 0
-        )
+        z = player * winner
         training_data.append(
             (torch.from_numpy(state_repr_hist.astype(np.float32)), policy, z)
         )
@@ -469,7 +444,6 @@ def main(args):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-        stream=sys.stdout,
     )
 
     logging.info(
@@ -535,18 +509,18 @@ def main(args):
         logging.info(f"Loaded ELO for 'best' model: {start_elo:.0f}")
         logging.info("Replay buffer will be populated by new self-play games.")
         gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
-        logging.info("Requesting gpu_worker to load best model state...")
+        logging.info("Requesting GPUWorker to load best model state...")
         gpu_request_queue.put(("LOAD_CHECKPOINT_DATA", gpu_states))
         response = main_gpu_pipe_recv.recv()
         if response.get("status") != "LOAD_DONE":
             raise RuntimeError(
-                f"Failed to load checkpoint on gpu_worker. Response: {response}"
+                f"Failed to load checkpoint on GPUWorker. Response: {response}"
             )
-        logging.info("gpu_worker confirmed state load.")
+        logging.info("GPUWorker confirmed state load.")
         logging.info(f"--- Resuming training from generation {start_generation} ---")
         return start_generation, start_elo
 
-    accelerator_worker = gpu_worker(
+    accelerator_worker = GPUWorker(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
     )
     accelerator_worker.daemon = True
@@ -559,10 +533,10 @@ def main(args):
     )
     pool_init_args = (gpu_request_queue, worker_conns, replay_buffer)
     cpu_worker_pool = Pool(
-        processes=num_cpu_workers, initializer=init_worker, initargs=pool_init_args
+        processes=num_cpu_workers, initializer=CPUWorker.init, initargs=pool_init_args
     )
     logging.info(
-        f"Started a CPU worker pool with {num_cpu_workers} workers and 1 gpu_worker process."
+        f"Started a CPU worker pool with {num_cpu_workers} workers and 1 GPUWorker process."
     )
 
     start_generation = 1
@@ -716,25 +690,19 @@ def main(args):
 
     logging.info("\nTraining complete! Shutting down...")
     final_generation = locals().get("generation", config.MAX_GENERATIONS)
-    logging.info("\n--- Saving final model to alphago-zero.safetensors ---")
-    logging.info("Requesting best model state from Accelerator...")
     gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
     gpu_state = main_gpu_pipe_recv.recv()
     best_model_state_dict = gpu_state.get("best_model_state_dict")
-    if best_model_state_dict:
-        safetensors.torch.save_file(best_model_state_dict, "alphago-zero.safetensors")
-        logging.info("Final model saved successfully to alphago-zero.safetensors.")
-        final_model_artifact = wandb.Artifact(
-            "final-model",
-            type="model",
-            description="Final 'best' model after all training generations.",
-            metadata={"generation": final_generation, "elo": best_model_elo},
-        )
-        final_model_artifact.add_file("alphago-zero.safetensors")
-        run.log_artifact(final_model_artifact)
-        logging.info("Final model artifact uploaded to W&B.")
-    else:
-        logging.error("Could not retrieve model state from gpu_worker.")
+    torch.save(best_model_state_dict, "alphago-zero.pt")
+    final_model_artifact = wandb.Artifact(
+        "final-model",
+        type="model",
+        description="Final 'best' model after all training generations.",
+        metadata={"generation": final_generation, "elo": best_model_elo},
+    )
+    final_model_artifact.add_file("alphago-zero.pt")
+    run.log_artifact(final_model_artifact)
+
     if "generation" in locals():
         save_checkpoint(final_generation, best_model_elo, run, config)
     cpu_worker_pool.terminate()
