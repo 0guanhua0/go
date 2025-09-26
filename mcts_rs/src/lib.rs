@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use numpy::ToPyArray;
-use numpy::ndarray::{s, IxDyn};
+use numpy::ndarray::{IxDyn, s};
 use numpy::{PyArray, PyArray1, PyArray2, PyArrayMethods};
 use once_cell::sync::Lazy;
 use pyo3::exceptions::PyValueError;
@@ -11,14 +11,9 @@ use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-// --- ZOBRIST HASHING SETUP ---
-
 const MAX_BOARD_SIZE: usize = 19;
 const NUM_PLAYERS: usize = 2;
 
-/// A table of random u64 values for Zobrist hashing.
-/// The table has a unique random number for each possible combination of
-/// (y, x, player_color).
 struct ZobristTable {
     keys: [[[u64; NUM_PLAYERS]; MAX_BOARD_SIZE]; MAX_BOARD_SIZE],
 }
@@ -37,22 +32,18 @@ impl ZobristTable {
         ZobristTable { keys }
     }
 
-    /// Helper to get a key safely, assuming board_size has been checked.
     #[inline]
     fn key_for(&self, y: usize, x: usize, player_idx: usize) -> u64 {
         self.keys[y][x][player_idx]
     }
 }
 
-/// Global, lazily-initialized Zobrist table. It's created only once.
 static ZOBRIST_TABLE: Lazy<ZobristTable> = Lazy::new(ZobristTable::new);
 
-/// Helper to convert player i8 (1 for Black, -1 for White) to a usize index.
 #[inline]
 fn player_to_index(player: i8) -> usize {
-    if player == 1 { 0 } else { 1 } // Black: 1 -> 0, White: -1 -> 1
+    if player == 1 { 0 } else { 1 }
 }
-
 
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -60,31 +51,97 @@ pub struct GoGameState {
     board_size: usize,
     board: Vec<i8>,
     current_player: i8,
-    /// A deque of recent board states, kept ONLY for neural network input representation.
     history_boards: VecDeque<Vec<i8>>,
     consecutive_passes: u32,
     move_count: u32,
-    /// Stores a point that is illegal to play on the next turn due to the simple ko rule.
     ko_point: Option<(usize, usize)>,
-    /// The Zobrist hash of the current board state.
     current_hash: u64,
-    /// A set of all previously seen board state hashes in the current game for superko detection.
     history_hashes: HashSet<u64>,
 }
 
-// Internal, high-performance Rust methods for GoGameState
 impl GoGameState {
-    /// Helper to get a stone at a 2D coordinate from the flat board vector.
     fn at(&self, y: usize, x: usize) -> i8 {
         self.board[y * self.board_size + x]
     }
 
-    /// Helper to set a stone at a 2D coordinate on the flat board vector.
     fn set(&mut self, y: usize, x: usize, val: i8) {
         self.board[y * self.board_size + x] = val;
     }
 
-    /// Finds the group of connected stones and its liberties for a stone at (y, x).
+    fn _calculate_scores(&self) -> (f32, f32) {
+        let mut territory_mask = self.board.clone();
+        let mut visited_flood = HashSet::new();
+
+        for y in 0..self.board_size {
+            for x in 0..self.board_size {
+                if territory_mask[y * self.board_size + x] == 0 && !visited_flood.contains(&(y, x))
+                {
+                    let mut q = VecDeque::new();
+                    let mut visited_region = HashSet::new();
+                    let mut borders = (false, false); // black, white
+
+                    q.push_back((y, x));
+                    visited_region.insert((y, x));
+                    visited_flood.insert((y, x));
+
+                    while let Some((cy, cx)) = q.pop_front() {
+                        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+                            let ny_isize = cy as isize + dy;
+                            let nx_isize = cx as isize + dx;
+
+                            if ny_isize < 0
+                                || ny_isize >= self.board_size as isize
+                                || nx_isize < 0
+                                || nx_isize >= self.board_size as isize
+                            {
+                                continue;
+                            }
+                            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+                            let neighbor_val = self.board[ny * self.board_size + nx];
+                            if neighbor_val == 1 {
+                                borders.0 = true;
+                            } else if neighbor_val == -1 {
+                                borders.1 = true;
+                            } else if !visited_region.contains(&(ny, nx)) {
+                                visited_region.insert((ny, nx));
+                                visited_flood.insert((ny, nx));
+                                q.push_back((ny, nx));
+                            }
+                        }
+                    }
+
+                    let owner = match borders {
+                        (true, false) => 1,
+                        (false, true) => -1,
+                        _ => 0,
+                    };
+
+                    if owner != 0 {
+                        for (ry, rx) in visited_region {
+                            territory_mask[ry * self.board_size + rx] = owner;
+                        }
+                    }
+                }
+            }
+        }
+
+        let black_score: f32 = territory_mask.iter().filter(|&&s| s == 1).count() as f32;
+        let white_score: f32 = territory_mask.iter().filter(|&&s| s == -1).count() as f32 + 7.5; // Komi
+
+        (black_score, white_score)
+    }
+
+    fn _get_winner(&self) -> i8 {
+        let (black_score, white_score) = self._calculate_scores();
+
+        if black_score > white_score {
+            1
+        } else if white_score > black_score {
+            -1
+        } else {
+            0
+        }
+    }
     fn _get_group(
         &self,
         y: usize,
@@ -133,47 +190,45 @@ impl GoGameState {
         (group_stones, liberties)
     }
 
-    /// Checks if a move is valid (not suicide and not a superko repetition).
-    /// This is the core of the optimized legal move generation.
     fn is_valid_move(&self, y: usize, x: usize) -> bool {
         let player = self.current_player;
 
-        // --- 1. Compute potential next hash and check for captures ---
-        let mut potential_next_hash = self.current_hash ^ ZOBRIST_TABLE.key_for(y, x, player_to_index(player));
+        let mut potential_next_hash =
+            self.current_hash ^ ZOBRIST_TABLE.key_for(y, x, player_to_index(player));
         let mut captures_made = false;
 
         for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
             let ny_isize = y as isize + dy;
             let nx_isize = x as isize + dx;
-            if ny_isize < 0 || ny_isize >= self.board_size as isize || nx_isize < 0 || nx_isize >= self.board_size as isize { continue; }
+            if ny_isize < 0
+                || ny_isize >= self.board_size as isize
+                || nx_isize < 0
+                || nx_isize >= self.board_size as isize
+            {
+                continue;
+            }
             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
             if self.at(ny, nx) == -player {
                 let (group, liberties) = self._get_group(ny, nx, &self.board);
                 if liberties.len() == 1 && liberties.contains(&(y, x)) {
                     captures_made = true;
-                    // XOR out the captured group from the potential hash
                     for (sy, sx) in group {
-                        potential_next_hash ^= ZOBRIST_TABLE.key_for(sy, sx, player_to_index(-player));
+                        potential_next_hash ^=
+                            ZOBRIST_TABLE.key_for(sy, sx, player_to_index(-player));
                     }
                 }
             }
         }
 
-        // --- 2. Superko Check ---
-        // If the resulting board state has been seen before, the move is illegal.
         if self.history_hashes.contains(&potential_next_hash) {
             return false;
         }
 
-        // --- 3. Suicide Check ---
-        // A move that captures opponent stones can never be a suicide.
         if captures_made {
             return true;
         }
-        
-        // If no captures are made, check if the move results in the new group having no liberties.
-        // This efficient logic avoids creating a temporary board.
+
         let mut final_liberties = HashSet::new();
         let mut visited_stones_for_lib_check = HashSet::new();
         visited_stones_for_lib_check.insert((y, x));
@@ -181,125 +236,62 @@ impl GoGameState {
         for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
             let ny_isize = y as isize + dy;
             let nx_isize = x as isize + dx;
-            if ny_isize < 0 || ny_isize >= self.board_size as isize || nx_isize < 0 || nx_isize >= self.board_size as isize { continue; }
+            if ny_isize < 0
+                || ny_isize >= self.board_size as isize
+                || nx_isize < 0
+                || nx_isize >= self.board_size as isize
+            {
+                continue;
+            }
             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
             match self.at(ny, nx) {
-                0 => return true, // Found an immediate liberty, so it's not suicide.
+                0 => return true,
                 p if p == player => {
-                    // This is a friendly neighbor. Check its group's liberties.
                     if !visited_stones_for_lib_check.contains(&(ny, nx)) {
                         let (group, liberties) = self._get_group(ny, nx, &self.board);
-                        for l in liberties { final_liberties.insert(l); }
-                        // Mark all stones of this group as visited to avoid re-processing.
-                        for s in group { visited_stones_for_lib_check.insert(s); }
+                        for l in liberties {
+                            final_liberties.insert(l);
+                        }
+                        for s in group {
+                            visited_stones_for_lib_check.insert(s);
+                        }
                     }
                 }
-                _ => {} // Opponent stone, does not contribute liberties.
+                _ => {}
             }
         }
 
-        // The only potential liberties are from adjacent friendly groups.
-        // We must not count the new stone's position (y,x) as a liberty.
         final_liberties.remove(&(y, x));
 
-        // If the set of liberties is not empty, the move is not suicide.
         !final_liberties.is_empty()
     }
 
-
-    /// Determines the winner using area scoring (stones + territory).
-    fn _get_winner(&self) -> i8 {
-        let mut territory_mask = self.board.clone();
-        let mut visited_flood = HashSet::new();
-
-        for y in 0..self.board_size {
-            for x in 0..self.board_size {
-                if territory_mask[y * self.board_size + x] == 0 && !visited_flood.contains(&(y, x))
-                {
-                    let mut q = VecDeque::new();
-                    let mut visited_region = HashSet::new();
-                    let mut borders = (false, false); // (touches_black, touches_white)
-
-                    q.push_back((y, x));
-                    visited_region.insert((y, x));
-                    visited_flood.insert((y, x));
-
-                    while let Some((cy, cx)) = q.pop_front() {
-                        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                            let ny_isize = cy as isize + dy;
-                            let nx_isize = cx as isize + dx;
-
-                            if ny_isize < 0
-                                || ny_isize >= self.board_size as isize
-                                || nx_isize < 0
-                                || nx_isize >= self.board_size as isize
-                            {
-                                continue;
-                            }
-                            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
-                            let neighbor_val = self.board[ny * self.board_size + nx];
-                            if neighbor_val == 1 {
-                                borders.0 = true;
-                            } else if neighbor_val == -1 {
-                                borders.1 = true;
-                            } else if !visited_region.contains(&(ny, nx)) {
-                                visited_region.insert((ny, nx));
-                                visited_flood.insert((ny, nx));
-                                q.push_back((ny, nx));
-                            }
-                        }
-                    }
-
-                    let owner = match borders {
-                        (true, false) => 1,
-                        (false, true) => -1,
-                        _ => 0,
-                    };
-
-                    if owner != 0 {
-                        for (ry, rx) in visited_region {
-                            territory_mask[ry * self.board_size + rx] = owner;
-                        }
-                    }
-                }
-            }
-        }
-
-        let black_score: f32 = territory_mask.iter().filter(|&&s| s == 1).count() as f32;
-        let white_score: f32 =
-            territory_mask.iter().filter(|&&s| s == -1).count() as f32 + 7.5; // Komi
-
-        if black_score > white_score {
-            1
-        } else if white_score > black_score {
-            -1
-        } else {
-            0
-        }
-    }
 }
 
 #[pymethods]
 impl GoGameState {
     #[new]
     fn new(board_size: usize) -> Self {
-        assert!(board_size <= MAX_BOARD_SIZE, "Board size exceeds max supported size of {}", MAX_BOARD_SIZE);
+        assert!(
+            board_size <= MAX_BOARD_SIZE,
+            "Board size exceeds max supported size of {}",
+            MAX_BOARD_SIZE
+        );
         let board = vec![0i8; board_size * board_size];
-        
-        // Pre-fill with empty boards for NN input history
+
         let mut history_boards = VecDeque::with_capacity(9);
         for _ in 0..8 {
             history_boards.push_back(board.clone());
         }
 
         let mut history_hashes = HashSet::new();
-        history_hashes.insert(0); // Add hash for the empty board
+        history_hashes.insert(0);
 
         GoGameState {
             board_size,
             board,
-            current_player: 1, // Black starts
+            current_player: 1,
             history_boards,
             consecutive_passes: 0,
             move_count: 0,
@@ -318,6 +310,10 @@ impl GoGameState {
         self.current_player
     }
 
+    fn get_scores(&self) -> (f32, f32) {
+        self._calculate_scores()
+    }
+
     fn clone(&self) -> Self {
         Clone::clone(self)
     }
@@ -327,46 +323,53 @@ impl GoGameState {
 
         if action == pass_move {
             self.consecutive_passes += 1;
-            self.ko_point = None; // A pass move resolves any ko situation.
+            self.ko_point = None;
         } else {
             self.consecutive_passes = 0;
             let (y, x) = (action / self.board_size, action % self.board_size);
-            
-            // Update hash for the new stone being placed.
+
             self.current_hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(self.current_player));
             self.set(y, x, self.current_player);
 
             let mut captured_stones_total = 0;
             let mut single_captured_stone_pos = None;
 
-            // Check for captures of opponent groups
             for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
                 let ny_isize = y as isize + dy;
                 let nx_isize = x as isize + dx;
-                if ny_isize < 0 || ny_isize >= self.board_size as isize || nx_isize < 0 || nx_isize >= self.board_size as isize { continue; }
+                if ny_isize < 0
+                    || ny_isize >= self.board_size as isize
+                    || nx_isize < 0
+                    || nx_isize >= self.board_size as isize
+                {
+                    continue;
+                }
                 let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
                 if self.at(ny, nx) == -self.current_player {
                     let (group, liberties) = self._get_group(ny, nx, &self.board);
                     if liberties.is_empty() {
                         if group.len() == 1 {
-                                single_captured_stone_pos = group.iter().next().cloned();
+                            single_captured_stone_pos = group.iter().next().cloned();
                         }
                         captured_stones_total += group.len();
                         for (sy, sx) in group {
-                            // Update hash for each removed stone.
-                            self.current_hash ^= ZOBRIST_TABLE.key_for(sy, sx, player_to_index(-self.current_player));
+                            self.current_hash ^= ZOBRIST_TABLE.key_for(
+                                sy,
+                                sx,
+                                player_to_index(-self.current_player),
+                            );
                             self.set(sy, sx, 0);
                         }
                     }
                 }
             }
 
-            // Simple Ko Rule Check
             let (my_group, my_liberties) = self._get_group(y, x, &self.board);
             if captured_stones_total == 1 && my_group.len() == 1 && my_liberties.len() == 1 {
                 if let Some(liberty_pos) = my_liberties.iter().next() {
-                    let (opp_group, opp_libs) = self._get_group(liberty_pos.0, liberty_pos.1, &self.board);
+                    let (opp_group, opp_libs) =
+                        self._get_group(liberty_pos.0, liberty_pos.1, &self.board);
                     if opp_group.len() == 1 && opp_libs.len() == 1 {
                         self.ko_point = single_captured_stone_pos;
                     } else {
@@ -380,7 +383,6 @@ impl GoGameState {
             }
         }
 
-        // Update history (both boards for NN and hashes for rules)
         self.history_boards.push_front(self.board.clone());
         if self.history_boards.len() > 8 {
             self.history_boards.pop_back();
@@ -391,19 +393,15 @@ impl GoGameState {
         self.move_count += 1;
     }
 
-    /// Generates a list of all legal moves for the current player.
     fn get_legal_moves(&self) -> Vec<usize> {
         let mut legal_moves = Vec::with_capacity(self.board_size * self.board_size + 1);
-        legal_moves.push(self.board_size * self.board_size); // Pass move
+        legal_moves.push(self.board_size * self.board_size);
 
         let mut other_moves: Vec<usize> = (0..self.board_size * self.board_size)
             .into_par_iter()
             .filter_map(|action| {
                 let (y, x) = (action / self.board_size, action % self.board_size);
-                if self.at(y, x) == 0
-                    && self.ko_point != Some((y, x))
-                    && self.is_valid_move(y, x)
-                {
+                if self.at(y, x) == 0 && self.ko_point != Some((y, x)) && self.is_valid_move(y, x) {
                     Some(action)
                 } else {
                     None
@@ -415,7 +413,6 @@ impl GoGameState {
         legal_moves
     }
 
-
     fn is_game_over(&self) -> (bool, Option<i8>) {
         let max_moves = self.board_size * self.board_size * 2;
         if self.consecutive_passes >= 2 || self.move_count >= max_moves as u32 {
@@ -425,7 +422,10 @@ impl GoGameState {
         }
     }
 
-    fn get_representation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
+    fn get_representation<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
         let num_planes = 17;
         let plane_size = self.board_size * self.board_size;
         let mut state_vec = vec![0.0f32; num_planes * plane_size];
@@ -433,7 +433,6 @@ impl GoGameState {
         let player_stone = self.current_player;
         let opponent_stone = -self.current_player;
 
-        // Planes 0 (player) and 8 (opponent) for current board
         for i in 0..self.board.len() {
             if self.board[i] == player_stone {
                 state_vec[i] = 1.0;
@@ -442,8 +441,6 @@ impl GoGameState {
             }
         }
 
-        // Planes 1-7 (player history) and 9-15 (opponent history)
-        // This relies on the `history_boards` deque.
         for (hist_idx, past_board) in self.history_boards.iter().take(7).enumerate() {
             let player_plane_offset = (hist_idx + 1) * plane_size;
             let opponent_plane_offset = (hist_idx + 9) * plane_size;
@@ -456,7 +453,6 @@ impl GoGameState {
             }
         }
 
-        // Plane 16: Color plane (1.0 for black to play, 0.0 otherwise)
         if self.current_player == 1 {
             let color_plane_offset = 16 * plane_size;
             state_vec[color_plane_offset..color_plane_offset + plane_size].fill(1.0);
@@ -468,11 +464,6 @@ impl GoGameState {
     }
 }
 
-// =================================================================================
-// === MCTS IMPLEMENTATION (MODIFIED FOR TRANSPOSITION TABLE) ======================
-// =================================================================================
-
-/// A node in the Monte Carlo Tree Search tree.
 #[pyclass]
 #[derive(Debug, Clone)]
 struct MCTSNode {
@@ -523,40 +514,45 @@ impl MCTSNode {
             let action = *item.key();
             let total_val = *item.value();
             let visits = self.visit_count.get(&action).map_or(0, |v| *v) as f64;
-            let mean_val = if visits > 0.0 { total_val / visits } else { 0.0 };
+            let mean_val = if visits > 0.0 {
+                total_val / visits
+            } else {
+                0.0
+            };
             dict.set_item(action, mean_val).unwrap();
         }
         dict
     }
 
     fn get_child(&self, action: usize) -> Option<MCTSNode> {
-        self.children.get(&action).map(|child| child.value().clone())
+        self.children
+            .get(&action)
+            .map(|child| child.value().clone())
     }
 
     fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
 
-    /// Selects an action based on the PUCT formula, incorporating the µ-FPU heuristic.
     fn select_action(&self, c_puct: f64) -> Option<usize> {
         let mut best_score = f64::NEG_INFINITY;
         let mut best_action = None;
 
-        // --- µ-FPU Heuristic Implementation ---
         let (total_visits_from_node, total_value_from_node) =
-            self.visit_count.iter().fold((0.0, 0.0), |(v_acc, val_acc), entry| {
-                let action = *entry.key();
-                let visits = *entry.value() as f64;
-                let value = self.total_action_value.get(&action).map_or(0.0, |v| *v);
-                (v_acc + visits, val_acc + value)
-            });
+            self.visit_count
+                .iter()
+                .fold((0.0, 0.0), |(v_acc, val_acc), entry| {
+                    let action = *entry.key();
+                    let visits = *entry.value() as f64;
+                    let value = self.total_action_value.get(&action).map_or(0.0, |v| *v);
+                    (v_acc + visits, val_acc + value)
+                });
 
         let mu_fpu = if total_visits_from_node > 0.0 {
             total_value_from_node / total_visits_from_node
         } else {
-            0.0 // Default value if no moves have been explored yet.
+            0.0
         };
-        // --- End µ-FPU ---
 
         let sqrt_total_visits = total_visits_from_node.sqrt();
 
@@ -567,7 +563,7 @@ impl MCTSNode {
             let q_value = if n_value > 0.0 {
                 *self.total_action_value.get(&action).unwrap() / n_value
             } else {
-                mu_fpu // Apply µ-FPU for unvisited moves.
+                mu_fpu
             };
 
             let p_value = *self.prior_prob.get(&action).unwrap();
@@ -591,14 +587,12 @@ impl MCTSNode {
     }
 }
 
-/// An entry in the transposition table, caching NN results.
 #[derive(Clone, Debug)]
 struct TTEntry {
     policy: HashMap<usize, f64>,
     value: f64,
 }
 
-/// An implementation of Batch Monte Carlo Tree Search as described in AlphaGo Zero.
 #[pyclass]
 struct MCTS {
     network: PyObject,
@@ -629,28 +623,35 @@ impl MCTS {
         root_state: &GoGameState,
         num_simulations: usize,
     ) -> PyResult<()> {
-        // --- 1. Root Expansion and Noise ---
         if root_node.is_leaf() {
             let state_repr_numpy = root_state.get_representation(py)?;
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
-            
+
             let result_obj = self.network.call_method1(py, "predict", (batch_repr,))?;
             let result_tuple = result_obj.downcast_bound::<pyo3::types::PyTuple>(py)?;
             let policy_item = result_tuple.get_item(0)?;
             let policy_array_2d = policy_item.downcast::<PyArray2<f32>>()?;
             let value_item = result_tuple.get_item(1)?;
-            let value_vec: Vec<f32> = value_item.downcast::<PyArray1<f32>>()?.readonly().to_vec()?;
+            let value_vec: Vec<f32> = value_item
+                .downcast::<PyArray1<f32>>()?
+                .readonly()
+                .to_vec()?;
 
             let policy_readonly = policy_array_2d.readonly();
             let policy_array = policy_readonly.as_array();
-            let policy_slice = policy_array.slice(s![0, ..]).to_slice()
+            let policy_slice = policy_array
+                .slice(s![0, ..])
+                .to_slice()
                 .ok_or_else(|| PyValueError::new_err("failed to slice policy array"))?;
-            
+
             let (policy_map, _) = self._get_normalized_priors(root_state, policy_slice)?;
             self.transposition_table.insert(
                 root_state.current_hash,
-                TTEntry { policy: policy_map.clone(), value: value_vec[0] as f64 },
+                TTEntry {
+                    policy: policy_map.clone(),
+                    value: value_vec[0] as f64,
+                },
             );
 
             root_node.expand(&policy_map);
@@ -663,12 +664,18 @@ impl MCTS {
         }
         #[allow(non_camel_case_types)]
         enum SimulationResult<'a> {
-            Terminal { path: Vec<(&'a MCTSNode, usize)>, value: f64 },
-            TtHit { path: Vec<(&'a MCTSNode, usize)>, node_to_expand: &'a MCTSNode, entry: TTEntry },
+            Terminal {
+                path: Vec<(&'a MCTSNode, usize)>,
+                value: f64,
+            },
+            TtHit {
+                path: Vec<(&'a MCTSNode, usize)>,
+                node_to_expand: &'a MCTSNode,
+                entry: TTEntry,
+            },
             NeedsEvaluation(LeafToEvaluate<'a>),
         }
 
-        // --- 2. Parallel Selection Phase ---
         let simulation_results: Vec<SimulationResult> = (0..num_simulations)
             .into_par_iter()
             .map(|_| {
@@ -688,26 +695,40 @@ impl MCTS {
                 let (is_over, winner_opt) = current_state.is_game_over();
                 if is_over {
                     let winner = winner_opt.unwrap_or(0);
-                    let value = if winner == 0 { 0.0 } else { (winner as f64) * (root_state.current_player as f64) };
+                    let value = if winner == 0 {
+                        0.0
+                    } else {
+                        (winner as f64) * (root_state.current_player as f64)
+                    };
                     SimulationResult::Terminal { path, value }
                 } else {
                     if let Some(entry) = self.transposition_table.get(&current_state.current_hash) {
-                         SimulationResult::TtHit { path, node_to_expand: node, entry: entry.value().clone() }
+                        SimulationResult::TtHit {
+                            path,
+                            node_to_expand: node,
+                            entry: entry.value().clone(),
+                        }
                     } else {
-                         SimulationResult::NeedsEvaluation(LeafToEvaluate { path, state: current_state })
+                        SimulationResult::NeedsEvaluation(LeafToEvaluate {
+                            path,
+                            state: current_state,
+                        })
                     }
                 }
             })
             .collect();
 
-        // --- 3. Sequential Backup and Batch Collection ---
         let mut leaves_to_evaluate: Vec<LeafToEvaluate> = Vec::with_capacity(num_simulations);
         for result in simulation_results {
             match result {
                 SimulationResult::Terminal { path, value } => {
                     self._backup(&path, value);
                 }
-                SimulationResult::TtHit { path, node_to_expand, entry } => {
+                SimulationResult::TtHit {
+                    path,
+                    node_to_expand,
+                    entry,
+                } => {
                     node_to_expand.expand(&entry.policy);
                     self._backup(&path, entry.value);
                 }
@@ -717,7 +738,6 @@ impl MCTS {
             }
         }
 
-        // --- 4. Batch Expansion and Backup ---
         if !leaves_to_evaluate.is_empty() {
             let mut state_reps = Vec::with_capacity(leaves_to_evaluate.len());
             for leaf in &leaves_to_evaluate {
@@ -728,31 +748,43 @@ impl MCTS {
             stack_kwargs.set_item("arrays", state_reps)?;
             stack_kwargs.set_item("axis", 0)?;
             let batch_numpy_array = np.call_method("stack", (), Some(&stack_kwargs))?;
-            let result_obj = self.network.call_method1(py, "predict", (batch_numpy_array,))?;
+            let result_obj = self
+                .network
+                .call_method1(py, "predict", (batch_numpy_array,))?;
 
             let result_tuple = result_obj.downcast_bound::<pyo3::types::PyTuple>(py)?;
             let policy_item = result_tuple.get_item(0)?;
             let policies_array = policy_item.downcast::<PyArray2<f32>>()?;
             let policies = policies_array.readonly();
             let value_item = result_tuple.get_item(1)?;
-            let value_vec: Vec<f32> = value_item.downcast::<PyArray1<f32>>()?.readonly().to_vec()?;
+            let value_vec: Vec<f32> = value_item
+                .downcast::<PyArray1<f32>>()?
+                .readonly()
+                .to_vec()?;
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
-                let leaf_node = item.path.last().map_or(root_node, |(parent, action)| {
-                    unsafe { &*(parent.children.get(action).unwrap().value() as *const MCTSNode) }
-                });
+                let leaf_node = item
+                    .path
+                    .last()
+                    .map_or(root_node, |(parent, action)| unsafe {
+                        &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
+                    });
 
                 let policies_array_view = policies.as_array();
-                let policy_slice = policies_array_view.slice(s![i, ..]).to_slice()
+                let policy_slice = policies_array_view
+                    .slice(s![i, ..])
+                    .to_slice()
                     .ok_or_else(|| PyValueError::new_err("failed to slice batched policy array"))?;
 
                 let (policy_map, _) = self._get_normalized_priors(&item.state, policy_slice)?;
                 let value = value_vec[i] as f64;
-                
-                // Store in transposition table
+
                 self.transposition_table.insert(
                     item.state.current_hash,
-                    TTEntry { policy: policy_map.clone(), value },
+                    TTEntry {
+                        policy: policy_map.clone(),
+                        value,
+                    },
                 );
 
                 leaf_node.expand(&policy_map);
@@ -762,14 +794,29 @@ impl MCTS {
         Ok(())
     }
 
-    fn get_move_probs<'py>(&self, py: Python<'py>, root_node: &MCTSNode, temp: f64) -> PyResult<Bound<'py, PyDict>> {
-        let visit_counts: HashMap<usize, u32> = root_node.visit_count.iter().map(|e| (*e.key(), *e.value())).collect();
+    fn get_move_probs<'py>(
+        &self,
+        py: Python<'py>,
+        root_node: &MCTSNode,
+        temp: f64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let visit_counts: HashMap<usize, u32> = root_node
+            .visit_count
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
         let out_dict = PyDict::new(py);
 
-        if visit_counts.is_empty() { return Ok(out_dict); }
+        if visit_counts.is_empty() {
+            return Ok(out_dict);
+        }
 
         if temp == 0.0 {
-            if let Some(best_action) = visit_counts.iter().max_by_key(|&(_, count)| count).map(|(k, _)| k) {
+            if let Some(best_action) = visit_counts
+                .iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(k, _)| k)
+            {
                 for action in visit_counts.keys() {
                     out_dict.set_item(action, if action == best_action { 1.0 } else { 0.0 })?;
                 }
@@ -778,12 +825,17 @@ impl MCTS {
         }
 
         let inv_temp = 1.0 / temp;
-        let powered_counts: HashMap<_,_> = visit_counts.iter().map(|(&a, &c)| (a, (c as f64).powf(inv_temp))).collect();
+        let powered_counts: HashMap<_, _> = visit_counts
+            .iter()
+            .map(|(&a, &c)| (a, (c as f64).powf(inv_temp)))
+            .collect();
         let total_powered_count: f64 = powered_counts.values().sum();
 
         if total_powered_count < 1e-6 {
             let prob = 1.0 / visit_counts.len() as f64;
-            for action in visit_counts.keys() { out_dict.set_item(action, prob)?; }
+            for action in visit_counts.keys() {
+                out_dict.set_item(action, prob)?;
+            }
         } else {
             for (action, powered_count) in powered_counts {
                 out_dict.set_item(action, powered_count / total_powered_count)?;
@@ -796,13 +848,18 @@ impl MCTS {
 impl MCTS {
     fn _add_dirichlet_noise(&self, node: &MCTSNode) {
         let actions: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
-        if actions.is_empty() { return; }
+        if actions.is_empty() {
+            return;
+        }
 
         let gamma_dist = match Gamma::new(self.dirichlet_alpha, 1.0) {
-            Ok(d) => d, Err(_) => return,
+            Ok(d) => d,
+            Err(_) => return,
         };
         let mut rng = rand::rng();
-        let mut samples: Vec<f64> = (0..actions.len()).map(|_| gamma_dist.sample(&mut rng)).collect();
+        let mut samples: Vec<f64> = (0..actions.len())
+            .map(|_| gamma_dist.sample(&mut rng))
+            .collect();
         let sum: f64 = samples.iter().sum();
 
         if sum > 1e-9 {
@@ -837,10 +894,14 @@ impl MCTS {
         }
 
         if prob_sum > 1e-6 {
-            for prob in action_priors.values_mut() { *prob /= prob_sum; }
+            for prob in action_priors.values_mut() {
+                *prob /= prob_sum;
+            }
         } else if !action_priors.is_empty() {
             let uniform_prob = 1.0 / action_priors.len() as f64;
-            for prob in action_priors.values_mut() { *prob = uniform_prob; }
+            for prob in action_priors.values_mut() {
+                *prob = uniform_prob;
+            }
         }
 
         Ok((action_priors, prob_sum))

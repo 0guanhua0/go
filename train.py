@@ -1,4 +1,5 @@
 import argparse
+import collections
 import logging
 import os
 import queue
@@ -6,6 +7,7 @@ import time
 
 import numpy as np
 import torch
+from sgfmill import sgf
 from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 
 import config
@@ -13,6 +15,13 @@ import wandb
 from elo import Rating, calculate_expected_score, update_ratings
 from mcts_rs import MCTS, GoGameState, MCTSNode
 from network import AlphaGoZeroNet
+
+
+def to_sgf_coords(action, board_size):
+    if action == board_size * board_size:
+        return None
+    row, col = divmod(action, board_size)
+    return (row, col)
 
 
 class ReplayBuffer:
@@ -89,19 +98,133 @@ class CPUWorker:
     def __init__(self, worker_id):
         self.worker_id = worker_id
 
-    def play_game(self, generation_num):
+    def play_game(self, generation_num, resignation_threshold, disable_resignation):
         network_wrapper = NetworkWrapper(
             self.worker_id,
             model_id="best",
             request_queue=self.request_queue,
             result_pipe=self.result_pipes[self.worker_id],
         )
-        game_data = play_game(network_wrapper, generation_num)
-        self.replay_buffer.add(game_data)
-        logging.info(
-            f"Game finished ({len(game_data)} moves). Buffer size: {len(self.replay_buffer)}"
+
+        game_state = GoGameState(config.BOARD_SIZE)
+        mcts = MCTS(
+            network_wrapper,
+            config.C_PUCT,
+            config.DIRICHLET_ALPHA,
+            config.DIRICHLET_EPSILON,
         )
-        return len(game_data)
+
+        sgf_game = sgf.Sgf_game(size=config.BOARD_SIZE)
+        sgf_game.get_root().set_raw("KM", b"7.5")
+        sgf_game.get_root().set("PW", "AlphaGoZero-Best")
+        sgf_game.get_root().set("PB", "AlphaGoZero-Best")
+        sgf_node = sgf_game.get_root()
+
+        root_node = MCTSNode()
+        game_history = []
+        state_repr = game_state.get_representation()
+        resigned = False
+
+        while True:
+            game_over, winner = game_state.is_game_over()
+            if game_over:
+                break
+
+            mcts.run_simulations(root_node, game_state, config.NUM_SIMULATIONS)
+
+            temp = 1.0 if game_state.move_count < 30 else 0.0
+            move_probs = mcts.get_move_probs(root_node, temp)
+            root_value = sum(
+                prob * root_node.mean_action_value.get(action, 0.0)
+                for action, prob in move_probs.items()
+            )
+
+            if not disable_resignation:
+                best_action = max(move_probs, key=move_probs.get) if move_probs else -1
+                best_child_value = root_node.mean_action_value.get(best_action, -1.0)
+                if (
+                    root_value < resignation_threshold
+                    and best_child_value < resignation_threshold
+                ):
+                    winner = -game_state.get_current_player()
+                    resigned = True
+                    break
+
+            policy_target = np.zeros(
+                config.BOARD_SIZE * config.BOARD_SIZE + 1, dtype=np.float32
+            )
+            for action, prob in move_probs.items():
+                policy_target[action] = prob
+
+            game_history.append(
+                (
+                    state_repr,
+                    policy_target,
+                    game_state.get_current_player(),
+                    root_value,
+                )
+            )
+            action_to_play = np.random.choice(len(policy_target), p=policy_target)
+
+            player_color = "b" if game_state.get_current_player() == 1 else "w"
+            sgf_coords = to_sgf_coords(action_to_play, config.BOARD_SIZE)
+            sgf_node = sgf_node.new_child()
+            sgf_node.set_move(player_color, sgf_coords)
+
+            game_state.apply_move(action_to_play)
+            state_repr = game_state.get_representation()
+            child_node = root_node.get_child(action_to_play)
+            root_node = child_node if child_node is not None else MCTSNode()
+
+        game_data = []
+        non_resigned_data = []
+        for state_repr_hist, policy, player, r_val in game_history:
+            z = player * winner
+            game_data.append(
+                (torch.from_numpy(state_repr_hist.astype(np.float32)), policy, z)
+            )
+            if disable_resignation:
+                non_resigned_data.append({"root_value": r_val, "final_reward": z})
+
+        self.replay_buffer.add(game_data)
+
+        sgf_result = ""
+        if resigned:
+            sgf_result = "B+R" if winner == 1 else "W+R"
+        else:
+            try:
+                black_score, white_score = game_state.get_scores()
+                if winner == 1:
+                    margin = black_score - white_score
+                    sgf_result = f"B+{margin:.1f}"
+                elif winner == -1:
+                    margin = white_score - black_score
+                    sgf_result = f"W+{margin:.1f}"
+                else:
+                    sgf_result = "Jigo"
+            except Exception:
+                sgf_result = "Void"
+
+        sgf_game.get_root().set("RE", sgf_result)
+
+        filename = (
+            time.strftime("%Y%m%d-%H%M%S")
+            + f"-gen-{generation_num}-worker-{self.worker_id}.sgf"
+        )
+        with open(filename, "wb") as f:
+            f.write(sgf_game.serialise())
+
+        log_message = (
+            f"Game finished ({len(game_data)} moves). Result: {sgf_result}. "
+            f"Buffer size: {len(self.replay_buffer)}"
+        )
+        logging.info(log_message)
+
+        return {
+            "moves": len(game_data),
+            "disable_resignation": disable_resignation,
+            "non_resigned_data": non_resigned_data,
+        }
 
     def evaluate_game(self, is_next_black):
         next_wrapper = NetworkWrapper(
@@ -118,6 +241,14 @@ class CPUWorker:
         )
         winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
         return winner_result
+
+    def play_game_task(
+        worker_id, generation_num, resignation_threshold, disable_resignation
+    ):
+        worker = CPUWorker(worker_id)
+        return worker.play_game(
+            generation_num, resignation_threshold, disable_resignation
+        )
 
 
 class GPUWorker(Process):
@@ -335,64 +466,9 @@ class NetworkWrapper:
         return policy_probs, value
 
 
-def play_game_task(worker_id, generation_num):
-    worker = CPUWorker(worker_id)
-    return worker.play_game(generation_num)
-
-
 def evaluate_game_task(worker_id, is_next_black):
     worker = CPUWorker(worker_id)
     return worker.evaluate_game(is_next_black)
-
-
-def play_game(network_wrapper, generation_num):
-    game_state = GoGameState(config.BOARD_SIZE)
-    mcts = MCTS(
-        network_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON
-    )
-    root_node = MCTSNode()
-    game_history = []
-    state_repr = game_state.get_representation()
-
-    while True:
-        game_over, winner = game_state.is_game_over()
-        if game_over:
-            break
-
-        mcts.run_simulations(root_node, game_state, config.NUM_SIMULATIONS)
-
-        if generation_num > 5 and not root_node.is_leaf():
-            move_probs_det = mcts.get_move_probs(root_node, temp=0)
-            if move_probs_det:
-                best_action = max(move_probs_det, key=move_probs_det.get)
-                root_value = root_node.mean_action_value.get(best_action, -1.0)
-                if root_value < config.RESIGNATION_THRESHOLD:
-                    winner = -game_state.get_current_player()
-                    break
-        temp = 1.0 if game_state.move_count < 30 else 0.0
-        move_probs = mcts.get_move_probs(root_node, temp)
-        policy_target = np.zeros(
-            config.BOARD_SIZE * config.BOARD_SIZE + 1, dtype=np.float32
-        )
-        for action, prob in move_probs.items():
-            policy_target[action] = prob
-
-        game_history.append(
-            (state_repr, policy_target, game_state.get_current_player())
-        )
-        action_to_play = np.random.choice(len(policy_target), p=policy_target)
-        game_state.apply_move(action_to_play)
-        state_repr = game_state.get_representation()
-        child_node = root_node.get_child(action_to_play)
-        root_node = child_node if child_node is not None else MCTSNode()
-
-    training_data = []
-    for state_repr_hist, policy, player in game_history:
-        z = player * winner
-        training_data.append(
-            (torch.from_numpy(state_repr_hist.astype(np.float32)), policy, z)
-        )
-    return training_data
 
 
 def evaluate_game(next_wrapper, best_wrapper, is_next_black):
@@ -544,10 +620,16 @@ def main(args):
     if run.resumed:
         start_generation, best_model_elo = load_checkpoint(run, config)
 
+    resignation_threshold = config.RESIGNATION_THRESHOLD
+    non_resignation_history = collections.deque()
+
     active_sp_tasks = {}
 
-    def dispatch_sp_task(worker_id, gen_num):
-        return cpu_worker_pool.apply_async(play_game_task, args=(worker_id, gen_num))
+    def dispatch_sp_task(worker_id, gen_num, threshold, disable_resign):
+        return cpu_worker_pool.apply_async(
+            CPUWorker.play_game_task,
+            args=(worker_id, gen_num, threshold, disable_resign),
+        )
 
     min_initial_data = config.BATCH_SIZE * 20
     if len(replay_buffer) < min_initial_data:
@@ -556,7 +638,10 @@ def main(args):
         )
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
-                active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, 0)
+                disable_resign = worker_id % 10 == 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    worker_id, 0, resignation_threshold, disable_resign
+                )
         while len(replay_buffer) < min_initial_data:
             done_workers = [
                 worker_id
@@ -564,7 +649,11 @@ def main(args):
                 if result.ready()
             ]
             for worker_id in done_workers:
-                active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, 0)
+                active_sp_tasks[worker_id].get()
+                disable_resign = worker_id % 10 == 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    worker_id, 0, resignation_threshold, disable_resign
+                )
             logging.info(f"Buffer size: {len(replay_buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
@@ -573,17 +662,62 @@ def main(args):
         logging.info(f"--- Generation {generation}/{config.MAX_GENERATIONS} ---")
         log_data = {"generation": generation}
         run.log(log_data, step=generation, commit=False)
+
+        if len(non_resignation_history) > 1000:
+            logging.info("Updating resignation threshold...")
+            best_threshold = resignation_threshold
+            min_diff = float("inf")
+
+            for v_candidate in np.arange(-0.99, -0.50, 0.01):
+                would_resign = [
+                    d for d in non_resignation_history if d[0] < v_candidate
+                ]
+                if not would_resign:
+                    continue
+
+                false_positives = sum(1 for _, outcome in would_resign if outcome == 1)
+                fp_rate = false_positives / len(would_resign)
+
+                if fp_rate <= 0.05 and (0.05 - fp_rate) < min_diff:
+                    min_diff = 0.05 - fp_rate
+                    best_threshold = v_candidate
+
+            if best_threshold != resignation_threshold:
+                logging.info(
+                    f"New resignation threshold: {best_threshold:.2f} (previously {resignation_threshold:.2f})"
+                )
+                resignation_threshold = best_threshold
+            else:
+                logging.info(
+                    f"Resignation threshold remains {resignation_threshold:.2f}"
+                )
+            log_data.update({"resignation_threshold": resignation_threshold})
+
         logging.info("[1/3] Managing self-play pool and training...")
-        done_workers = [
-            worker_id
-            for worker_id, result in list(active_sp_tasks.items())
-            if result.ready() and (result.get() is not None)
-        ]
+        done_workers = []
+        for worker_id, result in list(active_sp_tasks.items()):
+            if result.ready():
+                game_result = result.get()
+                if game_result and game_result["disable_resignation"]:
+                    for data_point in game_result["non_resigned_data"]:
+                        non_resignation_history.append(
+                            (data_point["root_value"], data_point["final_reward"])
+                        )
+                done_workers.append(worker_id)
+
         for worker_id in done_workers:
-            active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, generation)
+            disable_resign = worker_id % 10 == 0
+            active_sp_tasks[worker_id] = dispatch_sp_task(
+                worker_id, generation, resignation_threshold, disable_resign
+            )
+
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks or active_sp_tasks[worker_id].ready():
-                active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, generation)
+                disable_resign = worker_id % 10 == 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    worker_id, generation, resignation_threshold, disable_resign
+                )
+
         if len(replay_buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
             time.sleep(10)
@@ -614,7 +748,16 @@ def main(args):
         logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
         for res in active_sp_tasks.values():
             res.wait()
+        # Collect final results from the generation's games
+        for worker_id, result in list(active_sp_tasks.items()):
+            game_result = result.get()
+            if game_result and game_result["disable_resignation"]:
+                for data_point in game_result["non_resigned_data"]:
+                    non_resignation_history.append(
+                        (data_point["root_value"], data_point["final_reward"])
+                    )
         active_sp_tasks.clear()
+
         logging.info("Evaluating 'next' model (self-play is paused)...")
         next_model_elo = best_model_elo
         expected_win_rate = calculate_expected_score(next_model_elo, best_model_elo)
@@ -686,7 +829,10 @@ def main(args):
             "Evaluation complete. Resuming self-play for the next generation..."
         )
         for worker_id in range(num_cpu_workers):
-            active_sp_tasks[worker_id] = dispatch_sp_task(worker_id, generation)
+            disable_resign = worker_id % 10 == 0
+            active_sp_tasks[worker_id] = dispatch_sp_task(
+                worker_id, generation, resignation_threshold, disable_resign
+            )
 
     logging.info("\nTraining complete! Shutting down...")
     final_generation = locals().get("generation", config.MAX_GENERATIONS)
