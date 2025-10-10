@@ -54,7 +54,6 @@ pub struct GoGameState {
     history_boards: VecDeque<Vec<i8>>,
     consecutive_passes: u32,
     move_count: u32,
-    // ko_point: Option<(usize, usize)>, // REMOVED: Redundant under superko rule
     current_hash: u64,
     history_hashes: HashSet<u64>,
 }
@@ -190,7 +189,8 @@ impl GoGameState {
         (group_stones, liberties)
     }
 
-    fn is_valid_move(&self, y: usize, x: usize) -> bool {
+    // https://tromp.github.io/go.html
+    fn check(&self, y: usize, x: usize) -> bool {
         let player = self.current_player;
 
         if self.at(y, x) != 0 {
@@ -225,17 +225,10 @@ impl GoGameState {
             }
         }
 
-        if self.history_hashes.contains(&potential_next_hash) {
-            return false;
-        }
-
-        if captures_made {
-            return true;
-        }
-
         let mut final_liberties = HashSet::new();
         let mut visited_stones_for_lib_check = HashSet::new();
         visited_stones_for_lib_check.insert((y, x));
+        let mut has_immediate_liberty = false;
 
         for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
             let ny_isize = y as isize + dy;
@@ -250,7 +243,7 @@ impl GoGameState {
             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
             match self.at(ny, nx) {
-                0 => return true,
+                0 => has_immediate_liberty = true,
                 p if p == player => {
                     if !visited_stones_for_lib_check.contains(&(ny, nx)) {
                         let (group, liberties) = self._get_group(ny, nx, &self.board);
@@ -268,7 +261,13 @@ impl GoGameState {
 
         final_liberties.remove(&(y, x));
 
-        !final_liberties.is_empty()
+        let move_has_liberty =
+            has_immediate_liberty || !final_liberties.is_empty() || captures_made;
+        if !move_has_liberty {
+            return false;
+        }
+
+        !self.history_hashes.contains(&potential_next_hash)
     }
 }
 
@@ -333,7 +332,6 @@ impl GoGameState {
             self.current_hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(self.current_player));
             self.set(y, x, self.current_player);
 
-            // SIMPLIFIED: Removed complex ko detection; superko handles all cases.
             for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
                 let ny_isize = y as isize + dy;
                 let nx_isize = x as isize + dx;
@@ -366,9 +364,10 @@ impl GoGameState {
         if self.history_boards.len() > 8 {
             self.history_boards.pop_back();
         }
+        let next_player = -self.current_player;
         self.history_hashes.insert(self.current_hash);
+        self.current_player = next_player;
 
-        self.current_player *= -1;
         self.move_count += 1;
     }
 
@@ -380,8 +379,7 @@ impl GoGameState {
             .into_par_iter()
             .filter_map(|action| {
                 let (y, x) = (action / self.board_size, action % self.board_size);
-                // SIMPLIFIED: Removed ko_point check
-                if self.at(y, x) == 0 && self.is_valid_move(y, x) {
+                if self.at(y, x) == 0 && self.check(y, x) {
                     Some(action)
                 } else {
                     None
@@ -903,6 +901,79 @@ mod tests {
 
         let expected: Vec<usize> = (0..pass_action).collect();
         assert_eq!(legal_moves, expected);
+    }
+
+    fn compute_hash(board_size: usize, board: &[i8]) -> u64 {
+        let mut hash = 0;
+        for y in 0..board_size {
+            for x in 0..board_size {
+                let stone = board[y * board_size + x];
+                if stone != 0 {
+                    hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(stone));
+                }
+            }
+        }
+        hash
+    }
+
+    fn simulate_board_after_move(state: &GoGameState, y: usize, x: usize) -> Vec<i8> {
+        let mut board = state.board.clone();
+        let player = state.current_player;
+        board[y * state.board_size + x] = player;
+
+        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+            let ny_isize = y as isize + dy;
+            let nx_isize = x as isize + dx;
+            if ny_isize < 0
+                || ny_isize >= state.board_size as isize
+                || nx_isize < 0
+                || nx_isize >= state.board_size as isize
+            {
+                continue;
+            }
+            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+            if board[ny * state.board_size + nx] == -player {
+                let (group, liberties) = state._get_group(ny, nx, &board);
+                if liberties.is_empty() {
+                    for (sy, sx) in group {
+                        board[sy * state.board_size + sx] = 0;
+                    }
+                }
+            }
+        }
+
+        board
+    }
+
+    #[test]
+    fn superko_blocks_repeating_position() {
+        let mut state = GoGameState::new(3);
+        state.board = vec![
+            1, -1, 1, //
+            0, 0, 0, //
+            0, 0, 0, //
+        ];
+        state.current_player = 1;
+        state.current_hash = compute_hash(state.board_size, &state.board);
+
+        state.history_hashes.clear();
+        state.history_hashes.insert(state.current_hash);
+
+        let target_y = 1;
+        let target_x = 1;
+        assert!(
+            state.check(target_y, target_x),
+            "move should be legal before superko check"
+        );
+
+        let repeated_board = simulate_board_after_move(&state, target_y, target_x);
+        let repeated_hash = compute_hash(state.board_size, &repeated_board);
+        state.history_hashes.insert(repeated_hash);
+
+        assert!(
+            !state.check(target_y, target_x),
+            "superko should prevent recreating an earlier grid coloring"
+        );
     }
 }
 
