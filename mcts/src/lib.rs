@@ -884,6 +884,28 @@ impl MCTS {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legal_moves_on_empty_board_include_pass_and_all_points() {
+        let board_size = 3;
+        let pass_action = board_size * board_size;
+        let state = GoGameState::new(board_size);
+        let mut legal_moves = state.get_legal_moves();
+
+        assert_eq!(legal_moves.len(), pass_action + 1);
+        assert!(legal_moves.contains(&pass_action));
+
+        legal_moves.retain(|action| *action != pass_action);
+        legal_moves.sort_unstable();
+
+        let expected: Vec<usize> = (0..pass_action).collect();
+        assert_eq!(legal_moves, expected);
+    }
+}
+
 #[pymodule]
 fn mcts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MCTS>()?;

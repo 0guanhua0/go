@@ -19,3 +19,13 @@ repos:
       entry: cargo check --manifest-path mcts/Cargo.toml
       language: system
       pass_filenames: false
+    - id: cargo-test
+      name: cargo test
+      entry: cargo test --manifest-path mcts/Cargo.toml
+      language: system
+      pass_filenames: false
+    - id: maturin-develop
+      name: maturin develop
+      entry: maturin develop
+      language: system
+      pass_filenames: false
