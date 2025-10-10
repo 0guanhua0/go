@@ -13,7 +13,7 @@ from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 import config
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
-from mcts_rs import MCTS, GoGameState, MCTSNode
+from mcts import MCTS, GoGameState, MCTSNode
 from network import AlphaGoZeroNet
 
 
@@ -541,10 +541,6 @@ def main(args):
     main_gpu_pipe_recv, main_gpu_pipe_send = Pipe(duplex=False)
 
     def save_checkpoint(generation, best_elo, run, cfg):
-        logging.info(
-            f"--- Saving lightweight checkpoint for generation {generation} ---"
-        )
-        logging.info("Requesting best model state from Accelerator...")
         gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = main_gpu_pipe_recv.recv()
         checkpoint_data = {
@@ -565,7 +561,6 @@ def main(args):
         artifact.add_file(filename)
         run.log_artifact(artifact, aliases=["latest", f"gen-{generation}"])
         logging.info("Checkpoint artifact uploaded to W&B.")
-        os.remove(filename)
 
     def load_checkpoint(run, cfg):
         logging.info("\n--- Resuming from lightweight checkpoint ---")
@@ -576,23 +571,12 @@ def main(args):
         checkpoint_path = os.path.join(artifact_dir, checkpoint_file)
         logging.info(f"Downloaded checkpoint to {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        if "generation" not in checkpoint or "best_model_state_dict" not in checkpoint:
-            raise KeyError(
-                "Checkpoint is missing required keys ('generation', 'best_model_state_dict')."
-            )
         start_generation = checkpoint["generation"] + 1
         start_elo = checkpoint.get("best_model_elo", cfg.ELO_INITIAL)
         logging.info(f"Loaded ELO for 'best' model: {start_elo:.0f}")
-        logging.info("Replay buffer will be populated by new self-play games.")
         gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
-        logging.info("Requesting GPUWorker to load best model state...")
         gpu_request_queue.put(("LOAD_CHECKPOINT_DATA", gpu_states))
-        response = main_gpu_pipe_recv.recv()
-        if response.get("status") != "LOAD_DONE":
-            raise RuntimeError(
-                f"Failed to load checkpoint on GPUWorker. Response: {response}"
-            )
-        logging.info("GPUWorker confirmed state load.")
+        main_gpu_pipe_recv.recv()
         logging.info(f"--- Resuming training from generation {start_generation} ---")
         return start_generation, start_elo
 
@@ -819,7 +803,6 @@ def main(args):
         else:
             logging.info("'Next' model not strong enough. Discarding weights.")
             gpu_request_queue.put(("RESET_NEXT", None))
-            best_model_elo = new_best_elo
         log_data.update({"best_model_elo": best_model_elo})
         logging.info(f"New champion ELO for next generation: {best_model_elo:.0f}")
         if promoted or (generation % config.CHECKPOINT_FREQUENCY == 0):

@@ -1,10 +1,10 @@
 [package]
-name = "mcts_rs"
+name = "mcts"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "mcts_rs"
+name = "mcts"
 crate-type = ["cdylib"]
 
 [dependencies]

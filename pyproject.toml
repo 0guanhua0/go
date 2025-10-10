@@ -28,5 +28,5 @@ dev = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "mcts_rs"
-manifest-path = "mcts_rs/Cargo.toml"
+module-name = "mcts"
+manifest-path = "mcts/Cargo.toml"

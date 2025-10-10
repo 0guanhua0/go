@@ -7,3 +7,15 @@ repos:
     - id: ruff-check
     # Run the formatter.
     - id: ruff-format
+- repo: local
+  hooks:
+    - id: cargo-fmt
+      name: cargo fmt
+      entry: cargo fmt --manifest-path mcts/Cargo.toml --check
+      language: system
+      pass_filenames: false
+    - id: cargo-check
+      name: cargo check
+      entry: cargo check --manifest-path mcts/Cargo.toml
+      language: system
+      pass_filenames: false

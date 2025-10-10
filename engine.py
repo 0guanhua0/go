@@ -8,7 +8,7 @@ from safetensors.torch import load_file
 # Local project imports
 import config
 from game import GoGameState
-from mcts_rs import MCTS, MCTSNode
+from mcts import MCTS, MCTSNode
 from network import AlphaGoZeroNet
 
 

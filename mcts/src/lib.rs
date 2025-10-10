@@ -54,7 +54,7 @@ pub struct GoGameState {
     history_boards: VecDeque<Vec<i8>>,
     consecutive_passes: u32,
     move_count: u32,
-    ko_point: Option<(usize, usize)>,
+    // ko_point: Option<(usize, usize)>, // REMOVED: Redundant under superko rule
     current_hash: u64,
     history_hashes: HashSet<u64>,
 }
@@ -193,6 +193,10 @@ impl GoGameState {
     fn is_valid_move(&self, y: usize, x: usize) -> bool {
         let player = self.current_player;
 
+        if self.at(y, x) != 0 {
+            return false;
+        }
+
         let mut potential_next_hash =
             self.current_hash ^ ZOBRIST_TABLE.key_for(y, x, player_to_index(player));
         let mut captures_made = false;
@@ -266,7 +270,6 @@ impl GoGameState {
 
         !final_liberties.is_empty()
     }
-
 }
 
 #[pymethods]
@@ -295,7 +298,7 @@ impl GoGameState {
             history_boards,
             consecutive_passes: 0,
             move_count: 0,
-            ko_point: None,
+            // ko_point: None, // REMOVED
             current_hash: 0,
             history_hashes,
         }
@@ -323,7 +326,6 @@ impl GoGameState {
 
         if action == pass_move {
             self.consecutive_passes += 1;
-            self.ko_point = None;
         } else {
             self.consecutive_passes = 0;
             let (y, x) = (action / self.board_size, action % self.board_size);
@@ -331,9 +333,7 @@ impl GoGameState {
             self.current_hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(self.current_player));
             self.set(y, x, self.current_player);
 
-            let mut captured_stones_total = 0;
-            let mut single_captured_stone_pos = None;
-
+            // SIMPLIFIED: Removed complex ko detection; superko handles all cases.
             for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
                 let ny_isize = y as isize + dy;
                 let nx_isize = x as isize + dx;
@@ -349,10 +349,6 @@ impl GoGameState {
                 if self.at(ny, nx) == -self.current_player {
                     let (group, liberties) = self._get_group(ny, nx, &self.board);
                     if liberties.is_empty() {
-                        if group.len() == 1 {
-                            single_captured_stone_pos = group.iter().next().cloned();
-                        }
-                        captured_stones_total += group.len();
                         for (sy, sx) in group {
                             self.current_hash ^= ZOBRIST_TABLE.key_for(
                                 sy,
@@ -363,23 +359,6 @@ impl GoGameState {
                         }
                     }
                 }
-            }
-
-            let (my_group, my_liberties) = self._get_group(y, x, &self.board);
-            if captured_stones_total == 1 && my_group.len() == 1 && my_liberties.len() == 1 {
-                if let Some(liberty_pos) = my_liberties.iter().next() {
-                    let (opp_group, opp_libs) =
-                        self._get_group(liberty_pos.0, liberty_pos.1, &self.board);
-                    if opp_group.len() == 1 && opp_libs.len() == 1 {
-                        self.ko_point = single_captured_stone_pos;
-                    } else {
-                        self.ko_point = None;
-                    }
-                } else {
-                    self.ko_point = None;
-                }
-            } else {
-                self.ko_point = None;
             }
         }
 
@@ -401,7 +380,8 @@ impl GoGameState {
             .into_par_iter()
             .filter_map(|action| {
                 let (y, x) = (action / self.board_size, action % self.board_size);
-                if self.at(y, x) == 0 && self.ko_point != Some((y, x)) && self.is_valid_move(y, x) {
+                // SIMPLIFIED: Removed ko_point check
+                if self.at(y, x) == 0 && self.is_valid_move(y, x) {
                     Some(action)
                 } else {
                     None
@@ -538,21 +518,11 @@ impl MCTSNode {
         let mut best_score = f64::NEG_INFINITY;
         let mut best_action = None;
 
-        let (total_visits_from_node, total_value_from_node) =
-            self.visit_count
-                .iter()
-                .fold((0.0, 0.0), |(v_acc, val_acc), entry| {
-                    let action = *entry.key();
-                    let visits = *entry.value() as f64;
-                    let value = self.total_action_value.get(&action).map_or(0.0, |v| *v);
-                    (v_acc + visits, val_acc + value)
-                });
-
-        let mu_fpu = if total_visits_from_node > 0.0 {
-            total_value_from_node / total_visits_from_node
-        } else {
-            0.0
-        };
+        let total_visits_from_node: f64 = self
+            .visit_count
+            .iter()
+            .map(|entry| *entry.value() as f64)
+            .sum();
 
         let sqrt_total_visits = total_visits_from_node.sqrt();
 
@@ -563,7 +533,7 @@ impl MCTSNode {
             let q_value = if n_value > 0.0 {
                 *self.total_action_value.get(&action).unwrap() / n_value
             } else {
-                mu_fpu
+                0.0 // FPU (First Play Urgency) is effectively 0 for unvisited nodes
             };
 
             let p_value = *self.prior_prob.get(&action).unwrap();
@@ -744,10 +714,8 @@ impl MCTS {
                 state_reps.push(leaf.state.get_representation(py)?);
             }
             let np = PyModule::import(py, "numpy")?;
-            let stack_kwargs = PyDict::new(py);
-            stack_kwargs.set_item("arrays", state_reps)?;
-            stack_kwargs.set_item("axis", 0)?;
-            let batch_numpy_array = np.call_method("stack", (), Some(&stack_kwargs))?;
+            let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
+
             let result_obj = self
                 .network
                 .call_method1(py, "predict", (batch_numpy_array,))?;
@@ -917,7 +885,7 @@ impl MCTS {
 }
 
 #[pymodule]
-fn mcts_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn mcts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MCTS>()?;
     m.add_class::<MCTSNode>()?;
     m.add_class::<GoGameState>()?;
