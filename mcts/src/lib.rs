@@ -15,26 +15,21 @@ const BOARD_SIZE: usize = 19;
 const NUM_PLAYER: usize = 2;
 
 struct ZobristTable {
-    keys: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
+    pub key: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
 }
 
 impl ZobristTable {
     fn new() -> Self {
         let mut rng = rand::rng();
-        let mut keys = [[[0; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE];
-        for y in 0..BOARD_SIZE {
-            for x in 0..BOARD_SIZE {
+        let mut key = [[[0; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE];
+        for x in 0..BOARD_SIZE {
+            for y in 0..BOARD_SIZE {
                 for p in 0..NUM_PLAYER {
-                    keys[y][x][p] = rng.random();
+                    key[x][y][p] = rng.random();
                 }
             }
         }
-        ZobristTable { keys }
-    }
-
-    #[inline]
-    fn key_for(&self, y: usize, x: usize, player_idx: usize) -> u64 {
-        self.keys[y][x][player_idx]
+        ZobristTable { key }
     }
 }
 
@@ -198,7 +193,7 @@ impl State {
         }
 
         let mut potential_next_hash =
-            self.current_hash ^ ZOBRIST_TABLE.key_for(y, x, player_to_index(player));
+            self.current_hash ^ ZOBRIST_TABLE.key[x][y][player_to_index(player)];
         let mut captures_made = false;
 
         for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
@@ -218,8 +213,7 @@ impl State {
                 if liberties.len() == 1 && liberties.contains(&(y, x)) {
                     captures_made = true;
                     for (sy, sx) in group {
-                        potential_next_hash ^=
-                            ZOBRIST_TABLE.key_for(sy, sx, player_to_index(-player));
+                        potential_next_hash ^= ZOBRIST_TABLE.key[sx][sy][player_to_index(-player)];
                     }
                 }
             }
@@ -323,7 +317,7 @@ impl State {
             self.consecutive_passes = 0;
             let (y, x) = (action / self.board_size, action % self.board_size);
 
-            self.current_hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(self.current_player));
+            self.current_hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(self.current_player)];
             self.set(y, x, self.current_player);
 
             for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
@@ -342,11 +336,8 @@ impl State {
                     let (group, liberties) = self._get_group(ny, nx, &self.board);
                     if liberties.is_empty() {
                         for (sy, sx) in group {
-                            self.current_hash ^= ZOBRIST_TABLE.key_for(
-                                sy,
-                                sx,
-                                player_to_index(-self.current_player),
-                            );
+                            self.current_hash ^=
+                                ZOBRIST_TABLE.key[sx][sy][player_to_index(-self.current_player)];
                             self.set(sy, sx, 0);
                         }
                     }
@@ -921,7 +912,7 @@ mod tests {
             for x in 0..board_size {
                 let stone = board[y * board_size + x];
                 if stone != 0 {
-                    hash ^= ZOBRIST_TABLE.key_for(y, x, player_to_index(stone));
+                    hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(stone)];
                 }
             }
         }
