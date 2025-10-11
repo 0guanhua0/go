@@ -47,7 +47,7 @@ fn player_to_index(player: i8) -> usize {
 
 #[pyclass]
 #[derive(Debug, Clone)]
-pub struct GoGameState {
+pub struct State {
     board_size: usize,
     board: Vec<i8>,
     current_player: i8,
@@ -58,7 +58,7 @@ pub struct GoGameState {
     history_hashes: HashSet<u64>,
 }
 
-impl GoGameState {
+impl State {
     fn at(&self, y: usize, x: usize) -> i8 {
         self.board[y * self.board_size + x]
     }
@@ -272,7 +272,7 @@ impl GoGameState {
 }
 
 #[pymethods]
-impl GoGameState {
+impl State {
     #[new]
     fn new(board_size: usize) -> Self {
         assert!(
@@ -290,7 +290,7 @@ impl GoGameState {
         let mut history_hashes = HashSet::new();
         history_hashes.insert(0);
 
-        GoGameState {
+        State {
             board_size,
             board,
             current_player: 1,
@@ -588,7 +588,7 @@ impl MCTS {
         &self,
         py: Python,
         root_node: &MCTSNode,
-        root_state: &GoGameState,
+        root_state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
         if root_node.is_leaf() {
@@ -628,7 +628,7 @@ impl MCTS {
 
         struct LeafToEvaluate<'a> {
             path: Vec<(&'a MCTSNode, usize)>,
-            state: GoGameState,
+            state: State,
         }
         #[allow(non_camel_case_types)]
         enum SimulationResult<'a> {
@@ -844,7 +844,7 @@ impl MCTS {
 
     fn _get_normalized_priors(
         &self,
-        state: &GoGameState,
+        state: &State,
         policy_raw: &[f32],
     ) -> PyResult<(HashMap<usize, f64>, f64)> {
         let legal_moves = state.get_legal_moves();
@@ -890,7 +890,7 @@ mod tests {
     fn legal_moves_on_empty_board_include_pass_and_all_points() {
         let board_size = 3;
         let pass_action = board_size * board_size;
-        let state = GoGameState::new(board_size);
+        let state = State::new(board_size);
         let mut legal_moves = state.get_legal_moves();
 
         assert_eq!(legal_moves.len(), pass_action + 1);
@@ -916,7 +916,7 @@ mod tests {
         hash
     }
 
-    fn simulate_board_after_move(state: &GoGameState, y: usize, x: usize) -> Vec<i8> {
+    fn simulate_board_after_move(state: &State, y: usize, x: usize) -> Vec<i8> {
         let mut board = state.board.clone();
         let player = state.current_player;
         board[y * state.board_size + x] = player;
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn superko_blocks_repeating_position() {
-        let mut state = GoGameState::new(3);
+        let mut state = State::new(3);
         state.board = vec![
             1, -1, 1, //
             0, 0, 0, //
@@ -981,6 +981,6 @@ mod tests {
 fn mcts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MCTS>()?;
     m.add_class::<MCTSNode>()?;
-    m.add_class::<GoGameState>()?;
+    m.add_class::<State>()?;
     Ok(())
 }

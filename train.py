@@ -13,7 +13,7 @@ from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 import config
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
-from mcts import MCTS, GoGameState, MCTSNode
+from mcts import MCTS, State, MCTSNode
 from network import AlphaGoZeroNet
 
 
@@ -106,7 +106,7 @@ class CPUWorker:
             result_pipe=self.result_pipes[self.worker_id],
         )
 
-        game_state = GoGameState(config.BOARD_SIZE)
+        game_state = State(config.BOARD_SIZE)
         mcts = MCTS(
             network_wrapper,
             config.C_PUCT,
@@ -476,7 +476,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
         black_player, white_player = next_wrapper, best_wrapper
     else:
         black_player, white_player = best_wrapper, next_wrapper
-    game_state = GoGameState(config.BOARD_SIZE)
+    game_state = State(config.BOARD_SIZE)
     black_mcts = MCTS(black_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     white_mcts = MCTS(white_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = MCTSNode(), MCTSNode()
