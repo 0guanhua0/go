@@ -11,20 +11,20 @@ use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const MAX_BOARD_SIZE: usize = 19;
-const NUM_PLAYERS: usize = 2;
+const BOARD_SIZE: usize = 19;
+const NUM_PLAYER: usize = 2;
 
 struct ZobristTable {
-    keys: [[[u64; NUM_PLAYERS]; MAX_BOARD_SIZE]; MAX_BOARD_SIZE],
+    keys: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
 }
 
 impl ZobristTable {
     fn new() -> Self {
         let mut rng = rand::rng();
-        let mut keys = [[[0; NUM_PLAYERS]; MAX_BOARD_SIZE]; MAX_BOARD_SIZE];
-        for y in 0..MAX_BOARD_SIZE {
-            for x in 0..MAX_BOARD_SIZE {
-                for p in 0..NUM_PLAYERS {
+        let mut keys = [[[0; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE];
+        for y in 0..BOARD_SIZE {
+            for x in 0..BOARD_SIZE {
+                for p in 0..NUM_PLAYER {
                     keys[y][x][p] = rng.random();
                 }
             }
@@ -275,11 +275,6 @@ impl State {
 impl State {
     #[new]
     fn new(board_size: usize) -> Self {
-        assert!(
-            board_size <= MAX_BOARD_SIZE,
-            "Board size exceeds max supported size of {}",
-            MAX_BOARD_SIZE
-        );
         let board = vec![0i8; board_size * board_size];
 
         let mut history_boards = VecDeque::with_capacity(9);
@@ -297,7 +292,6 @@ impl State {
             history_boards,
             consecutive_passes: 0,
             move_count: 0,
-            // ko_point: None, // REMOVED
             current_hash: 0,
             history_hashes,
         }
