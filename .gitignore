@@ -210,3 +210,5 @@ sgf_games/
 wandb/
 
 *.sgf
+*.txt
+*.tex
