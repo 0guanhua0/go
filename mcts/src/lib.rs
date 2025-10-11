@@ -588,11 +588,11 @@ impl MCTS {
         &self,
         py: Python,
         root_node: &MCTSNode,
-        root_state: &State,
+        state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
         if root_node.is_leaf() {
-            let state_repr_numpy = root_state.get_representation(py)?;
+            let state_repr_numpy = state.get_representation(py)?;
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
 
@@ -613,9 +613,9 @@ impl MCTS {
                 .to_slice()
                 .ok_or_else(|| PyValueError::new_err("failed to slice policy array"))?;
 
-            let (policy_map, _) = self._get_normalized_priors(root_state, policy_slice)?;
+            let (policy_map, _) = self._get_normalized_priors(state, policy_slice)?;
             self.transposition_table.insert(
-                root_state.current_hash,
+                state.current_hash,
                 TTEntry {
                     policy: policy_map.clone(),
                     value: value_vec[0] as f64,
@@ -649,7 +649,7 @@ impl MCTS {
             .map(|_| {
                 let mut path: Vec<(&MCTSNode, usize)> = Vec::new();
                 let mut node = root_node;
-                let mut current_state = root_state.clone();
+                let mut current_state = state.clone();
 
                 while !node.is_leaf() {
                     let action = node.select_action(self.c_puct).unwrap();
@@ -666,7 +666,7 @@ impl MCTS {
                     let value = if winner == 0 {
                         0.0
                     } else {
-                        (winner as f64) * (root_state.current_player as f64)
+                        (winner as f64) * (state.current_player as f64)
                     };
                     SimulationResult::Terminal { path, value }
                 } else {
@@ -764,16 +764,34 @@ impl MCTS {
         &self,
         py: Python<'py>,
         root_node: &MCTSNode,
+        state: &State,
         temp: f64,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let legal_moves_vec = state.get_legal_moves();
+        let legal_moves: HashSet<usize> = legal_moves_vec.iter().copied().collect();
+
         let visit_counts: HashMap<usize, u32> = root_node
             .visit_count
             .iter()
-            .map(|e| (*e.key(), *e.value()))
+            .filter_map(|e| {
+                let action = *e.key();
+                if legal_moves.contains(&action) {
+                    Some((action, *e.value()))
+                } else {
+                    None
+                }
+            })
             .collect();
         let out_dict = PyDict::new(py);
 
         if visit_counts.is_empty() {
+            if legal_moves_vec.is_empty() {
+                return Ok(out_dict);
+            }
+            let prob = 1.0 / legal_moves_vec.len() as f64;
+            for action in legal_moves_vec {
+                out_dict.set_item(action, prob)?;
+            }
             return Ok(out_dict);
         }
 

@@ -106,7 +106,7 @@ class CPUWorker:
             result_pipe=self.result_pipes[self.worker_id],
         )
 
-        game_state = State(config.BOARD_SIZE)
+        state = State(config.BOARD_SIZE)
         mcts = MCTS(
             network_wrapper,
             config.C_PUCT,
@@ -122,18 +122,18 @@ class CPUWorker:
 
         root_node = MCTSNode()
         game_history = []
-        state_repr = game_state.get_representation()
+        state_repr = state.get_representation()
         resigned = False
 
         while True:
-            game_over, winner = game_state.is_game_over()
+            game_over, winner = state.is_game_over()
             if game_over:
                 break
 
-            mcts.run_simulations(root_node, game_state, config.NUM_SIMULATIONS)
+            mcts.run_simulations(root_node, state, config.NUM_SIMULATIONS)
 
-            temp = 1.0 if game_state.move_count < 30 else 0.0
-            move_probs = mcts.get_move_probs(root_node, temp)
+            temp = 1.0 if state.move_count < 30 else 0.0
+            move_probs = mcts.get_move_probs(root_node, state, temp)
             root_value = sum(
                 prob * root_node.mean_action_value.get(action, 0.0)
                 for action, prob in move_probs.items()
@@ -146,7 +146,7 @@ class CPUWorker:
                     root_value < resignation_threshold
                     and best_child_value < resignation_threshold
                 ):
-                    winner = -game_state.get_current_player()
+                    winner = -state.get_current_player()
                     resigned = True
                     break
 
@@ -160,19 +160,19 @@ class CPUWorker:
                 (
                     state_repr,
                     policy_target,
-                    game_state.get_current_player(),
+                    state.get_current_player(),
                     root_value,
                 )
             )
             action_to_play = np.random.choice(len(policy_target), p=policy_target)
 
-            player_color = "b" if game_state.get_current_player() == 1 else "w"
+            player_color = "b" if state.get_current_player() == 1 else "w"
             sgf_coords = to_sgf_coords(action_to_play, config.BOARD_SIZE)
             sgf_node = sgf_node.new_child()
             sgf_node.set_move(player_color, sgf_coords)
 
-            game_state.apply_move(action_to_play)
-            state_repr = game_state.get_representation()
+            state.apply_move(action_to_play)
+            state_repr = state.get_representation()
             child_node = root_node.get_child(action_to_play)
             root_node = child_node if child_node is not None else MCTSNode()
 
@@ -193,7 +193,7 @@ class CPUWorker:
             sgf_result = "B+R" if winner == 1 else "W+R"
         else:
             try:
-                black_score, white_score = game_state.get_scores()
+                black_score, white_score = state.get_scores()
                 if winner == 1:
                     margin = black_score - white_score
                     sgf_result = f"B+{margin:.1f}"
@@ -476,12 +476,12 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
         black_player, white_player = next_wrapper, best_wrapper
     else:
         black_player, white_player = best_wrapper, next_wrapper
-    game_state = State(config.BOARD_SIZE)
+    state = State(config.BOARD_SIZE)
     black_mcts = MCTS(black_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     white_mcts = MCTS(white_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = MCTSNode(), MCTSNode()
     while True:
-        game_over, winner = game_state.is_game_over()
+        game_over, winner = state.is_game_over()
         if game_over:
             if winner == 0:
                 return 0
@@ -491,19 +491,19 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
             return 1 if next_won else -1
         mcts, root, current_player_is_black = (
             (black_mcts, black_root, True)
-            if game_state.get_current_player() == 1
+            if state.get_current_player() == 1
             else (white_mcts, white_root, False)
         )
 
-        mcts.run_simulations(root, game_state, config.NUM_SIMULATIONS)
+        mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
 
-        move_probs = mcts.get_move_probs(root, temp=0)
+        move_probs = mcts.get_move_probs(root, state, temp=0)
         action_to_play = (
             max(move_probs, key=move_probs.get)
             if move_probs
             else (config.BOARD_SIZE**2)
         )
-        game_state.apply_move(action_to_play)
+        state.apply_move(action_to_play)
         if current_player_is_black:
             black_child = black_root.get_child(action_to_play)
             black_root = black_child if black_child is not None else MCTSNode()
