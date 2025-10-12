@@ -517,7 +517,7 @@ impl MCTSNode {
             let q_value = if n_value > 0.0 {
                 *self.total_action_value.get(&action).unwrap() / n_value
             } else {
-                0.0 // FPU (First Play Urgency) is effectively 0 for unvisited nodes
+                0.0
             };
 
             let p_value = *self.prior_prob.get(&action).unwrap();
@@ -541,8 +541,8 @@ impl MCTSNode {
     }
 }
 
-#[derive(Clone, Debug)]
-struct TTEntry {
+#[derive(Clone)]
+struct TTval {
     policy: HashMap<usize, f64>,
     value: f64,
 }
@@ -553,7 +553,7 @@ struct MCTS {
     c_puct: f64,
     dirichlet_alpha: f64,
     epsilon: f64,
-    transposition_table: DashMap<u64, TTEntry>,
+    transposition_table: DashMap<u64, TTval>,
 }
 
 #[pymethods]
@@ -602,7 +602,7 @@ impl MCTS {
             let (policy_map, _) = self._get_normalized_priors(state, policy_slice)?;
             self.transposition_table.insert(
                 state.current_hash,
-                TTEntry {
+                TTval {
                     policy: policy_map.clone(),
                     value: value_vec[0] as f64,
                 },
@@ -625,7 +625,7 @@ impl MCTS {
             TtHit {
                 path: Vec<(&'a MCTSNode, usize)>,
                 node_to_expand: &'a MCTSNode,
-                entry: TTEntry,
+                entry: TTval,
             },
             NeedsEvaluation(LeafToEvaluate<'a>),
         }
@@ -740,7 +740,7 @@ impl MCTS {
 
                 self.transposition_table.insert(
                     item.state.current_hash,
-                    TTEntry {
+                    TTval {
                         policy: policy_map.clone(),
                         value,
                     },
