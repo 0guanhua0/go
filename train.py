@@ -140,16 +140,17 @@ class CPUWorker:
 
             mcts.run_simulations(root_node, state, config.NUM_SIMULATIONS)
 
-            temp = 1.0 if state.move_count < 30 else 0.0
+            temp = 1.0 if state.move_count() < 30 else 0.0
             move_probs = mcts.get_move_probs(root_node, state, temp)
+            mean_act_val = root_node.mean_action_value()
             root_value = sum(
-                prob * root_node.mean_action_value.get(action, 0.0)
+                prob * mean_act_val.get(action, 0.0)
                 for action, prob in move_probs.items()
             )
 
             if not disable_resignation:
                 best_action = max(move_probs, key=move_probs.get) if move_probs else -1
-                best_child_value = root_node.mean_action_value.get(best_action, -1.0)
+                best_child_value = mean_act_val.get(best_action, -1.0)
                 if (
                     root_value < resignation_threshold
                     and best_child_value < resignation_threshold
