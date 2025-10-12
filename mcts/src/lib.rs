@@ -729,11 +729,11 @@ impl MCTS {
                         &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
                     });
 
-                let policies_array_view = policies.as_array();
-                let policy_slice = policies_array_view
+                let policies_view = policies.as_array();
+                let policy_slice = policies_view
                     .slice(s![i, ..])
                     .to_slice()
-                    .ok_or_else(|| PyValueError::new_err("failed to slice batched policy array"))?;
+                    .expect("policy slice fail");
 
                 let (policy_map, _) = self._get_normalized_priors(&item.state, policy_slice)?;
                 let value = value_vec[i] as f64;
