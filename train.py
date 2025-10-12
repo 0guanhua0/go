@@ -202,7 +202,7 @@ class CPUWorker:
             sgf_result = "B+R" if winner == 1 else "W+R"
         else:
             try:
-                black_score, white_score = state.get_scores()
+                black_score, white_score = state.get_score()
                 if winner == 1:
                     margin = black_score - white_score
                     sgf_result = f"B+{margin:.1f}"

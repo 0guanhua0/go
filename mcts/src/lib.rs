@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const BOARD_SIZE: usize = 19;
 // black 1, white 2
 const NUM_PLAYER: usize = 2;
+const KOMI: f64 = 7.5;
 
 struct ZobristTable {
     pub key: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
@@ -42,7 +43,7 @@ fn player_to_index(player: i8) -> usize {
 }
 
 #[pyclass]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct State {
     board_size: usize,
     board: Vec<i8>,
@@ -55,79 +56,16 @@ pub struct State {
 }
 
 impl State {
-    fn at(&self, y: usize, x: usize) -> i8 {
-        self.board[y * self.board_size + x]
+    fn get(&self, x: usize, y: usize) -> i8 {
+        self.board[x * self.board_size + y]
     }
 
-    fn set(&mut self, y: usize, x: usize, val: i8) {
-        self.board[y * self.board_size + x] = val;
-    }
-
-    fn _calculate_scores(&self) -> (f32, f32) {
-        let mut territory_mask = self.board.clone();
-        let mut visited_flood = HashSet::new();
-
-        for y in 0..self.board_size {
-            for x in 0..self.board_size {
-                if territory_mask[y * self.board_size + x] == 0 && !visited_flood.contains(&(y, x))
-                {
-                    let mut q = VecDeque::new();
-                    let mut visited_region = HashSet::new();
-                    let mut borders = (false, false); // black, white
-
-                    q.push_back((y, x));
-                    visited_region.insert((y, x));
-                    visited_flood.insert((y, x));
-
-                    while let Some((cy, cx)) = q.pop_front() {
-                        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                            let ny_isize = cy as isize + dy;
-                            let nx_isize = cx as isize + dx;
-
-                            if ny_isize < 0
-                                || ny_isize >= self.board_size as isize
-                                || nx_isize < 0
-                                || nx_isize >= self.board_size as isize
-                            {
-                                continue;
-                            }
-                            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
-                            let neighbor_val = self.board[ny * self.board_size + nx];
-                            if neighbor_val == 1 {
-                                borders.0 = true;
-                            } else if neighbor_val == -1 {
-                                borders.1 = true;
-                            } else if !visited_region.contains(&(ny, nx)) {
-                                visited_region.insert((ny, nx));
-                                visited_flood.insert((ny, nx));
-                                q.push_back((ny, nx));
-                            }
-                        }
-                    }
-
-                    let owner = match borders {
-                        (true, false) => 1,
-                        (false, true) => -1,
-                        _ => 0,
-                    };
-
-                    if owner != 0 {
-                        for (ry, rx) in visited_region {
-                            territory_mask[ry * self.board_size + rx] = owner;
-                        }
-                    }
-                }
-            }
-        }
-
-        let black_score: f32 = territory_mask.iter().filter(|&&s| s == 1).count() as f32;
-        let white_score: f32 = territory_mask.iter().filter(|&&s| s == -1).count() as f32 + 7.5; // Komi
-
-        (black_score, white_score)
+    fn set(&mut self, x: usize, y: usize, val: i8) {
+        self.board[x * self.board_size + y] = val;
     }
 
     fn _get_winner(&self) -> i8 {
-        let (black_score, white_score) = self._calculate_scores();
+        let (black_score, white_score) = self.get_score();
 
         if black_score > white_score {
             1
@@ -189,7 +127,7 @@ impl State {
     fn check(&self, y: usize, x: usize) -> bool {
         let player = self.current_player;
 
-        if self.at(y, x) != 0 {
+        if self.get(x, y) != 0 {
             return false;
         }
 
@@ -209,7 +147,7 @@ impl State {
             }
             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
-            if self.at(ny, nx) == -player {
+            if self.get(nx, ny) == -player {
                 let (group, liberties) = self._get_group(ny, nx, &self.board);
                 if liberties.len() == 1 && liberties.contains(&(y, x)) {
                     captures_made = true;
@@ -237,7 +175,7 @@ impl State {
             }
             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
-            match self.at(ny, nx) {
+            match self.get(nx, ny) {
                 0 => has_immediate_liberty = true,
                 p if p == player => {
                     if !visited_stones_for_lib_check.contains(&(ny, nx)) {
@@ -301,8 +239,67 @@ impl State {
         self.current_player
     }
 
-    fn get_scores(&self) -> (f32, f32) {
-        self._calculate_scores()
+    fn get_score(&self) -> (f64, f64) {
+        let mut territory_mask = self.board.clone();
+        let mut visited_flood = HashSet::new();
+
+        for y in 0..self.board_size {
+            for x in 0..self.board_size {
+                if territory_mask[y * self.board_size + x] == 0 && !visited_flood.contains(&(y, x))
+                {
+                    let mut q = VecDeque::new();
+                    let mut visited_region = HashSet::new();
+                    let mut borders = (false, false); // black, white
+
+                    q.push_back((y, x));
+                    visited_region.insert((y, x));
+                    visited_flood.insert((y, x));
+
+                    while let Some((cy, cx)) = q.pop_front() {
+                        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+                            let ny_isize = cy as isize + dy;
+                            let nx_isize = cx as isize + dx;
+
+                            if ny_isize < 0
+                                || ny_isize >= self.board_size as isize
+                                || nx_isize < 0
+                                || nx_isize >= self.board_size as isize
+                            {
+                                continue;
+                            }
+                            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+                            let neighbor_val = self.board[ny * self.board_size + nx];
+                            if neighbor_val == 1 {
+                                borders.0 = true;
+                            } else if neighbor_val == -1 {
+                                borders.1 = true;
+                            } else if !visited_region.contains(&(ny, nx)) {
+                                visited_region.insert((ny, nx));
+                                visited_flood.insert((ny, nx));
+                                q.push_back((ny, nx));
+                            }
+                        }
+                    }
+
+                    let owner = match borders {
+                        (true, false) => 1,
+                        (false, true) => -1,
+                        _ => 0,
+                    };
+
+                    if owner != 0 {
+                        for (ry, rx) in visited_region {
+                            territory_mask[ry * self.board_size + rx] = owner;
+                        }
+                    }
+                }
+            }
+        }
+
+        let black_score: f64 = territory_mask.iter().filter(|&&s| s == 1).count() as f64;
+        let white_score: f64 = territory_mask.iter().filter(|&&s| s == -1).count() as f64 + KOMI;
+
+        (black_score, white_score)
     }
 
     fn clone(&self) -> Self {
@@ -318,7 +315,7 @@ impl State {
             self.consecutive_passes = 0;
 
             self.current_hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(self.current_player)];
-            self.set(y, x, self.current_player);
+            self.set(x, y, self.current_player);
 
             for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
                 let ny_isize = y as isize + dy;
@@ -332,13 +329,13 @@ impl State {
                 }
                 let (ny, nx) = (ny_isize as usize, nx_isize as usize);
 
-                if self.at(ny, nx) == -self.current_player {
+                if self.get(nx, ny) == -self.current_player {
                     let (group, liberties) = self._get_group(ny, nx, &self.board);
                     if liberties.is_empty() {
                         for (sy, sx) in group {
                             self.current_hash ^=
                                 ZOBRIST_TABLE.key[sx][sy][player_to_index(-self.current_player)];
-                            self.set(sy, sx, 0);
+                            self.set(sx, sy, 0);
                         }
                     }
                 }
@@ -365,7 +362,7 @@ impl State {
             .filter_map(|action| {
                 let x = action / self.board_size;
                 let y = action % self.board_size;
-                if self.at(y, x) == 0 && self.check(y, x) {
+                if self.get(x, y) == 0 && self.check(y, x) {
                     Some(action)
                 } else {
                     None
