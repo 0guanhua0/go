@@ -230,7 +230,6 @@ impl State {
         }
     }
 
-    #[getter]
     fn move_count(&self) -> u32 {
         self.move_count
     }
@@ -459,7 +458,6 @@ impl MCTSNode {
         }
     }
 
-    #[getter]
     fn visit_count<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
         let dict = PyDict::new(py);
         for item in self.visit_count.iter() {
@@ -468,7 +466,6 @@ impl MCTSNode {
         dict
     }
 
-    #[getter]
     fn mean_action_value<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
         let dict = PyDict::new(py);
         for item in self.total_action_value.iter() {
