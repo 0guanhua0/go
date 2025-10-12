@@ -49,8 +49,8 @@ pub struct State {
     board: Vec<i8>,
     current_player: i8,
     history_boards: VecDeque<Vec<i8>>,
-    consecutive_passes: u32,
-    move_count: u32,
+    consecutive_passes: usize,
+    move_count: usize,
     current_hash: u64,
     history_hashes: HashSet<u64>,
 }
@@ -230,7 +230,7 @@ impl State {
         }
     }
 
-    fn move_count(&self) -> u32 {
+    fn move_count(&self) -> usize {
         self.move_count
     }
 
@@ -375,7 +375,7 @@ impl State {
 
     fn is_game_over(&self) -> (bool, Option<i8>) {
         let max_moves = self.board_size * self.board_size * 2;
-        if self.consecutive_passes >= 2 || self.move_count >= max_moves as u32 {
+        if self.consecutive_passes >= 2 || self.move_count >= max_moves as usize {
             (true, Some(self._get_winner()))
         } else {
             (false, None)
@@ -428,7 +428,7 @@ impl State {
 #[derive(Debug, Clone)]
 struct MCTSNode {
     children: DashMap<usize, MCTSNode>,
-    visit_count: DashMap<usize, u32>,
+    visit_count: DashMap<usize, usize>,
     total_action_value: DashMap<usize, f64>,
     prior_prob: DashMap<usize, f64>,
 }
@@ -757,7 +757,7 @@ impl MCTS {
         let legal_moves_vec = state.get_legal_moves();
         let legal_moves: HashSet<usize> = legal_moves_vec.iter().copied().collect();
 
-        let visit_counts: HashMap<usize, u32> = root_node
+        let visit_counts: HashMap<usize, usize> = root_node
             .visit_count
             .iter()
             .filter_map(|e| {
