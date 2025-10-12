@@ -1,30 +1,23 @@
-[build-system]
-requires = ["maturin>=1.9.2"]
-build-backend = "maturin"
-
 [project]
-name = "go-zero-mcts-rs"
+name = "alphago-zero"
 dynamic = ["version"]
 dependencies = [
-    "numba",
     "numpy",
-    "pandas",
-    "requests",
     "sgfmill",
     "torch",
     "wandb",
 ]
-classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: implementation :: CPython",
-    "Programming Language :: Python :: implementation :: PyPy",
-]
 
 [project.optional-dependencies]
 dev = [
-    "ruff",
+    "maturin",
     "pre-commit",
+    "ruff",
 ]
+
+[build-system]
+requires = ["maturin>=1.9.6"]
+build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
