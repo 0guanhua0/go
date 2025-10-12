@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BOARD_SIZE: usize = 19;
+// black 1, white 2
 const NUM_PLAYER: usize = 2;
 
 struct ZobristTable {
@@ -906,36 +907,16 @@ mod tests {
         assert_eq!(legal_moves, expected);
     }
 
-    fn compute_hash(board_size: usize, board: &[i8]) -> u64 {
-        let mut hash = 0;
-        for y in 0..board_size {
-            for x in 0..board_size {
-                let stone = board[y * board_size + x];
-                if stone != 0 {
-                    hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(stone)];
-                }
-            }
-        }
-        hash
-    }
-
     #[test]
     fn superko() {
-        let mut state = State::new(3);
-        state.board = vec![
-            0, 1, 0, //
-            1, 0, 0, //
-            0, 0, 0, //
-        ];
-        state.current_player = -1;
-        state.current_hash = compute_hash(state.board_size, &state.board);
+        let size: usize = 3;
+        let mut state = State::new(size);
+        let game = [(0, 1), (1, 1), (1, 0)];
+        for &(y, x) in &game {
+            state.apply_move(y * size + x);
+        }
 
-        state.history_hashes.clear();
-        state.history_hashes.insert(state.current_hash);
-
-        let target_y = 0;
-        let target_x = 0;
-        assert!(!state.check(target_y, target_x));
+        assert!(!state.check(0, 0));
     }
 }
 
