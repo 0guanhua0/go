@@ -309,14 +309,13 @@ impl State {
         Clone::clone(self)
     }
 
-    fn apply_move(&mut self, action: usize) {
-        let pass_move = self.board_size * self.board_size;
+    fn apply_move(&mut self, x: usize, y: usize) {
+        let is_pass = x == self.board_size && y == self.board_size;
 
-        if action == pass_move {
+        if is_pass {
             self.consecutive_passes += 1;
         } else {
             self.consecutive_passes = 0;
-            let (y, x) = (action / self.board_size, action % self.board_size);
 
             self.current_hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(self.current_player)];
             self.set(y, x, self.current_player);
@@ -364,7 +363,8 @@ impl State {
         let mut other_moves: Vec<usize> = (0..self.board_size * self.board_size)
             .into_par_iter()
             .filter_map(|action| {
-                let (y, x) = (action / self.board_size, action % self.board_size);
+                let x = action / self.board_size;
+                let y = action % self.board_size;
                 if self.at(y, x) == 0 && self.check(y, x) {
                     Some(action)
                 } else {
@@ -640,7 +640,14 @@ impl MCTS {
                 while !node.is_leaf() {
                     let action = node.select_action(self.c_puct).unwrap();
                     path.push((node, action));
-                    current_state.apply_move(action);
+                    let board_size = current_state.board_size;
+                    if action == board_size * board_size {
+                        current_state.apply_move(board_size, board_size);
+                    } else {
+                        let x = action / board_size;
+                        let y = action % board_size;
+                        current_state.apply_move(x, y);
+                    }
 
                     let child_ref = node.children.get(&action).unwrap();
                     node = unsafe { &*(child_ref.value() as *const MCTSNode) };
@@ -911,9 +918,9 @@ mod tests {
     fn superko() {
         let size: usize = 3;
         let mut state = State::new(size);
-        let game = [(0, 1), (1, 1), (1, 0)];
-        for &(y, x) in &game {
-            state.apply_move(y * size + x);
+        let game = [(1, 0), (1, 1), (0, 1)];
+        for &(x, y) in &game {
+            state.apply_move(x, y);
         }
 
         assert!(!state.check(0, 0));

@@ -17,11 +17,19 @@ from mcts import MCTS, State, MCTSNode
 from network import AlphaGoZeroNet
 
 
+def action_to_coords(action, board_size):
+    if action == board_size * board_size:
+        return board_size, board_size
+    x = action // board_size
+    y = action % board_size
+    return x, y
+
+
 def to_sgf_coords(action, board_size):
     if action == board_size * board_size:
         return None
-    row, col = divmod(action, board_size)
-    return (row, col)
+    x, y = action_to_coords(action, board_size)
+    return (y, x)
 
 
 class ReplayBuffer:
@@ -171,7 +179,8 @@ class CPUWorker:
             sgf_node = sgf_node.new_child()
             sgf_node.set_move(player_color, sgf_coords)
 
-            state.apply_move(action_to_play)
+            x, y = action_to_coords(action_to_play, config.BOARD_SIZE)
+            state.apply_move(x, y)
             state_repr = state.get_representation()
             child_node = root_node.get_child(action_to_play)
             root_node = child_node if child_node is not None else MCTSNode()
@@ -503,7 +512,8 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
             if move_probs
             else (config.BOARD_SIZE**2)
         )
-        state.apply_move(action_to_play)
+        x, y = action_to_coords(action_to_play, config.BOARD_SIZE)
+        state.apply_move(x, y)
         if current_player_is_black:
             black_child = black_root.get_child(action_to_play)
             black_root = black_child if black_child is not None else MCTSNode()
