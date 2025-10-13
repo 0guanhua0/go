@@ -25,6 +25,7 @@
 
 [Zobrist hashing](https://en.wikipedia.org/wiki/Zobrist_hashing)
 
+[sgf](https://www.red-bean.com/sgf/go.html)
 # network
 residual network
 
@@ -35,11 +36,6 @@ policy and value in one network
 # perf
 rust
 
-numba
-
 self play - 1 network forward pass + mcts
 train - loss + backpropagation
 eval - 2 networks forward pass + mcts
-
-
-Compact State Representation

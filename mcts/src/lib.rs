@@ -124,7 +124,7 @@ impl State {
     }
 
     // https://tromp.github.io/go.html
-    fn check(&self, y: usize, x: usize) -> bool {
+    fn check(&self, x: usize, y: usize) -> bool {
         let player = self.current_player;
 
         if self.get(x, y) != 0 {
@@ -135,24 +135,24 @@ impl State {
             self.current_hash ^ ZOBRIST_TABLE.key[x][y][player_to_index(player)];
         let mut captures_made = false;
 
-        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-            let ny_isize = y as isize + dy;
+        for (dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
             let nx_isize = x as isize + dx;
-            if ny_isize < 0
-                || ny_isize >= self.board_size as isize
-                || nx_isize < 0
+            let ny_isize = y as isize + dy;
+            if nx_isize < 0
                 || nx_isize >= self.board_size as isize
+                || ny_isize < 0
+                || ny_isize >= self.board_size as isize
             {
                 continue;
             }
-            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+            let (nx, ny) = (nx_isize as usize, ny_isize as usize);
 
             if self.get(nx, ny) == -player {
-                let (group, liberties) = self._get_group(ny, nx, &self.board);
-                if liberties.len() == 1 && liberties.contains(&(y, x)) {
+                let (group, liberties) = self._get_group(nx, ny, &self.board);
+                if liberties.len() == 1 && liberties.contains(&(x, y)) {
                     captures_made = true;
-                    for (sy, sx) in group {
-                        potential_next_hash ^= ZOBRIST_TABLE.key[sx][sy][player_to_index(-player)];
+                    for (gx, gy) in group {
+                        potential_next_hash ^= ZOBRIST_TABLE.key[gx][gy][player_to_index(-player)];
                     }
                 }
             }
@@ -160,31 +160,31 @@ impl State {
 
         let mut final_liberties = HashSet::new();
         let mut visited_stones_for_lib_check = HashSet::new();
-        visited_stones_for_lib_check.insert((y, x));
+        visited_stones_for_lib_check.insert((x, y));
         let mut has_immediate_liberty = false;
 
-        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-            let ny_isize = y as isize + dy;
+        for (dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
             let nx_isize = x as isize + dx;
-            if ny_isize < 0
-                || ny_isize >= self.board_size as isize
-                || nx_isize < 0
+            let ny_isize = y as isize + dy;
+            if nx_isize < 0
                 || nx_isize >= self.board_size as isize
+                || ny_isize < 0
+                || ny_isize >= self.board_size as isize
             {
                 continue;
             }
-            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+            let (nx, ny) = (nx_isize as usize, ny_isize as usize);
 
             match self.get(nx, ny) {
                 0 => has_immediate_liberty = true,
                 p if p == player => {
-                    if !visited_stones_for_lib_check.contains(&(ny, nx)) {
-                        let (group, liberties) = self._get_group(ny, nx, &self.board);
-                        for l in liberties {
-                            final_liberties.insert(l);
+                    if !visited_stones_for_lib_check.contains(&(nx, ny)) {
+                        let (group, liberties) = self._get_group(nx, ny, &self.board);
+                        for liberty in liberties {
+                            final_liberties.insert(liberty);
                         }
-                        for s in group {
-                            visited_stones_for_lib_check.insert(s);
+                        for stone in group {
+                            visited_stones_for_lib_check.insert(stone);
                         }
                     }
                 }
@@ -192,7 +192,7 @@ impl State {
             }
         }
 
-        final_liberties.remove(&(y, x));
+        final_liberties.remove(&(x, y));
 
         let move_has_liberty =
             has_immediate_liberty || !final_liberties.is_empty() || captures_made;
@@ -361,7 +361,7 @@ impl State {
             .filter_map(|action| {
                 let x = action / self.board_size;
                 let y = action % self.board_size;
-                if self.get(x, y) == 0 && self.check(y, x) {
+                if self.get(x, y) == 0 && self.check(x, y) {
                     Some(action)
                 } else {
                     None
@@ -897,14 +897,15 @@ mod tests {
 
     #[test]
     fn superko() {
-        let size: usize = 3;
+        let size: usize = 19;
         let mut state = State::new(size);
-        let game = [(1, 0), (1, 1), (0, 1)];
+        let game = [(1, 0), (1, 1), (0, 1), (2, 1), (1, 2), (3, 1), (0, 3)];
         for &(x, y) in &game {
             state.apply_move(x, y);
         }
 
         assert!(!state.check(0, 0));
+        assert!(!state.check(0, 2));
     }
 }
 
