@@ -15,6 +15,7 @@ const BOARD_SIZE: usize = 19;
 // black 1, white 2
 const NUM_PLAYER: usize = 2;
 const KOMI: f64 = 7.5;
+const NEIGHBOR_OFFSETS: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 struct ZobristTable {
     pub key: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
@@ -56,12 +57,18 @@ pub struct State {
 }
 
 impl State {
+    #[inline]
+    fn idx(&self, x: usize, y: usize) -> usize {
+        x * self.board_size + y
+    }
+
     fn get(&self, x: usize, y: usize) -> i8 {
-        self.board[x * self.board_size + y]
+        self.board[self.idx(x, y)]
     }
 
     fn set(&mut self, x: usize, y: usize, val: i8) {
-        self.board[x * self.board_size + y] = val;
+        let idx = self.idx(x, y);
+        self.board[idx] = val;
     }
 
     fn _get_winner(&self) -> i8 {
@@ -77,13 +84,13 @@ impl State {
     }
     fn _get_group(
         &self,
-        y: usize,
         x: usize,
-        board: &Vec<i8>,
+        y: usize,
+        board: &[i8],
     ) -> (HashSet<(usize, usize)>, HashSet<(usize, usize)>) {
         let mut group_stones = HashSet::new();
         let mut liberties = HashSet::new();
-        let color = board[y * self.board_size + x];
+        let color = board[self.idx(x, y)];
 
         if color == 0 {
             return (group_stones, liberties);
@@ -92,31 +99,32 @@ impl State {
         let mut q = VecDeque::new();
         let mut visited = HashSet::new();
 
-        q.push_back((y, x));
-        visited.insert((y, x));
-        group_stones.insert((y, x));
+        q.push_back((x, y));
+        visited.insert((x, y));
+        group_stones.insert((x, y));
 
-        while let Some((cy, cx)) = q.pop_front() {
-            for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                let ny_isize = cy as isize + dy;
+        while let Some((cx, cy)) = q.pop_front() {
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
                 let nx_isize = cx as isize + dx;
+                let ny_isize = cy as isize + dy;
 
-                if ny_isize < 0
-                    || ny_isize >= self.board_size as isize
-                    || nx_isize < 0
+                if nx_isize < 0
                     || nx_isize >= self.board_size as isize
+                    || ny_isize < 0
+                    || ny_isize >= self.board_size as isize
                 {
                     continue;
                 }
-                let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+                let nx = nx_isize as usize;
+                let ny = ny_isize as usize;
 
-                let neighbor = board[ny * self.board_size + nx];
+                let neighbor = board[self.idx(nx, ny)];
                 if neighbor == 0 {
-                    liberties.insert((ny, nx));
-                } else if neighbor == color && !visited.contains(&(ny, nx)) {
-                    visited.insert((ny, nx));
-                    group_stones.insert((ny, nx));
-                    q.push_back((ny, nx));
+                    liberties.insert((nx, ny));
+                } else if neighbor == color && !visited.contains(&(nx, ny)) {
+                    visited.insert((nx, ny));
+                    group_stones.insert((nx, ny));
+                    q.push_back((nx, ny));
                 }
             }
         }
@@ -135,7 +143,7 @@ impl State {
             self.current_hash ^ ZOBRIST_TABLE.key[x][y][player_to_index(player)];
         let mut captures_made = false;
 
-        for (dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
             let nx_isize = x as isize + dx;
             let ny_isize = y as isize + dy;
             if nx_isize < 0
@@ -145,7 +153,8 @@ impl State {
             {
                 continue;
             }
-            let (nx, ny) = (nx_isize as usize, ny_isize as usize);
+            let nx = nx_isize as usize;
+            let ny = ny_isize as usize;
 
             if self.get(nx, ny) == -player {
                 let (group, liberties) = self._get_group(nx, ny, &self.board);
@@ -163,7 +172,7 @@ impl State {
         visited_stones_for_lib_check.insert((x, y));
         let mut has_immediate_liberty = false;
 
-        for (dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+        for &(dx, dy) in &NEIGHBOR_OFFSETS {
             let nx_isize = x as isize + dx;
             let ny_isize = y as isize + dy;
             if nx_isize < 0
@@ -173,7 +182,8 @@ impl State {
             {
                 continue;
             }
-            let (nx, ny) = (nx_isize as usize, ny_isize as usize);
+            let nx = nx_isize as usize;
+            let ny = ny_isize as usize;
 
             match self.get(nx, ny) {
                 0 => has_immediate_liberty = true,
@@ -244,8 +254,7 @@ impl State {
 
         for y in 0..self.board_size {
             for x in 0..self.board_size {
-                if territory_mask[y * self.board_size + x] == 0 && !visited_flood.contains(&(y, x))
-                {
+                if territory_mask[self.idx(x, y)] == 0 && !visited_flood.contains(&(y, x)) {
                     let mut q = VecDeque::new();
                     let mut visited_region = HashSet::new();
                     let mut borders = (false, false); // black, white
@@ -267,7 +276,7 @@ impl State {
                                 continue;
                             }
                             let (ny, nx) = (ny_isize as usize, nx_isize as usize);
-                            let neighbor_val = self.board[ny * self.board_size + nx];
+                            let neighbor_val = self.board[self.idx(nx, ny)];
                             if neighbor_val == 1 {
                                 borders.0 = true;
                             } else if neighbor_val == -1 {
@@ -288,7 +297,7 @@ impl State {
 
                     if owner != 0 {
                         for (ry, rx) in visited_region {
-                            territory_mask[ry * self.board_size + rx] = owner;
+                            territory_mask[self.idx(rx, ry)] = owner;
                         }
                     }
                 }
@@ -316,25 +325,26 @@ impl State {
             self.current_hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(self.current_player)];
             self.set(x, y, self.current_player);
 
-            for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                let ny_isize = y as isize + dy;
+            for &(dx, dy) in &NEIGHBOR_OFFSETS {
                 let nx_isize = x as isize + dx;
-                if ny_isize < 0
-                    || ny_isize >= self.board_size as isize
-                    || nx_isize < 0
+                let ny_isize = y as isize + dy;
+                if nx_isize < 0
                     || nx_isize >= self.board_size as isize
+                    || ny_isize < 0
+                    || ny_isize >= self.board_size as isize
                 {
                     continue;
                 }
-                let (ny, nx) = (ny_isize as usize, nx_isize as usize);
+                let nx = nx_isize as usize;
+                let ny = ny_isize as usize;
 
                 if self.get(nx, ny) == -self.current_player {
-                    let (group, liberties) = self._get_group(ny, nx, &self.board);
+                    let (group, liberties) = self._get_group(nx, ny, &self.board);
                     if liberties.is_empty() {
-                        for (sy, sx) in group {
+                        for (gx, gy) in group {
                             self.current_hash ^=
-                                ZOBRIST_TABLE.key[sx][sy][player_to_index(-self.current_player)];
-                            self.set(sx, sy, 0);
+                                ZOBRIST_TABLE.key[gx][gy][player_to_index(-self.current_player)];
+                            self.set(gx, gy, 0);
                         }
                     }
                 }
