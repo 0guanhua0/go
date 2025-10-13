@@ -385,10 +385,10 @@ impl State {
     fn get_representation<'py>(
         &self,
         py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
+    ) -> PyResult<Bound<'py, PyArray<f64, IxDyn>>> {
         let num_planes = 17;
         let plane_size = self.board_size * self.board_size;
-        let mut state_vec = vec![0.0f32; num_planes * plane_size];
+        let mut state_vec = vec![0.0f64; num_planes * plane_size];
 
         let player_stone = self.current_player;
         let opponent_stone = -self.current_player;
@@ -577,18 +577,12 @@ impl MCTS {
             let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
 
             let result_obj = self.network.call_method1(py, "predict", (batch_repr,))?;
-            let result_tuple = result_obj.downcast_bound::<pyo3::types::PyTuple>(py)?;
-            let policy_item = result_tuple.get_item(0)?;
-            let policy_array_2d = policy_item.downcast::<PyArray2<f32>>()?;
-            let value_item = result_tuple.get_item(1)?;
-            let value_vec: Vec<f32> = value_item
-                .downcast::<PyArray1<f32>>()?
-                .readonly()
-                .to_vec()?;
+            let (policy_array, value_array): (Bound<'_, PyArray2<f64>>, Bound<'_, PyArray1<f64>>) =
+                result_obj.extract(py)?;
+            let value_vec = value_array.to_vec()?;
 
-            let policy_readonly = policy_array_2d.readonly();
-            let policy_array = policy_readonly.as_array();
-            let policy_slice = policy_array
+            let policy_view = unsafe { policy_array.as_array() };
+            let policy_slice = policy_view
                 .slice(s![0, ..])
                 .to_slice()
                 .ok_or_else(|| PyValueError::new_err("failed to slice policy array"))?;
@@ -598,7 +592,7 @@ impl MCTS {
                 state.current_hash,
                 TTval {
                     policy: policy_map.clone(),
-                    value: value_vec[0] as f64,
+                    value: value_vec[0],
                 },
             );
 
@@ -705,15 +699,9 @@ impl MCTS {
                 .network
                 .call_method1(py, "predict", (batch_numpy_array,))?;
 
-            let result_tuple = result_obj.downcast_bound::<pyo3::types::PyTuple>(py)?;
-            let policy_item = result_tuple.get_item(0)?;
-            let policies_array = policy_item.downcast::<PyArray2<f32>>()?;
-            let policies = policies_array.readonly();
-            let value_item = result_tuple.get_item(1)?;
-            let value_vec: Vec<f32> = value_item
-                .downcast::<PyArray1<f32>>()?
-                .readonly()
-                .to_vec()?;
+            let (policies, value_array): (Bound<'_, PyArray2<f64>>, Bound<'_, PyArray1<f64>>) =
+                result_obj.extract(py)?;
+            let value_vec = value_array.to_vec()?;
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
                 let leaf_node = item
@@ -723,14 +711,14 @@ impl MCTS {
                         &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
                     });
 
-                let policies_view = policies.as_array();
+                let policies_view = unsafe { policies.as_array() };
                 let policy_slice = policies_view
                     .slice(s![i, ..])
                     .to_slice()
                     .expect("policy slice fail");
 
                 let (policy_map, _) = self._get_normalized_priors(&item.state, policy_slice)?;
-                let value = value_vec[i] as f64;
+                let value = value_vec[i];
 
                 self.transposition_table.insert(
                     item.state.current_hash,
@@ -850,15 +838,14 @@ impl MCTS {
     fn _get_normalized_priors(
         &self,
         state: &State,
-        policy_raw: &[f32],
+        policy_raw: &[f64],
     ) -> PyResult<(HashMap<usize, f64>, f64)> {
         let legal_moves = state.get_legal_moves();
         let mut action_priors = HashMap::new();
         let mut prob_sum = 0.0;
 
         for &action in &legal_moves {
-            if let Some(&prob_f32) = policy_raw.get(action) {
-                let prob = prob_f32 as f64;
+            if let Some(&prob) = policy_raw.get(action) {
                 action_priors.insert(action, prob);
                 prob_sum += prob;
             }

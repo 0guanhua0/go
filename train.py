@@ -473,6 +473,8 @@ class NetworkWrapper:
 
         self.request_queue.put(("INFER", (self.worker_id, self.model_id, state_batch)))
         policy_probs, value = self.result_pipe.recv()
+        policy_probs = np.asarray(policy_probs, dtype=np.float64)
+        value = np.asarray(value, dtype=np.float64)
         return policy_probs, value
 
 
