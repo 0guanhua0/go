@@ -6,10 +6,11 @@
 [Residual neural network](https://en.wikipedia.org/wiki/Residual_neural_network)
 - [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385)
 
+[Monte Carlo tree search](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search)
+- [Batch Monte Carlo Tree Search](https://arxiv.org/abs/2104.04278)
+
 [Cross-entropy](https://en.wikipedia.org/wiki/Cross_entropy)
 - [The Key Equation Behind Probability](https://www.youtube.com/watch?v=KHVR587oW8I)
-
-[Weight initialization](https://en.wikipedia.org/wiki/Weight_initialization)
 
 [Backpropagation](https://en.wikipedia.org/wiki/Backpropagation)
 - [Backpropagation, intuitively | Deep Learning Chapter 3](https://www.youtube.com/watch?v=Ilg3gGewQ5U)
@@ -20,22 +21,6 @@
 
 [Elo rating system](https://en.wikipedia.org/wiki/Elo_rating_system)
 
-[Monte Carlo tree search](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search)
-- [Batch Monte Carlo Tree Search](https://arxiv.org/abs/2104.04278)
-
 [Zobrist hashing](https://en.wikipedia.org/wiki/Zobrist_hashing)
 
 [sgf](https://www.red-bean.com/sgf/go.html)
-# network
-residual network
-
-policy and value in one network
-
-# data pipeline
-
-# perf
-rust
-
-self play - 1 network forward pass + mcts
-train - loss + backpropagation
-eval - 2 networks forward pass + mcts
