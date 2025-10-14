@@ -114,7 +114,7 @@ class CPUWorker:
             result_pipe=self.result_pipes[self.worker_id],
         )
 
-        state = State(config.BOARD_SIZE)
+        state = State(config.board)
         mcts = MCTS(
             network_wrapper,
             config.C_PUCT,
@@ -122,7 +122,7 @@ class CPUWorker:
             config.DIRICHLET_EPSILON,
         )
 
-        sgf_game = sgf.Sgf_game(size=config.BOARD_SIZE)
+        sgf_game = sgf.Sgf_game(size=config.board)
         sgf_game.get_root().set_raw("KM", b"7.5")
         sgf_game.get_root().set("PW", "AlphaGoZero-Best")
         sgf_game.get_root().set("PB", "AlphaGoZero-Best")
@@ -159,9 +159,7 @@ class CPUWorker:
                     resigned = True
                     break
 
-            policy_target = np.zeros(
-                config.BOARD_SIZE * config.BOARD_SIZE + 1, dtype=np.float32
-            )
+            policy_target = np.zeros(config.board * config.board + 1, dtype=np.float32)
             for action, prob in move_probs.items():
                 policy_target[action] = prob
 
@@ -176,11 +174,11 @@ class CPUWorker:
             action_to_play = np.random.choice(len(policy_target), p=policy_target)
 
             player_color = "b" if state.get_current_player() == 1 else "w"
-            sgf_coords = to_sgf_coords(action_to_play, config.BOARD_SIZE)
+            sgf_coords = to_sgf_coords(action_to_play, config.board)
             sgf_node = sgf_node.new_child()
             sgf_node.set_move(player_color, sgf_coords)
 
-            x, y = action_to_coords(action_to_play, config.BOARD_SIZE)
+            x, y = action_to_coords(action_to_play, config.board)
             state.apply_move(x, y)
             state_repr = state.get_representation()
             child_node = root_node.get_child(action_to_play)
@@ -279,10 +277,10 @@ class GPUWorker(Process):
         )
 
         common_args = (
-            config.BOARD_SIZE,
-            config.NUM_RES_BLOCKS,
-            config.IN_CHANNELS,
-            config.NUM_FILTERS,
+            config.board,
+            config.history,
+            config.conv_filter,
+            config.res_block,
         )
         self.models = {
             "best": AlphaGoZeroNet(*common_args).to(self.device),
@@ -488,7 +486,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
         black_player, white_player = next_wrapper, best_wrapper
     else:
         black_player, white_player = best_wrapper, next_wrapper
-    state = State(config.BOARD_SIZE)
+    state = State(config.board)
     black_mcts = MCTS(black_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     white_mcts = MCTS(white_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = MCTSNode(), MCTSNode()
@@ -511,11 +509,9 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
 
         move_probs = mcts.get_move_probs(root, state, temp=0)
         action_to_play = (
-            max(move_probs, key=move_probs.get)
-            if move_probs
-            else (config.BOARD_SIZE**2)
+            max(move_probs, key=move_probs.get) if move_probs else (config.board**2)
         )
-        x, y = action_to_coords(action_to_play, config.BOARD_SIZE)
+        x, y = action_to_coords(action_to_play, config.board)
         state.apply_move(x, y)
         if current_player_is_black:
             black_child = black_root.get_child(action_to_play)
@@ -601,8 +597,8 @@ def main(args):
 
     replay_buffer = ReplayBuffer(
         capacity=config.REPLAY_BUFFER_SIZE,
-        board_size=config.BOARD_SIZE,
-        in_channels=config.IN_CHANNELS,
+        board_size=config.board,
+        in_channels=config.history * 2 + 1,
     )
     pool_init_args = (gpu_request_queue, worker_conns, replay_buffer)
     cpu_worker_pool = Pool(
