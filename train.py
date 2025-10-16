@@ -5,7 +5,6 @@ import os
 import queue
 import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from sgfmill import sgf
@@ -62,7 +61,14 @@ class ReplayBuffer:
     def add(self, game_data):
         states, policies, values = zip(*game_data)
         state_tensors = torch.stack(states)
-        policy_tensors = torch.from_numpy(np.array(policies, dtype=np.float32))
+        policy_tensors = torch.stack(
+            [
+                policy.to(torch.float32)
+                if isinstance(policy, torch.Tensor)
+                else torch.as_tensor(policy, dtype=torch.float32)
+                for policy in policies
+            ]
+        )
         value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
 
         with self.lock:
@@ -160,7 +166,9 @@ class CPUWorker:
                     resigned = True
                     break
 
-            policy_target = np.zeros(config.board * config.board + 1)
+            policy_target = torch.zeros(
+                config.board * config.board + 1, dtype=torch.float32
+            )
             for action, prob in move_probs.items():
                 policy_target[action] = prob
 
@@ -172,7 +180,7 @@ class CPUWorker:
                     root_value,
                 )
             )
-            action_to_play = np.random.choice(len(policy_target), p=policy_target)
+            action_to_play = torch.multinomial(policy_target, 1).item()
 
             player_color = "b" if state.get_current_player() == 1 else "w"
             sgf_coords = to_sgf_coords(action_to_play, config.board)
@@ -325,8 +333,8 @@ class GPUWorker(Process):
         requests_by_model = {"best": [], "next": []}
 
         if first_cmd == "INFER":
-            worker_id, model_name, numpy_array = first_payload
-            requests_by_model[model_name].append((worker_id, numpy_array))
+            worker_id, model_name, state_batch = first_payload
+            requests_by_model[model_name].append((worker_id, state_batch))
         else:
             other_commands.append((first_cmd, first_payload))
 
@@ -334,8 +342,8 @@ class GPUWorker(Process):
             try:
                 command, payload = self.request_queue.get_nowait()
                 if command == "INFER":
-                    worker_id, model_name, numpy_array = payload
-                    requests_by_model[model_name].append((worker_id, numpy_array))
+                    worker_id, model_name, state_batch = payload
+                    requests_by_model[model_name].append((worker_id, state_batch))
                 else:
                     other_commands.append((command, payload))
             except queue.Empty:
@@ -395,27 +403,35 @@ class GPUWorker(Process):
             if not model_requests:
                 continue
 
-            worker_ids, numpy_arrays = zip(*model_requests)
+            worker_ids, state_batches = zip(*model_requests)
 
-            batch_numpy = np.concatenate(numpy_arrays, axis=0)
-            batch_tensor = torch.from_numpy(batch_numpy)
-            batch = batch_tensor.to(self.device)
+            tensor_batches = []
+            for state_batch in state_batches:
+                if isinstance(state_batch, torch.Tensor):
+                    tensor_batch = state_batch.to(dtype=torch.float32)
+                else:
+                    tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
+                tensor_batches.append(tensor_batch.contiguous())
+
+            batch = torch.cat(tensor_batches, dim=0).to(self.device, non_blocking=True)
 
             model = self.models[model_name]
 
             with torch.no_grad():
                 policy_logits, value_preds = model(batch)
-                policy_probs_batch = F.softmax(policy_logits, dim=1).cpu().numpy()
-                value_preds_batch = value_preds.cpu().numpy()
+                policy_probs_batch = F.softmax(policy_logits, dim=1).cpu()
+                value_preds_batch = value_preds.cpu()
 
             start_index = 0
             for i, worker_id in enumerate(worker_ids):
-                num_samples = numpy_arrays[i].shape[0]
+                num_samples = tensor_batches[i].shape[0]
                 end_index = start_index + num_samples
-                policy_result = policy_probs_batch[start_index:end_index]
-                value_result = value_preds_batch[start_index:end_index]
+                policy_result = policy_probs_batch[start_index:end_index].contiguous()
+                value_result = (
+                    value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
+                )
                 self.result_pipes[worker_id].send(
-                    (policy_result, value_result.squeeze(-1))
+                    (policy_result.clone(), value_result.clone())
                 )
                 start_index = end_index
 
@@ -457,18 +473,27 @@ class NetworkWrapper:
 
     def predict(self, state_batch):
         if isinstance(state_batch, torch.Tensor):
-            state_batch = state_batch.cpu().numpy()
+            tensor_batch = state_batch.to(dtype=torch.float32)
+        else:
+            tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
 
-        assert isinstance(state_batch, np.ndarray)
-        assert state_batch.ndim == 4, (
-            "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
+        if tensor_batch.ndim != 4:
+            raise AssertionError(
+                "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
+            )
+
+        tensor_batch = tensor_batch.contiguous()
+        self.request_queue.put(
+            ("INFER", (self.worker_id, self.model_id, tensor_batch.cpu()))
         )
-
-        self.request_queue.put(("INFER", (self.worker_id, self.model_id, state_batch)))
         policy_probs, value = self.result_pipe.recv()
-        policy_probs = np.asarray(policy_probs)
-        value = np.asarray(value)
-        return policy_probs, value
+
+        if not isinstance(policy_probs, torch.Tensor):
+            policy_probs = torch.as_tensor(policy_probs, dtype=torch.float32)
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value, dtype=torch.float32)
+
+        return policy_probs.cpu().numpy(), value.cpu().numpy()
 
 
 def evaluate_game_task(worker_id, is_next_black):
@@ -656,7 +681,8 @@ def main(args):
             best_threshold = resignation_threshold
             min_diff = float("inf")
 
-            for v_candidate in np.arange(-0.99, -0.50, 0.01):
+            for v_candidate in torch.arange(-0.99, -0.50, 0.01, dtype=torch.float32):
+                v_candidate = float(v_candidate)
                 would_resign = [
                     d for d in non_resignation_history if d[0] < v_candidate
                 ]
