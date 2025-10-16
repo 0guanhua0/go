@@ -7,13 +7,14 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sgfmill import sgf
 from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 
 import config
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
-from mcts import MCTS, State, MCTSNode
+from mcts import MCTS, MCTSNode, State
 from network import AlphaGoZeroNet
 
 
@@ -294,7 +295,6 @@ class GPUWorker(Process):
             self.models["next"].parameters(),
             lr=config.INITIAL_LR,
             momentum=0.9,
-            weight_decay=config.L2_REGULARIZATION,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
@@ -383,7 +383,6 @@ class GPUWorker(Process):
                 self.models["next"].parameters(),
                 lr=config.INITIAL_LR,
                 momentum=0.9,
-                weight_decay=config.L2_REGULARIZATION,
             )
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
@@ -408,9 +407,7 @@ class GPUWorker(Process):
 
             with torch.no_grad():
                 policy_logits, value_preds = model(batch)
-                policy_probs_batch = (
-                    torch.nn.functional.softmax(policy_logits, dim=1).cpu().numpy()
-                )
+                policy_probs_batch = F.softmax(policy_logits, dim=1).cpu().numpy()
                 value_preds_batch = value_preds.cpu().numpy()
 
             start_index = 0
@@ -435,16 +432,16 @@ class GPUWorker(Process):
 
         policy_pred_logits, value_pred = self.models["next"](state_tensors)
 
-        policy_loss = torch.nn.functional.cross_entropy(
-            policy_pred_logits, policy_targets
-        )
-        value_loss = torch.nn.functional.mse_loss(value_pred, value_targets)
-        loss = policy_loss + value_loss
+        policy_loss = F.cross_entropy(policy_pred_logits, policy_targets)
+        value_loss = F.mse_loss(value_pred, value_targets)
+        l2_penalty = torch.tensor(0.0, device=self.device)
+        for p in self.models["next"].parameters():
+            if p.requires_grad and p.dim() > 1:
+                l2_penalty += torch.sum(p.pow(2))
+        loss = policy_loss + value_loss + config.l2_regularization * l2_penalty
 
         loss.backward()
-
         self.optimizer.step()
-
         self.models["next"].eval()
         return loss.item()
 
