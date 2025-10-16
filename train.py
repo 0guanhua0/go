@@ -50,9 +50,9 @@ class ReplayBuffer:
 
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
 
-        self.states = torch.zeros(state_shape, dtype=torch.float32)
-        self.policies = torch.zeros(policy_shape, dtype=torch.float32)
-        self.values = torch.zeros(value_shape, dtype=torch.float32)
+        self.states = torch.zeros(state_shape)
+        self.policies = torch.zeros(policy_shape)
+        self.values = torch.zeros(value_shape)
 
         self.states.share_memory_()
         self.policies.share_memory_()
@@ -63,7 +63,7 @@ class ReplayBuffer:
         states, policies, values = zip(*game_data)
         state_tensors = torch.stack(states)
         policy_tensors = torch.from_numpy(np.array(policies, dtype=np.float32))
-        value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(1)
+        value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
 
         with self.lock:
             idx = (
@@ -160,7 +160,7 @@ class CPUWorker:
                     resigned = True
                     break
 
-            policy_target = np.zeros(config.board * config.board + 1, dtype=np.float32)
+            policy_target = np.zeros(config.board * config.board + 1)
             for action, prob in move_probs.items():
                 policy_target[action] = prob
 
@@ -189,9 +189,7 @@ class CPUWorker:
         non_resigned_data = []
         for state_repr_hist, policy, player, r_val in game_history:
             z = player * winner
-            game_data.append(
-                (torch.from_numpy(state_repr_hist.astype(np.float32)), policy, z)
-            )
+            game_data.append((torch.from_numpy(state_repr_hist), policy, z))
             if disable_resignation:
                 non_resigned_data.append({"root_value": r_val, "final_reward": z})
 
@@ -400,7 +398,7 @@ class GPUWorker(Process):
             worker_ids, numpy_arrays = zip(*model_requests)
 
             batch_numpy = np.concatenate(numpy_arrays, axis=0)
-            batch_tensor = torch.from_numpy(batch_numpy).float()
+            batch_tensor = torch.from_numpy(batch_numpy)
             batch = batch_tensor.to(self.device)
 
             model = self.models[model_name]
@@ -424,7 +422,7 @@ class GPUWorker(Process):
     def _train_step(self, states, policies, values):
         self.models["next"].train()
 
-        state_tensors = states.to(self.device, non_blocking=True).float()
+        state_tensors = states.to(self.device, non_blocking=True)
         policy_targets = policies.to(self.device, non_blocking=True)
         value_targets = values.to(self.device, non_blocking=True)
 
@@ -468,8 +466,8 @@ class NetworkWrapper:
 
         self.request_queue.put(("INFER", (self.worker_id, self.model_id, state_batch)))
         policy_probs, value = self.result_pipe.recv()
-        policy_probs = np.asarray(policy_probs, dtype=np.float64)
-        value = np.asarray(value, dtype=np.float64)
+        policy_probs = np.asarray(policy_probs)
+        value = np.asarray(value)
         return policy_probs, value
 
 

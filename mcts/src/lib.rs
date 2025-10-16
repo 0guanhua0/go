@@ -12,9 +12,9 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BOARD_SIZE: usize = 19;
-// black 1, white 2
+// black 1, white -1
 const NUM_PLAYER: usize = 2;
-const KOMI: f64 = 7.5;
+const KOMI: f32 = 7.5;
 const NEIGHBOR_OFFSETS: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 struct ZobristTable {
@@ -248,7 +248,7 @@ impl State {
         self.current_player
     }
 
-    fn get_score(&self) -> (f64, f64) {
+    fn get_score(&self) -> (f32, f32) {
         let mut territory_mask = self.board.clone();
         let mut visited_flood = HashSet::new();
 
@@ -304,8 +304,8 @@ impl State {
             }
         }
 
-        let black_score: f64 = territory_mask.iter().filter(|&&s| s == 1).count() as f64;
-        let white_score: f64 = territory_mask.iter().filter(|&&s| s == -1).count() as f64 + KOMI;
+        let black_score: f32 = territory_mask.iter().filter(|&&s| s == 1).count() as f32;
+        let white_score: f32 = territory_mask.iter().filter(|&&s| s == -1).count() as f32 + KOMI;
 
         (black_score, white_score)
     }
@@ -395,10 +395,10 @@ impl State {
     fn get_representation<'py>(
         &self,
         py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray<f64, IxDyn>>> {
+    ) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
         let num_planes = 17;
         let plane_size = self.board_size * self.board_size;
-        let mut state_vec = vec![0.0f64; num_planes * plane_size];
+        let mut state_vec = vec![0.0f32; num_planes * plane_size];
 
         let player_stone = self.current_player;
         let opponent_stone = -self.current_player;
@@ -439,12 +439,12 @@ impl State {
 struct MCTSNode {
     children: DashMap<usize, MCTSNode>,
     visit_count: DashMap<usize, usize>,
-    total_action_value: DashMap<usize, f64>,
-    prior_prob: DashMap<usize, f64>,
+    total_action_value: DashMap<usize, f32>,
+    prior_prob: DashMap<usize, f32>,
 }
 
 impl MCTSNode {
-    fn expand(&self, action_priors: &HashMap<usize, f64>) {
+    fn expand(&self, action_priors: &HashMap<usize, f32>) {
         for (&action, &prob) in action_priors {
             if !self.children.contains_key(&action) {
                 self.children.insert(action, MCTSNode::new());
@@ -481,7 +481,7 @@ impl MCTSNode {
         for item in self.total_action_value.iter() {
             let action = *item.key();
             let total_val = *item.value();
-            let visits = self.visit_count.get(&action).map_or(0, |v| *v) as f64;
+            let visits = self.visit_count.get(&action).map_or(0, |v| *v) as f32;
             let mean_val = if visits > 0.0 {
                 total_val / visits
             } else {
@@ -502,21 +502,21 @@ impl MCTSNode {
         self.children.is_empty()
     }
 
-    fn select_action(&self, c_puct: f64) -> Option<usize> {
-        let mut best_score = f64::NEG_INFINITY;
+    fn select_action(&self, c_puct: f32) -> Option<usize> {
+        let mut best_score = f32::NEG_INFINITY;
         let mut best_action = None;
 
-        let total_visits_from_node: f64 = self
+        let total_visits_from_node: f32 = self
             .visit_count
             .iter()
-            .map(|entry| *entry.value() as f64)
+            .map(|entry| *entry.value() as f32)
             .sum();
 
         let sqrt_total_visits = total_visits_from_node.sqrt();
 
         for entry in self.children.iter() {
             let action = *entry.key();
-            let n_value = *self.visit_count.get(&action).unwrap() as f64;
+            let n_value = *self.visit_count.get(&action).unwrap() as f32;
 
             let q_value = if n_value > 0.0 {
                 *self.total_action_value.get(&action).unwrap() / n_value
@@ -536,7 +536,7 @@ impl MCTSNode {
         best_action
     }
 
-    fn update_stats_for_action(&self, action: usize, value: f64) {
+    fn update_stats_for_action(&self, action: usize, value: f32) {
         if let Some(mut count) = self.visit_count.get_mut(&action) {
             *count += 1;
             let mut total_val = self.total_action_value.get_mut(&action).unwrap();
@@ -547,16 +547,16 @@ impl MCTSNode {
 
 #[derive(Clone)]
 struct TTval {
-    policy: HashMap<usize, f64>,
-    value: f64,
+    policy: HashMap<usize, f32>,
+    value: f32,
 }
 
 #[pyclass]
 struct MCTS {
     network: PyObject,
-    c_puct: f64,
-    dirichlet_alpha: f64,
-    epsilon: f64,
+    c_puct: f32,
+    dirichlet_alpha: f32,
+    epsilon: f32,
     transposition_table: DashMap<u64, TTval>,
 }
 
@@ -564,7 +564,7 @@ struct MCTS {
 impl MCTS {
     #[new]
     #[pyo3(signature = (network, c_puct=1.0, dirichlet_alpha=0.03, epsilon=0.25))]
-    fn new(network: PyObject, c_puct: f64, dirichlet_alpha: f64, epsilon: f64) -> Self {
+    fn new(network: PyObject, c_puct: f32, dirichlet_alpha: f32, epsilon: f32) -> Self {
         MCTS {
             network,
             c_puct,
@@ -587,7 +587,7 @@ impl MCTS {
             let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
 
             let result_obj = self.network.call_method1(py, "predict", (batch_repr,))?;
-            let (policy_array, value_array): (Bound<'_, PyArray2<f64>>, Bound<'_, PyArray1<f64>>) =
+            let (policy_array, value_array): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result_obj.extract(py)?;
             let value_vec = value_array.to_vec()?;
 
@@ -618,7 +618,7 @@ impl MCTS {
         enum SimulationResult<'a> {
             Terminal {
                 path: Vec<(&'a MCTSNode, usize)>,
-                value: f64,
+                value: f32,
             },
             TtHit {
                 path: Vec<(&'a MCTSNode, usize)>,
@@ -657,7 +657,7 @@ impl MCTS {
                     let value = if winner == 0 {
                         0.0
                     } else {
-                        (winner as f64) * (state.current_player as f64)
+                        (winner as f32) * (state.current_player as f32)
                     };
                     SimulationResult::Terminal { path, value }
                 } else {
@@ -709,7 +709,7 @@ impl MCTS {
                 .network
                 .call_method1(py, "predict", (batch_numpy_array,))?;
 
-            let (policies, value_array): (Bound<'_, PyArray2<f64>>, Bound<'_, PyArray1<f64>>) =
+            let (policies, value_array): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result_obj.extract(py)?;
             let value_vec = value_array.to_vec()?;
 
@@ -750,7 +750,7 @@ impl MCTS {
         py: Python<'py>,
         root_node: &MCTSNode,
         state: &State,
-        temp: f64,
+        temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
         let legal_moves_vec = state.get_legal_moves();
         let legal_moves: HashSet<usize> = legal_moves_vec.iter().copied().collect();
@@ -773,7 +773,7 @@ impl MCTS {
             if legal_moves_vec.is_empty() {
                 return Ok(out_dict);
             }
-            let prob = 1.0 / legal_moves_vec.len() as f64;
+            let prob = 1.0 / legal_moves_vec.len() as f32;
             for action in legal_moves_vec {
                 out_dict.set_item(action, prob)?;
             }
@@ -796,12 +796,12 @@ impl MCTS {
         let inv_temp = 1.0 / temp;
         let powered_counts: HashMap<_, _> = visit_counts
             .iter()
-            .map(|(&a, &c)| (a, (c as f64).powf(inv_temp)))
+            .map(|(&a, &c)| (a, (c as f32).powf(inv_temp)))
             .collect();
-        let total_powered_count: f64 = powered_counts.values().sum();
+        let total_powered_count: f32 = powered_counts.values().sum();
 
         if total_powered_count < 1e-6 {
-            let prob = 1.0 / visit_counts.len() as f64;
+            let prob = 1.0 / visit_counts.len() as f32;
             for action in visit_counts.keys() {
                 out_dict.set_item(action, prob)?;
             }
@@ -826,15 +826,15 @@ impl MCTS {
             Err(_) => return,
         };
         let mut rng = rand::rng();
-        let mut samples: Vec<f64> = (0..actions.len())
+        let mut samples: Vec<f32> = (0..actions.len())
             .map(|_| gamma_dist.sample(&mut rng))
             .collect();
-        let sum: f64 = samples.iter().sum();
+        let sum: f32 = samples.iter().sum();
 
         if sum > 1e-9 {
             samples.iter_mut().for_each(|s| *s /= sum);
         } else {
-            let uniform_prob = 1.0 / actions.len() as f64;
+            let uniform_prob = 1.0 / actions.len() as f32;
             samples.fill(uniform_prob);
         };
 
@@ -848,8 +848,8 @@ impl MCTS {
     fn _get_normalized_priors(
         &self,
         state: &State,
-        policy_raw: &[f64],
-    ) -> PyResult<(HashMap<usize, f64>, f64)> {
+        policy_raw: &[f32],
+    ) -> PyResult<(HashMap<usize, f32>, f32)> {
         let legal_moves = state.get_legal_moves();
         let mut action_priors = HashMap::new();
         let mut prob_sum = 0.0;
@@ -866,7 +866,7 @@ impl MCTS {
                 *prob /= prob_sum;
             }
         } else if !action_priors.is_empty() {
-            let uniform_prob = 1.0 / action_priors.len() as f64;
+            let uniform_prob = 1.0 / action_priors.len() as f32;
             for prob in action_priors.values_mut() {
                 *prob = uniform_prob;
             }
@@ -875,7 +875,7 @@ impl MCTS {
         Ok((action_priors, prob_sum))
     }
 
-    fn _backup(&self, path: &[(&MCTSNode, usize)], value: f64) {
+    fn _backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
         let mut current_value = -value;
         for &(parent_node, action_taken) in path.iter().rev() {
             parent_node.update_stats_for_action(action_taken, current_value);
