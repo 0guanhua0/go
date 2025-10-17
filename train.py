@@ -17,34 +17,34 @@ from mcts import MCTS, MCTSNode, State
 from network import AlphaGoZeroNet
 
 
-def action_to_coords(action, board_size):
-    if action == board_size * board_size:
-        return board_size, board_size
-    x = action // board_size
-    y = action % board_size
+def action_to_coords(action, board):
+    if action == board * board:
+        return board, board
+    x = action // board
+    y = action % board
     return x, y
 
 
-def to_sgf_coords(action, board_size):
-    if action == board_size * board_size:
+def to_sgf_coords(action, board):
+    if action == board * board:
         return None
-    x, y = action_to_coords(action, board_size)
+    x, y = action_to_coords(action, board)
     return (y, x)
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, board_size, in_channels):
+    def __init__(self, capacity, board, in_channels):
         self.lock = torch.multiprocessing.Lock()
         self.capacity = capacity
         self.size = torch.multiprocessing.Value("i", 0)
         self.head = torch.multiprocessing.Value("i", 0)
 
-        state_shape = (capacity, in_channels, board_size, board_size)
-        policy_shape = (capacity, board_size * board_size + 1)
+        state_shape = (capacity, in_channels, board, board)
+        policy_shape = (capacity, board * board + 1)
         value_shape = (capacity, 1)
 
-        state_bytes = capacity * in_channels * board_size * board_size * 4
-        policy_bytes = capacity * (board_size * board_size + 1) * 4
+        state_bytes = capacity * in_channels * board * board * 4
+        policy_bytes = capacity * (board * board + 1) * 4
         value_bytes = capacity * 1 * 4
 
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
@@ -479,7 +479,7 @@ class NetworkWrapper:
 
         if tensor_batch.ndim != 4:
             raise AssertionError(
-                "Input tensor must have shape (batch_size, in_channels, board_size, board_size)."
+                "Input tensor must have shape (batch_size, in_channels, board, board)."
             )
 
         tensor_batch = tensor_batch.contiguous()
@@ -617,7 +617,7 @@ def main(args):
 
     replay_buffer = ReplayBuffer(
         capacity=config.REPLAY_BUFFER_SIZE,
-        board_size=config.board,
+        board=config.board,
         in_channels=config.history * 2 + 1,
     )
     pool_init_args = (gpu_request_queue, worker_conns, replay_buffer)
