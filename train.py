@@ -33,19 +33,19 @@ def to_sgf_coords(action, board):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, board, in_channels):
+    def __init__(self, data, board, in_channels):
         self.lock = torch.multiprocessing.Lock()
-        self.capacity = capacity
+        self.data = data
         self.size = torch.multiprocessing.Value("i", 0)
         self.head = torch.multiprocessing.Value("i", 0)
 
-        state_shape = (capacity, in_channels, board, board)
-        policy_shape = (capacity, board * board + 1)
-        value_shape = (capacity, 1)
+        state_shape = (data, in_channels, board, board)
+        policy_shape = (data, board * board + 1)
+        value_shape = (data, 1)
 
-        state_bytes = capacity * in_channels * board * board * 4
-        policy_bytes = capacity * (board * board + 1) * 4
-        value_bytes = capacity * 1 * 4
+        state_bytes = data * in_channels * board * board * 4
+        policy_bytes = data * (board * board + 1) * 4
+        value_bytes = data * 1 * 4
 
         total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
 
@@ -58,8 +58,8 @@ class ReplayBuffer:
         self.values.share_memory_()
         logging.info(f"init replay buffer(~{total_gb:.2f} GB)")
 
-    def add(self, game_data):
-        states, policies, values = zip(*game_data)
+    def add(self, data):
+        states, policies, values = zip(*data)
         state_tensors = torch.stack(states)
         policy_tensors = torch.stack(
             [
@@ -72,17 +72,14 @@ class ReplayBuffer:
         value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
 
         with self.lock:
-            idx = (
-                torch.arange(self.head.value, self.head.value + len(game_data))
-                % self.capacity
-            )
+            idx = torch.arange(self.head.value, self.head.value + len(data)) % self.data
 
             self.states[idx] = state_tensors
             self.policies[idx] = policy_tensors
             self.values[idx] = value_tensors
 
-            self.head.value = (self.head.value + len(game_data)) % self.capacity
-            self.size.value = min(self.capacity, self.size.value + len(game_data))
+            self.head.value = (self.head.value + len(data)) % self.data
+            self.size.value = min(self.data, self.size.value + len(data))
 
     def sample(self, batch_size):
         with self.lock:
@@ -193,15 +190,15 @@ class CPUWorker:
             child_node = root_node.get_child(action_to_play)
             root_node = child_node if child_node is not None else MCTSNode()
 
-        game_data = []
+        data = []
         non_resigned_data = []
         for state_repr_hist, policy, player, r_val in game_history:
             z = player * winner
-            game_data.append((torch.from_numpy(state_repr_hist), policy, z))
+            data.append((torch.from_numpy(state_repr_hist), policy, z))
             if disable_resignation:
                 non_resigned_data.append({"root_value": r_val, "final_reward": z})
 
-        self.replay_buffer.add(game_data)
+        self.replay_buffer.add(data)
 
         sgf_result = ""
         if resigned:
@@ -230,13 +227,13 @@ class CPUWorker:
             f.write(sgf_game.serialise())
 
         log_message = (
-            f"Game finished ({len(game_data)} moves). Result: {sgf_result}. "
+            f"Game finished ({len(data)} moves). Result: {sgf_result}. "
             f"Buffer size: {len(self.replay_buffer)}"
         )
         logging.info(log_message)
 
         return {
-            "moves": len(game_data),
+            "moves": len(data),
             "disable_resignation": disable_resignation,
             "non_resigned_data": non_resigned_data,
         }
@@ -616,7 +613,7 @@ def main(args):
     accelerator_worker.start()
 
     replay_buffer = ReplayBuffer(
-        capacity=config.REPLAY_BUFFER_SIZE,
+        data=config.data,
         board=config.board,
         in_channels=config.history * 2 + 1,
     )
