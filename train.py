@@ -32,7 +32,7 @@ def to_sgf_coords(action, board):
     return (y, x)
 
 
-class ReplayBuffer:
+class RingBuffer:
     def __init__(self, data, board, in_channels):
         self.lock = torch.multiprocessing.Lock()
         self.data = data
@@ -56,7 +56,7 @@ class ReplayBuffer:
         self.states.share_memory_()
         self.policies.share_memory_()
         self.values.share_memory_()
-        logging.info(f"init replay buffer(~{total_gb:.2f} GB)")
+        logging.info(f"init ring buffer(~{total_gb:.2f} GB)")
 
     def add(self, data):
         states, policies, values = zip(*data)
@@ -95,13 +95,13 @@ class ReplayBuffer:
 class CPUWorker:
     request_queue = None
     result_pipes = None
-    replay_buffer = None
+    ring_buffer = None
 
     @classmethod
-    def init(cls, request_queue, result_pipes, replay_buffer):
+    def init(cls, request_queue, result_pipes, ring_buffer):
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
-        cls.replay_buffer = replay_buffer
+        cls.ring_buffer = ring_buffer
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
@@ -198,7 +198,7 @@ class CPUWorker:
             if disable_resignation:
                 non_resigned_data.append({"root_value": r_val, "final_reward": z})
 
-        self.replay_buffer.add(data)
+        self.ring_buffer.add(data)
 
         sgf_result = ""
         if resigned:
@@ -228,7 +228,7 @@ class CPUWorker:
 
         log_message = (
             f"Game finished ({len(data)} moves). Result: {sgf_result}. "
-            f"Buffer size: {len(self.replay_buffer)}"
+            f"Buffer size: {len(self.ring_buffer)}"
         )
         logging.info(log_message)
 
@@ -612,12 +612,12 @@ def main(args):
     accelerator_worker.daemon = True
     accelerator_worker.start()
 
-    replay_buffer = ReplayBuffer(
+    ring_buffer = RingBuffer(
         data=config.data,
         board=config.board,
         in_channels=config.history * 2 + 1,
     )
-    pool_init_args = (gpu_request_queue, worker_conns, replay_buffer)
+    pool_init_args = (gpu_request_queue, worker_conns, ring_buffer)
     cpu_worker_pool = Pool(
         processes=num_cpu_workers, initializer=CPUWorker.init, initargs=pool_init_args
     )
@@ -642,9 +642,9 @@ def main(args):
         )
 
     min_initial_data = config.BATCH_SIZE * 20
-    if len(replay_buffer) < min_initial_data:
+    if len(ring_buffer) < min_initial_data:
         logging.info(
-            f"--- Starting initial replay buffer fill (current: {len(replay_buffer)}) ---"
+            f"--- Starting initial ring buffer fill (current: {len(ring_buffer)}) ---"
         )
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
@@ -652,7 +652,7 @@ def main(args):
                 active_sp_tasks[worker_id] = dispatch_sp_task(
                     worker_id, 0, resignation_threshold, disable_resign
                 )
-        while len(replay_buffer) < min_initial_data:
+        while len(ring_buffer) < min_initial_data:
             done_workers = [
                 worker_id
                 for worker_id, result in active_sp_tasks.items()
@@ -664,7 +664,7 @@ def main(args):
                 active_sp_tasks[worker_id] = dispatch_sp_task(
                     worker_id, 0, resignation_threshold, disable_resign
                 )
-            logging.info(f"Buffer size: {len(replay_buffer)}/{min_initial_data}")
+            logging.info(f"Buffer size: {len(ring_buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
 
@@ -729,13 +729,13 @@ def main(args):
                     worker_id, generation, resignation_threshold, disable_resign
                 )
 
-        if len(replay_buffer) < config.BATCH_SIZE:
+        if len(ring_buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
             time.sleep(10)
             continue
         total_loss, batches_done = 0.0, 0
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
-            batch = replay_buffer.sample(config.BATCH_SIZE)
+            batch = ring_buffer.sample(config.BATCH_SIZE)
             if batch is None:
                 logging.warning(
                     "\nBuffer size fell below batch size. Pausing training."
@@ -748,13 +748,13 @@ def main(args):
                 batches_done += 1
             if (i + 1) % 50 == 0:
                 logging.info(
-                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(replay_buffer)}"
+                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(ring_buffer)}"
                 )
 
         gpu_request_queue.put(("STEP_SCHEDULER", None))
         avg_loss = total_loss / batches_done if batches_done > 0 else 0
         log_data.update(
-            {"training_loss": avg_loss, "replay_buffer_size": len(replay_buffer)}
+            {"training_loss": avg_loss, "ring_buffer_size": len(ring_buffer)}
         )
         logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
         for res in active_sp_tasks.values():
