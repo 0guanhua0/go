@@ -11,6 +11,7 @@ from sgfmill import sgf
 from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
 
 import config
+import dihedral
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
 from mcts import MCTS, MCTSNode, State
@@ -403,14 +404,34 @@ class GPUWorker(Process):
             worker_ids, state_batches = zip(*model_requests)
 
             tensor_batches = []
+            dihedral_batch = []
+            transform = []
             for state_batch in state_batches:
                 if isinstance(state_batch, torch.Tensor):
                     tensor_batch = state_batch.to(dtype=torch.float32)
                 else:
                     tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
+
                 tensor_batches.append(tensor_batch.contiguous())
 
-            batch = torch.cat(tensor_batches, dim=0).to(self.device, non_blocking=True)
+                idx = torch.randint(
+                    low=0,
+                    high=len(dihedral.apply),
+                    size=(tensor_batch.shape[0],),
+                )
+
+                transform_id_tensor = [
+                    dihedral.apply[int(idx.item())](sample)
+                    for sample, idx in zip(tensor_batch, idx)
+                ]
+                transform_id_batch = torch.stack(
+                    transform_id_tensor, dim=0
+                ).contiguous()
+
+                dihedral_batch.append(transform_id_batch)
+                transform.append(idx.tolist())
+
+            batch = torch.cat(dihedral_batch, dim=0).to(self.device, non_blocking=True)
 
             model = self.models[model_name]
 
@@ -427,6 +448,15 @@ class GPUWorker(Process):
                 value_result = (
                     value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
                 )
+
+                for sample, transform_id in enumerate(transform[i]):
+                    policy_plane = policy_result[sample, :-1].view(
+                        config.board, config.board
+                    )
+                    reverse_id = dihedral.reverse[int(transform_id)]
+                    restored_policy = dihedral.apply[reverse_id](policy_plane)
+                    policy_result[sample, :-1] = restored_policy.reshape(-1)
+
                 self.result_pipes[worker_id].send(
                     (policy_result.clone(), value_result.clone())
                 )
