@@ -16,6 +16,7 @@ import wandb
 from elo import Rating, calculate_expected_score, update_ratings
 from mcts import MCTS, MCTSNode, State
 from network import AlphaGoZeroNet
+from ring import Ring
 
 
 def action_to_coords(action, board):
@@ -33,76 +34,16 @@ def to_sgf_coords(action, board):
     return (y, x)
 
 
-class RingBuffer:
-    def __init__(self, data, board, in_channels):
-        self.lock = torch.multiprocessing.Lock()
-        self.data = data
-        self.size = torch.multiprocessing.Value("i", 0)
-        self.head = torch.multiprocessing.Value("i", 0)
-
-        state_shape = (data, in_channels, board, board)
-        policy_shape = (data, board * board + 1)
-        value_shape = (data, 1)
-
-        state_bytes = data * in_channels * board * board * 4
-        policy_bytes = data * (board * board + 1) * 4
-        value_bytes = data * 1 * 4
-
-        total_gb = (state_bytes + policy_bytes + value_bytes) / 1e9
-
-        self.states = torch.zeros(state_shape)
-        self.policies = torch.zeros(policy_shape)
-        self.values = torch.zeros(value_shape)
-
-        self.states.share_memory_()
-        self.policies.share_memory_()
-        self.values.share_memory_()
-        logging.info(f"init ring buffer(~{total_gb:.2f} GB)")
-
-    def add(self, data):
-        states, policies, values = zip(*data)
-        state_tensors = torch.stack(states)
-        policy_tensors = torch.stack(
-            [
-                policy.to(torch.float32)
-                if isinstance(policy, torch.Tensor)
-                else torch.as_tensor(policy, dtype=torch.float32)
-                for policy in policies
-            ]
-        )
-        value_tensors = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
-
-        with self.lock:
-            idx = torch.arange(self.head.value, self.head.value + len(data)) % self.data
-
-            self.states[idx] = state_tensors
-            self.policies[idx] = policy_tensors
-            self.values[idx] = value_tensors
-
-            self.head.value = (self.head.value + len(data)) % self.data
-            self.size.value = min(self.data, self.size.value + len(data))
-
-    def sample(self, batch_size):
-        with self.lock:
-            if self.size.value < batch_size:
-                return None
-            idx = torch.randint(0, self.size.value, (batch_size,))
-            return self.states[idx], self.policies[idx], self.values[idx]
-
-    def __len__(self):
-        return self.size.value
-
-
 class CPUWorker:
     request_queue = None
     result_pipes = None
-    ring_buffer = None
+    buffer = None
 
     @classmethod
-    def init(cls, request_queue, result_pipes, ring_buffer):
+    def init(cls, request_queue, result_pipes, buffer):
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
-        cls.ring_buffer = ring_buffer
+        cls.buffer = buffer
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
@@ -194,12 +135,12 @@ class CPUWorker:
         data = []
         non_resigned_data = []
         for state_repr_hist, policy, player, r_val in game_history:
-            z = player * winner
+            z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
             data.append((torch.from_numpy(state_repr_hist), policy, z))
             if disable_resignation:
                 non_resigned_data.append({"root_value": r_val, "final_reward": z})
 
-        self.ring_buffer.add(data)
+        self.buffer.add(data)
 
         sgf_result = ""
         if resigned:
@@ -229,7 +170,7 @@ class CPUWorker:
 
         log_message = (
             f"Game finished ({len(data)} moves). Result: {sgf_result}. "
-            f"Buffer size: {len(self.ring_buffer)}"
+            f"Buffer size: {len(self.buffer)}"
         )
         logging.info(log_message)
 
@@ -506,7 +447,7 @@ class NetworkWrapper:
 
         if tensor_batch.ndim != 4:
             raise AssertionError(
-                "Input tensor must have shape (batch_size, in_channels, board, board)."
+                "Input tensor must have shape (batch_size, feature, board, board)."
             )
 
         tensor_batch = tensor_batch.contiguous()
@@ -642,12 +583,12 @@ def main(args):
     accelerator_worker.daemon = True
     accelerator_worker.start()
 
-    ring_buffer = RingBuffer(
+    buffer = Ring(
         data=config.data,
+        feature=config.history * 2 + 1,
         board=config.board,
-        in_channels=config.history * 2 + 1,
     )
-    pool_init_args = (gpu_request_queue, worker_conns, ring_buffer)
+    pool_init_args = (gpu_request_queue, worker_conns, buffer)
     cpu_worker_pool = Pool(
         processes=num_cpu_workers, initializer=CPUWorker.init, initargs=pool_init_args
     )
@@ -672,17 +613,15 @@ def main(args):
         )
 
     min_initial_data = config.BATCH_SIZE * 20
-    if len(ring_buffer) < min_initial_data:
-        logging.info(
-            f"--- Starting initial ring buffer fill (current: {len(ring_buffer)}) ---"
-        )
+    if len(buffer) < min_initial_data:
+        logging.info(f"--- Starting initial buffer fill (current: {len(buffer)}) ---")
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
                 disable_resign = worker_id % 10 == 0
                 active_sp_tasks[worker_id] = dispatch_sp_task(
                     worker_id, 0, resignation_threshold, disable_resign
                 )
-        while len(ring_buffer) < min_initial_data:
+        while len(buffer) < min_initial_data:
             done_workers = [
                 worker_id
                 for worker_id, result in active_sp_tasks.items()
@@ -694,7 +633,7 @@ def main(args):
                 active_sp_tasks[worker_id] = dispatch_sp_task(
                     worker_id, 0, resignation_threshold, disable_resign
                 )
-            logging.info(f"Buffer size: {len(ring_buffer)}/{min_initial_data}")
+            logging.info(f"Buffer size: {len(buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
 
@@ -759,13 +698,13 @@ def main(args):
                     worker_id, generation, resignation_threshold, disable_resign
                 )
 
-        if len(ring_buffer) < config.BATCH_SIZE:
+        if len(buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
             time.sleep(10)
             continue
         total_loss, batches_done = 0.0, 0
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
-            batch = ring_buffer.sample(config.BATCH_SIZE)
+            batch = buffer.sample(config.BATCH_SIZE)
             if batch is None:
                 logging.warning(
                     "\nBuffer size fell below batch size. Pausing training."
@@ -778,14 +717,12 @@ def main(args):
                 batches_done += 1
             if (i + 1) % 50 == 0:
                 logging.info(
-                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(ring_buffer)}"
+                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(buffer)}"
                 )
 
         gpu_request_queue.put(("STEP_SCHEDULER", None))
         avg_loss = total_loss / batches_done if batches_done > 0 else 0
-        log_data.update(
-            {"training_loss": avg_loss, "ring_buffer_size": len(ring_buffer)}
-        )
+        log_data.update({"training_loss": avg_loss, "buffer_size": len(buffer)})
         logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
         for res in active_sp_tasks.values():
             res.wait()
