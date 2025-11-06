@@ -76,7 +76,7 @@ class CPUWorker:
 
         root_node = MCTSNode()
         game_history = []
-        state_repr = state.get_representation()
+        state_repr = state.get_state()
         resigned = False
 
         while True:
@@ -101,7 +101,7 @@ class CPUWorker:
                     root_value < resignation_threshold
                     and best_child_value < resignation_threshold
                 ):
-                    winner = -state.get_current_player()
+                    winner = -state.current_player()
                     resigned = True
                     break
 
@@ -115,20 +115,20 @@ class CPUWorker:
                 (
                     state_repr,
                     policy_target,
-                    state.get_current_player(),
+                    state.current_player(),
                     root_value,
                 )
             )
             action_to_play = torch.multinomial(policy_target, 1).item()
 
-            player_color = "b" if state.get_current_player() == 1 else "w"
+            player_color = "b" if state.current_player() == 1 else "w"
             sgf_coords = to_sgf_coords(action_to_play, config.board)
             sgf_node = sgf_node.new_child()
             sgf_node.set_move(player_color, sgf_coords)
 
             x, y = action_to_coords(action_to_play, config.board)
-            state.apply_move(x, y)
-            state_repr = state.get_representation()
+            state.apply_move(x, y, state.current_player())
+            state_repr = state.get_state()
             child_node = root_node.get_child(action_to_play)
             root_node = child_node if child_node is not None else MCTSNode()
 
@@ -489,7 +489,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
             return 1 if next_won else -1
         mcts, root, current_player_is_black = (
             (black_mcts, black_root, True)
-            if state.get_current_player() == 1
+            if state.current_player() == 1
             else (white_mcts, white_root, False)
         )
 
@@ -500,7 +500,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
             max(move_probs, key=move_probs.get) if move_probs else (config.board**2)
         )
         x, y = action_to_coords(action_to_play, config.board)
-        state.apply_move(x, y)
+        state.apply_move(x, y, state.current_player())
         if current_player_is_black:
             black_child = black_root.get_child(action_to_play)
             black_root = black_child if black_child is not None else MCTSNode()

@@ -12,23 +12,21 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BOARD_SIZE: usize = 19;
-// black 1, white -1
-const NUM_PLAYER: usize = 2;
 const KOMI: f32 = 7.5;
-const NEIGHBOR_OFFSETS: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const HISTORY: usize = 8;
 
 struct ZobristTable {
-    pub key: [[[u64; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE],
+    pub key: [[[u64; 2]; BOARD_SIZE]; BOARD_SIZE],
 }
 
 impl ZobristTable {
     fn new() -> Self {
         let mut rng = rand::rng();
-        let mut key = [[[0; NUM_PLAYER]; BOARD_SIZE]; BOARD_SIZE];
-        for x in 0..BOARD_SIZE {
-            for y in 0..BOARD_SIZE {
-                for p in 0..NUM_PLAYER {
-                    key[x][y][p] = rng.random();
+        let mut key = [[[0; 2]; BOARD_SIZE]; BOARD_SIZE];
+        for r in 0..BOARD_SIZE {
+            for c in 0..BOARD_SIZE {
+                for p in 0..2 {
+                    key[r][c][p] = rng.random();
                 }
             }
         }
@@ -38,9 +36,9 @@ impl ZobristTable {
 
 static ZOBRIST_TABLE: Lazy<ZobristTable> = Lazy::new(ZobristTable::new);
 
-#[inline]
-fn player_to_index(player: i8) -> usize {
-    if player == 1 { 0 } else { 1 }
+// black 1: 1 white -1: 0
+fn zobrist_idx(player: i8) -> usize {
+    if player == 1 { 1 } else { 0 }
 }
 
 #[pyclass]
@@ -49,168 +47,136 @@ pub struct State {
     board_size: usize,
     board: Vec<i8>,
     current_player: i8,
-    history_boards: VecDeque<Vec<i8>>,
-    consecutive_passes: usize,
+    board_history: VecDeque<Vec<i8>>,
+    pass_consecutive: usize,
     move_count: usize,
-    current_hash: u64,
-    history_hashes: HashSet<u64>,
+    hash: u64,
+    hash_history: HashSet<u64>,
 }
 
 impl State {
-    #[inline]
-    fn idx(&self, x: usize, y: usize) -> usize {
-        x * self.board_size + y
+    fn get(&self, r: usize, c: usize) -> i8 {
+        self.board[r * self.board_size + c]
     }
 
-    fn get(&self, x: usize, y: usize) -> i8 {
-        self.board[self.idx(x, y)]
+    fn set(&mut self, r: usize, c: usize, val: i8) {
+        self.board[r * self.board_size + c] = val;
     }
 
-    fn set(&mut self, x: usize, y: usize, val: i8) {
-        let idx = self.idx(x, y);
-        self.board[idx] = val;
+    fn game_over(&self) -> bool {
+        let max_moves = self.board_size * self.board_size * 2;
+        self.pass_consecutive >= 2 || self.move_count >= max_moves
     }
 
-    fn _get_winner(&self) -> i8 {
-        let (black_score, white_score) = self.get_score();
-
-        if black_score > white_score {
-            1
-        } else if white_score > black_score {
-            -1
-        } else {
-            0
-        }
+    fn neighbors(&self, r: usize, c: usize) -> Vec<(usize, usize)> {
+        [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .filter_map(|(dr, dc)| {
+                let nr = r.checked_add_signed(dr)?;
+                let nc = c.checked_add_signed(dc)?;
+                if nr < self.board_size && nc < self.board_size {
+                    Some((nr, nc))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
-    fn _get_group(
-        &self,
-        x: usize,
-        y: usize,
-        board: &[i8],
-    ) -> (HashSet<(usize, usize)>, HashSet<(usize, usize)>) {
-        let mut group_stones = HashSet::new();
-        let mut liberties = HashSet::new();
-        let color = board[self.idx(x, y)];
 
-        if color == 0 {
-            return (group_stones, liberties);
+    fn get_group(&self, r: usize, c: usize) -> (HashSet<(usize, usize)>, HashSet<(usize, usize)>) {
+        let mut group = HashSet::new();
+        let mut liberty = HashSet::new();
+
+        if self.get(r, c) == 0 {
+            return (group, liberty);
         }
 
         let mut q = VecDeque::new();
-        let mut visited = HashSet::new();
+        let mut visit = HashSet::new();
 
-        q.push_back((x, y));
-        visited.insert((x, y));
-        group_stones.insert((x, y));
+        q.push_back((r, c));
+        visit.insert((r, c));
+        group.insert((r, c));
 
-        while let Some((cx, cy)) = q.pop_front() {
-            for &(dx, dy) in &NEIGHBOR_OFFSETS {
-                let nx_isize = cx as isize + dx;
-                let ny_isize = cy as isize + dy;
-
-                if nx_isize < 0
-                    || nx_isize >= self.board_size as isize
-                    || ny_isize < 0
-                    || ny_isize >= self.board_size as isize
-                {
-                    continue;
-                }
-                let nx = nx_isize as usize;
-                let ny = ny_isize as usize;
-
-                let neighbor = board[self.idx(nx, ny)];
+        while let Some((cr, cc)) = q.pop_front() {
+            for (nr, nc) in self.neighbors(cr, cc) {
+                let neighbor = self.get(nr, nc);
                 if neighbor == 0 {
-                    liberties.insert((nx, ny));
-                } else if neighbor == color && !visited.contains(&(nx, ny)) {
-                    visited.insert((nx, ny));
-                    group_stones.insert((nx, ny));
-                    q.push_back((nx, ny));
+                    liberty.insert((nr, nc));
+                } else if neighbor == self.get(r, c) && !visit.contains(&(nr, nc)) {
+                    visit.insert((nr, nc));
+                    group.insert((nr, nc));
+                    q.push_back((nr, nc));
                 }
             }
         }
-        (group_stones, liberties)
+        (group, liberty)
+    }
+
+    fn rm_if_dead(&mut self, r: usize, c: usize) {
+        let color = self.get(r, c);
+        if color == 0 {
+            return;
+        }
+        let (group, liberty) = self.get_group(r, c);
+        if liberty.is_empty() {
+            for (gr, gc) in group {
+                self.hash ^= ZOBRIST_TABLE.key[gr][gc][zobrist_idx(color)];
+                self.set(gr, gc, 0);
+            }
+        }
     }
 
     // https://tromp.github.io/go.html
-    fn check(&self, x: usize, y: usize) -> bool {
-        let player = self.current_player;
-
-        if self.get(x, y) != 0 {
+    fn check(&self, r: usize, c: usize, player: i8) -> bool {
+        if self.get(r, c) != 0 {
             return false;
         }
 
-        let mut potential_next_hash =
-            self.current_hash ^ ZOBRIST_TABLE.key[x][y][player_to_index(player)];
-        let mut captures_made = false;
+        let mut hash_next = self.hash ^ ZOBRIST_TABLE.key[r][c][zobrist_idx(player)];
+        let mut captured = HashSet::new();
 
-        for &(dx, dy) in &NEIGHBOR_OFFSETS {
-            let nx_isize = x as isize + dx;
-            let ny_isize = y as isize + dy;
-            if nx_isize < 0
-                || nx_isize >= self.board_size as isize
-                || ny_isize < 0
-                || ny_isize >= self.board_size as isize
-            {
-                continue;
-            }
-            let nx = nx_isize as usize;
-            let ny = ny_isize as usize;
-
-            if self.get(nx, ny) == -player {
-                let (group, liberties) = self._get_group(nx, ny, &self.board);
-                if liberties.len() == 1 && liberties.contains(&(x, y)) {
-                    captures_made = true;
-                    for (gx, gy) in group {
-                        potential_next_hash ^= ZOBRIST_TABLE.key[gx][gy][player_to_index(-player)];
+        for (nr, nc) in self.neighbors(r, c) {
+            if self.get(nr, nc) == -player {
+                let (group, liberty) = self.get_group(nr, nc);
+                if liberty.len() == 1 && liberty.contains(&(r, c)) {
+                    for &stone in &group {
+                        captured.insert(stone);
+                    }
+                    for (gr, gc) in group {
+                        hash_next ^= ZOBRIST_TABLE.key[gr][gc][zobrist_idx(-player)];
                     }
                 }
             }
         }
 
-        let mut final_liberties = HashSet::new();
-        let mut visited_stones_for_lib_check = HashSet::new();
-        visited_stones_for_lib_check.insert((x, y));
-        let mut has_immediate_liberty = false;
+        let mut group_visit = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut has_liberty = false;
 
-        for &(dx, dy) in &NEIGHBOR_OFFSETS {
-            let nx_isize = x as isize + dx;
-            let ny_isize = y as isize + dy;
-            if nx_isize < 0
-                || nx_isize >= self.board_size as isize
-                || ny_isize < 0
-                || ny_isize >= self.board_size as isize
-            {
-                continue;
-            }
-            let nx = nx_isize as usize;
-            let ny = ny_isize as usize;
+        group_visit.insert((r, c));
+        queue.push_back((r, c));
 
-            match self.get(nx, ny) {
-                0 => has_immediate_liberty = true,
-                p if p == player => {
-                    if !visited_stones_for_lib_check.contains(&(nx, ny)) {
-                        let (group, liberties) = self._get_group(nx, ny, &self.board);
-                        for liberty in liberties {
-                            final_liberties.insert(liberty);
-                        }
-                        for stone in group {
-                            visited_stones_for_lib_check.insert(stone);
-                        }
-                    }
+        while let Some((cr, cc)) = queue.pop_front() {
+            for (nr, nc) in self.neighbors(cr, cc) {
+                if captured.contains(&(nr, nc)) || self.get(nr, nc) == 0 {
+                    has_liberty = true;
+                } else if self.get(nr, nc) == player && group_visit.insert((nr, nc)) {
+                    queue.push_back((nr, nc));
                 }
-                _ => {}
+            }
+            if has_liberty {
+                break;
             }
         }
 
-        final_liberties.remove(&(x, y));
-
-        let move_has_liberty =
-            has_immediate_liberty || !final_liberties.is_empty() || captures_made;
-        if !move_has_liberty {
-            return false;
+        if !has_liberty {
+            for &(gr, gc) in &group_visit {
+                hash_next ^= ZOBRIST_TABLE.key[gr][gc][zobrist_idx(player)];
+            }
         }
 
-        !self.history_hashes.contains(&potential_next_hash)
+        !self.hash_history.contains(&hash_next)
     }
 }
 
@@ -220,23 +186,23 @@ impl State {
     fn new(board_size: usize) -> Self {
         let board = vec![0i8; board_size * board_size];
 
-        let mut history_boards = VecDeque::with_capacity(9);
-        for _ in 0..8 {
-            history_boards.push_back(board.clone());
+        let mut board_history = VecDeque::with_capacity(HISTORY);
+        for _ in 0..HISTORY {
+            board_history.push_back(board.clone());
         }
 
-        let mut history_hashes = HashSet::new();
-        history_hashes.insert(0);
+        let mut hash_history = HashSet::new();
+        hash_history.insert(0);
 
         State {
             board_size,
             board,
             current_player: 1,
-            history_boards,
-            consecutive_passes: 0,
+            board_history,
+            pass_consecutive: 0,
             move_count: 0,
-            current_hash: 0,
-            history_hashes,
+            hash: 0,
+            hash_history,
         }
     }
 
@@ -244,188 +210,143 @@ impl State {
         self.move_count
     }
 
-    fn get_current_player(&self) -> i8 {
+    fn current_player(&self) -> i8 {
         self.current_player
     }
 
     fn get_score(&self) -> (f32, f32) {
-        let mut territory_mask = self.board.clone();
-        let mut visited_flood = HashSet::new();
+        let mut tmp = self.clone();
+        let mut visit_flood = HashSet::new();
 
-        for y in 0..self.board_size {
-            for x in 0..self.board_size {
-                if territory_mask[self.idx(x, y)] == 0 && !visited_flood.contains(&(y, x)) {
-                    let mut q = VecDeque::new();
-                    let mut visited_region = HashSet::new();
-                    let mut borders = (false, false); // black, white
+        for r in 0..self.board_size {
+            for c in 0..self.board_size {
+                if tmp.get(r, c) != 0 || visit_flood.contains(&(r, c)) {
+                    continue;
+                }
 
-                    q.push_back((y, x));
-                    visited_region.insert((y, x));
-                    visited_flood.insert((y, x));
+                let mut queue = VecDeque::new();
+                let mut region = HashSet::new();
+                let mut borders = (false, false);
 
-                    while let Some((cy, cx)) = q.pop_front() {
-                        for (dy, dx) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                            let ny_isize = cy as isize + dy;
-                            let nx_isize = cx as isize + dx;
+                queue.push_back((r, c));
+                visit_flood.insert((r, c));
 
-                            if ny_isize < 0
-                                || ny_isize >= self.board_size as isize
-                                || nx_isize < 0
-                                || nx_isize >= self.board_size as isize
-                            {
-                                continue;
-                            }
-                            let (ny, nx) = (ny_isize as usize, nx_isize as usize);
-                            let neighbor_val = self.board[self.idx(nx, ny)];
-                            if neighbor_val == 1 {
-                                borders.0 = true;
-                            } else if neighbor_val == -1 {
-                                borders.1 = true;
-                            } else if !visited_region.contains(&(ny, nx)) {
-                                visited_region.insert((ny, nx));
-                                visited_flood.insert((ny, nx));
-                                q.push_back((ny, nx));
+                while let Some((cr, cc)) = queue.pop_front() {
+                    region.insert((cr, cc));
+                    for (nr, nc) in self.neighbors(cr, cc) {
+                        let neighbor_val = self.get(nr, nc);
+                        if neighbor_val == 1 {
+                            borders.0 = true;
+                        } else if neighbor_val == -1 {
+                            borders.1 = true;
+                        } else {
+                            if !visit_flood.contains(&(nr, nc)) {
+                                visit_flood.insert((nr, nc));
+                                queue.push_back((nr, nc));
                             }
                         }
                     }
+                }
 
-                    let owner = match borders {
-                        (true, false) => 1,
-                        (false, true) => -1,
-                        _ => 0,
-                    };
+                let owner = match borders {
+                    (true, false) => 1,
+                    (false, true) => -1,
+                    _ => 0,
+                };
 
-                    if owner != 0 {
-                        for (ry, rx) in visited_region {
-                            territory_mask[self.idx(rx, ry)] = owner;
-                        }
+                if owner != 0 {
+                    for (rr, rc) in region {
+                        tmp.set(rr, rc, owner);
                     }
                 }
             }
         }
 
-        let black_score: f32 = territory_mask.iter().filter(|&&s| s == 1).count() as f32;
-        let white_score: f32 = territory_mask.iter().filter(|&&s| s == -1).count() as f32 + KOMI;
+        let black_score: f32 = tmp.board.iter().filter(|&&s| s == 1).count() as f32;
+        let white_score: f32 = (self.board_size * self.board_size) as f32 - black_score + KOMI;
 
         (black_score, white_score)
     }
+    fn apply_move(&mut self, r: usize, c: usize, player: i8) {
+        if r == self.board_size && c == self.board_size {
+            self.pass_consecutive += 1;
+        } else {
+            self.pass_consecutive = 0;
 
-    fn clone(&self) -> Self {
-        Clone::clone(self)
+            self.hash ^= ZOBRIST_TABLE.key[r][c][zobrist_idx(player)];
+            self.set(r, c, player);
+
+            for (nr, nc) in self.neighbors(r, c) {
+                if self.get(nr, nc) == -player {
+                    self.rm_if_dead(nr, nc);
+                }
+            }
+
+            self.rm_if_dead(r, c);
+        }
+
+        self.board_history.push_front(self.board.clone());
+        if self.board_history.len() > HISTORY {
+            self.board_history.pop_back();
+        }
+        self.hash_history.insert(self.hash);
+        self.move_count += 1;
+        self.current_player = -player;
     }
 
-    fn apply_move(&mut self, x: usize, y: usize) {
-        let is_pass = x == self.board_size && y == self.board_size;
+    fn get_move_option(&self) -> Vec<usize> {
+        let mut option = Vec::with_capacity(self.board_size * self.board_size + 1);
 
-        if is_pass {
-            self.consecutive_passes += 1;
-        } else {
-            self.consecutive_passes = 0;
-
-            self.current_hash ^= ZOBRIST_TABLE.key[x][y][player_to_index(self.current_player)];
-            self.set(x, y, self.current_player);
-
-            for &(dx, dy) in &NEIGHBOR_OFFSETS {
-                let nx_isize = x as isize + dx;
-                let ny_isize = y as isize + dy;
-                if nx_isize < 0
-                    || nx_isize >= self.board_size as isize
-                    || ny_isize < 0
-                    || ny_isize >= self.board_size as isize
-                {
-                    continue;
-                }
-                let nx = nx_isize as usize;
-                let ny = ny_isize as usize;
-
-                if self.get(nx, ny) == -self.current_player {
-                    let (group, liberties) = self._get_group(nx, ny, &self.board);
-                    if liberties.is_empty() {
-                        for (gx, gy) in group {
-                            self.current_hash ^=
-                                ZOBRIST_TABLE.key[gx][gy][player_to_index(-self.current_player)];
-                            self.set(gx, gy, 0);
-                        }
-                    }
+        for r in 0..self.board_size {
+            for c in 0..self.board_size {
+                if self.check(r, c, self.current_player) {
+                    option.push(r * self.board_size + c);
                 }
             }
         }
 
-        self.history_boards.push_front(self.board.clone());
-        if self.history_boards.len() > 8 {
-            self.history_boards.pop_back();
-        }
-        let next_player = -self.current_player;
-        self.history_hashes.insert(self.current_hash);
-        self.current_player = next_player;
+        let pass = self.board_size * self.board_size;
+        option.push(pass);
 
-        self.move_count += 1;
-    }
-
-    fn get_legal_moves(&self) -> Vec<usize> {
-        let mut legal_moves = Vec::with_capacity(self.board_size * self.board_size + 1);
-        legal_moves.push(self.board_size * self.board_size);
-
-        let mut other_moves: Vec<usize> = (0..self.board_size * self.board_size)
-            .into_par_iter()
-            .filter_map(|action| {
-                let x = action / self.board_size;
-                let y = action % self.board_size;
-                if self.get(x, y) == 0 && self.check(x, y) {
-                    Some(action)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        legal_moves.append(&mut other_moves);
-        legal_moves
+        option
     }
 
     fn is_game_over(&self) -> (bool, Option<i8>) {
-        let max_moves = self.board_size * self.board_size * 2;
-        if self.consecutive_passes >= 2 || self.move_count >= max_moves as usize {
-            (true, Some(self._get_winner()))
+        if self.game_over() {
+            let (black_score, white_score) = self.get_score();
+            let winner = if black_score > white_score {
+                1
+            } else if white_score > black_score {
+                -1
+            } else {
+                0
+            };
+            (true, Some(winner))
         } else {
             (false, None)
         }
     }
 
-    fn get_representation<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
-        let num_planes = 17;
+    fn get_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
+        let num_planes = 2 * HISTORY + 1;
         let plane_size = self.board_size * self.board_size;
         let mut state_vec = vec![0.0f32; num_planes * plane_size];
 
-        let player_stone = self.current_player;
-        let opponent_stone = -self.current_player;
-
-        for i in 0..self.board.len() {
-            if self.board[i] == player_stone {
-                state_vec[i] = 1.0;
-            } else if self.board[i] == opponent_stone {
-                state_vec[8 * plane_size + i] = 1.0;
-            }
-        }
-
-        for (hist_idx, past_board) in self.history_boards.iter().take(7).enumerate() {
-            let player_plane_offset = (hist_idx + 1) * plane_size;
-            let opponent_plane_offset = (hist_idx + 9) * plane_size;
+        for (idx, past_board) in self.board_history.iter().take(HISTORY).enumerate() {
+            let p1_idx = idx * 2 * plane_size;
+            let p2_idx = p1_idx + plane_size;
             for i in 0..past_board.len() {
-                if past_board[i] == player_stone {
-                    state_vec[player_plane_offset + i] = 1.0;
-                } else if past_board[i] == opponent_stone {
-                    state_vec[opponent_plane_offset + i] = 1.0;
+                if past_board[i] == self.current_player {
+                    state_vec[p1_idx + i] = 1.0;
+                } else if past_board[i] == -self.current_player {
+                    state_vec[p2_idx + i] = 1.0;
                 }
             }
         }
 
         if self.current_player == 1 {
-            let color_plane_offset = 16 * plane_size;
-            state_vec[color_plane_offset..color_plane_offset + plane_size].fill(1.0);
+            let idx = 2 * HISTORY * plane_size;
+            state_vec[idx..idx + plane_size].fill(1.0);
         }
 
         let dims = IxDyn(&[num_planes, self.board_size, self.board_size]);
@@ -435,11 +356,12 @@ impl State {
 }
 
 #[pyclass]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct MCTSNode {
     children: DashMap<usize, MCTSNode>,
     visit_count: DashMap<usize, usize>,
     total_action_value: DashMap<usize, f32>,
+    mean_action_value: DashMap<usize, f32>,
     prior_prob: DashMap<usize, f32>,
 }
 
@@ -451,6 +373,7 @@ impl MCTSNode {
                 self.prior_prob.insert(action, prob);
                 self.visit_count.insert(action, 0);
                 self.total_action_value.insert(action, 0.0);
+                self.mean_action_value.insert(action, 0.0);
             }
         }
     }
@@ -465,6 +388,7 @@ impl MCTSNode {
             visit_count: DashMap::new(),
             total_action_value: DashMap::new(),
             prior_prob: DashMap::new(),
+            mean_action_value: DashMap::new(),
         }
     }
 
@@ -478,16 +402,8 @@ impl MCTSNode {
 
     fn mean_action_value<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
         let dict = PyDict::new(py);
-        for item in self.total_action_value.iter() {
-            let action = *item.key();
-            let total_val = *item.value();
-            let visits = self.visit_count.get(&action).map_or(0, |v| *v) as f32;
-            let mean_val = if visits > 0.0 {
-                total_val / visits
-            } else {
-                0.0
-            };
-            dict.set_item(action, mean_val).unwrap();
+        for item in self.mean_action_value.iter() {
+            dict.set_item(*item.key(), *item.value()).unwrap();
         }
         dict
     }
@@ -497,51 +413,43 @@ impl MCTSNode {
             .get(&action)
             .map(|child| child.value().clone())
     }
-
-    fn is_leaf(&self) -> bool {
-        self.children.is_empty()
-    }
-
-    fn select_action(&self, c_puct: f32) -> Option<usize> {
-        let mut best_score = f32::NEG_INFINITY;
-        let mut best_action = None;
-
-        let total_visits_from_node: f32 = self
+    fn select(&self, c_puct: f32) -> Option<usize> {
+        let total_visits: f32 = self
             .visit_count
             .iter()
             .map(|entry| *entry.value() as f32)
             .sum();
+        let scale = total_visits.max(1.0).sqrt();
 
-        let sqrt_total_visits = total_visits_from_node.sqrt();
+        let mut best = (f32::NEG_INFINITY, None);
 
-        for entry in self.children.iter() {
-            let action = *entry.key();
-            let n_value = *self.visit_count.get(&action).unwrap() as f32;
+        for child in self.children.iter() {
+            let action = *child.key();
+            let n = self
+                .visit_count
+                .get(&action)
+                .map(|count| *count.value() as f32)
+                .unwrap_or(0.0);
+            let q = self
+                .mean_action_value
+                .get(&action)
+                .map(|value| *value.value())
+                .unwrap_or(0.0);
+            let p = self
+                .prior_prob
+                .get(&action)
+                .map(|value| *value.value())
+                .unwrap_or(0.0);
 
-            let q_value = if n_value > 0.0 {
-                *self.total_action_value.get(&action).unwrap() / n_value
-            } else {
-                0.0
-            };
+            let u = c_puct * p * scale / (1.0 + n);
+            let score = q + u;
 
-            let p_value = *self.prior_prob.get(&action).unwrap();
-            let u_value = c_puct * p_value * sqrt_total_visits / (1.0 + n_value);
-            let score = q_value + u_value;
-
-            if score > best_score {
-                best_score = score;
-                best_action = Some(action);
+            if score > best.0 {
+                best = (score, Some(action));
             }
         }
-        best_action
-    }
 
-    fn update_stats_for_action(&self, action: usize, value: f32) {
-        if let Some(mut count) = self.visit_count.get_mut(&action) {
-            *count += 1;
-            let mut total_val = self.total_action_value.get_mut(&action).unwrap();
-            *total_val += value;
-        }
+        best.1
     }
 }
 
@@ -563,7 +471,6 @@ struct MCTS {
 #[pymethods]
 impl MCTS {
     #[new]
-    #[pyo3(signature = (network, c_puct=1.0, dirichlet_alpha=0.03, epsilon=0.25))]
     fn new(network: PyObject, c_puct: f32, dirichlet_alpha: f32, epsilon: f32) -> Self {
         MCTS {
             network,
@@ -581,8 +488,8 @@ impl MCTS {
         state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
-        if root_node.is_leaf() {
-            let state_repr_numpy = state.get_representation(py)?;
+        if root_node.children.is_empty() {
+            let state_repr_numpy = state.get_state(py)?;
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
 
@@ -599,7 +506,7 @@ impl MCTS {
 
             let (policy_map, _) = self._get_normalized_priors(state, policy_slice)?;
             self.transposition_table.insert(
-                state.current_hash,
+                state.hash,
                 TTval {
                     policy: policy_map.clone(),
                     value: value_vec[0],
@@ -635,16 +542,17 @@ impl MCTS {
                 let mut node = root_node;
                 let mut current_state = state.clone();
 
-                while !node.is_leaf() {
-                    let action = node.select_action(self.c_puct).unwrap();
+                while !node.children.is_empty() {
+                    let action = node.select(self.c_puct).unwrap();
                     path.push((node, action));
                     let board_size = current_state.board_size;
+                    let player = current_state.current_player;
                     if action == board_size * board_size {
-                        current_state.apply_move(board_size, board_size);
+                        current_state.apply_move(board_size, board_size, player);
                     } else {
-                        let x = action / board_size;
-                        let y = action % board_size;
-                        current_state.apply_move(x, y);
+                        let r = action / board_size;
+                        let c = action % board_size;
+                        current_state.apply_move(r, c, player);
                     }
 
                     let child_ref = node.children.get(&action).unwrap();
@@ -660,19 +568,17 @@ impl MCTS {
                         (winner as f32) * (state.current_player as f32)
                     };
                     SimulationResult::Terminal { path, value }
-                } else {
-                    if let Some(entry) = self.transposition_table.get(&current_state.current_hash) {
-                        SimulationResult::TtHit {
-                            path,
-                            node_to_expand: node,
-                            entry: entry.value().clone(),
-                        }
-                    } else {
-                        SimulationResult::NeedsEvaluation(LeafToEvaluate {
-                            path,
-                            state: current_state,
-                        })
+                } else if let Some(entry) = self.transposition_table.get(&current_state.hash) {
+                    SimulationResult::TtHit {
+                        path,
+                        node_to_expand: node,
+                        entry: entry.value().clone(),
                     }
+                } else {
+                    SimulationResult::NeedsEvaluation(LeafToEvaluate {
+                        path,
+                        state: current_state,
+                    })
                 }
             })
             .collect();
@@ -681,7 +587,7 @@ impl MCTS {
         for result in simulation_results {
             match result {
                 SimulationResult::Terminal { path, value } => {
-                    self._backup(&path, value);
+                    self.backup(&path, value);
                 }
                 SimulationResult::TtHit {
                     path,
@@ -689,7 +595,7 @@ impl MCTS {
                     entry,
                 } => {
                     node_to_expand.expand(&entry.policy);
-                    self._backup(&path, entry.value);
+                    self.backup(&path, entry.value);
                 }
                 SimulationResult::NeedsEvaluation(leaf) => {
                     leaves_to_evaluate.push(leaf);
@@ -700,7 +606,7 @@ impl MCTS {
         if !leaves_to_evaluate.is_empty() {
             let mut state_reps = Vec::with_capacity(leaves_to_evaluate.len());
             for leaf in &leaves_to_evaluate {
-                state_reps.push(leaf.state.get_representation(py)?);
+                state_reps.push(leaf.state.get_state(py)?);
             }
             let np = PyModule::import(py, "numpy")?;
             let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
@@ -731,7 +637,7 @@ impl MCTS {
                 let value = value_vec[i];
 
                 self.transposition_table.insert(
-                    item.state.current_hash,
+                    item.state.hash,
                     TTval {
                         policy: policy_map.clone(),
                         value,
@@ -739,7 +645,7 @@ impl MCTS {
                 );
 
                 leaf_node.expand(&policy_map);
-                self._backup(&item.path, value);
+                self.backup(&item.path, value);
             }
         }
         Ok(())
@@ -752,15 +658,15 @@ impl MCTS {
         state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let legal_moves_vec = state.get_legal_moves();
-        let legal_moves: HashSet<usize> = legal_moves_vec.iter().copied().collect();
+        let option_vec = state.get_move_option();
+        let option: HashSet<usize> = option_vec.iter().copied().collect();
 
         let visit_counts: HashMap<usize, usize> = root_node
             .visit_count
             .iter()
             .filter_map(|e| {
                 let action = *e.key();
-                if legal_moves.contains(&action) {
+                if option.contains(&action) {
                     Some((action, *e.value()))
                 } else {
                     None
@@ -770,11 +676,11 @@ impl MCTS {
         let out_dict = PyDict::new(py);
 
         if visit_counts.is_empty() {
-            if legal_moves_vec.is_empty() {
+            if option_vec.is_empty() {
                 return Ok(out_dict);
             }
-            let prob = 1.0 / legal_moves_vec.len() as f32;
-            for action in legal_moves_vec {
+            let prob = 1.0 / option_vec.len() as f32;
+            for action in option_vec {
                 out_dict.set_item(action, prob)?;
             }
             return Ok(out_dict);
@@ -831,12 +737,11 @@ impl MCTS {
             .collect();
         let sum: f32 = samples.iter().sum();
 
-        if sum > 1e-9 {
-            samples.iter_mut().for_each(|s| *s /= sum);
-        } else {
-            let uniform_prob = 1.0 / actions.len() as f32;
-            samples.fill(uniform_prob);
-        };
+        if sum < f32::EPSILON {
+            return;
+        }
+
+        samples.iter_mut().for_each(|s| *s /= sum);
 
         for (i, &action) in actions.iter().enumerate() {
             if let Some(mut p) = node.prior_prob.get_mut(&action) {
@@ -850,11 +755,11 @@ impl MCTS {
         state: &State,
         policy_raw: &[f32],
     ) -> PyResult<(HashMap<usize, f32>, f32)> {
-        let legal_moves = state.get_legal_moves();
+        let option = state.get_move_option();
         let mut action_priors = HashMap::new();
         let mut prob_sum = 0.0;
 
-        for &action in &legal_moves {
+        for &action in &option {
             if let Some(&prob) = policy_raw.get(action) {
                 action_priors.insert(action, prob);
                 prob_sum += prob;
@@ -875,10 +780,18 @@ impl MCTS {
         Ok((action_priors, prob_sum))
     }
 
-    fn _backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
+    fn backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
         let mut current_value = -value;
-        for &(parent_node, action_taken) in path.iter().rev() {
-            parent_node.update_stats_for_action(action_taken, current_value);
+        for &(parent, action) in path.iter().rev() {
+            if let (Some(mut count), Some(mut total_val)) = (
+                parent.visit_count.get_mut(&action),
+                parent.total_action_value.get_mut(&action),
+            ) {
+                *count += 1;
+                *total_val += current_value;
+                let mean_val = *total_val / (*count as f32);
+                parent.mean_action_value.insert(action, mean_val);
+            }
             current_value = -current_value;
         }
     }
@@ -889,33 +802,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legal_moves_on_empty_board_include_pass_and_all_points() {
-        let board_size = 3;
-        let pass_action = board_size * board_size;
-        let state = State::new(board_size);
-        let mut legal_moves = state.get_legal_moves();
-
-        assert_eq!(legal_moves.len(), pass_action + 1);
-        assert!(legal_moves.contains(&pass_action));
-
-        legal_moves.retain(|action| *action != pass_action);
-        legal_moves.sort_unstable();
-
-        let expected: Vec<usize> = (0..pass_action).collect();
-        assert_eq!(legal_moves, expected);
-    }
-
-    #[test]
     fn superko() {
         let size: usize = 19;
         let mut state = State::new(size);
         let game = [(1, 0), (1, 1), (0, 1), (2, 1), (1, 2), (3, 1), (0, 3)];
-        for &(x, y) in &game {
-            state.apply_move(x, y);
+        for &(r, c) in &game {
+            state.apply_move(r, c, state.current_player());
         }
 
-        assert!(!state.check(0, 0));
-        assert!(!state.check(0, 2));
+        assert!(!state.check(0, 0, state.current_player));
+        assert!(!state.check(0, 2, state.current_player));
     }
 }
 
