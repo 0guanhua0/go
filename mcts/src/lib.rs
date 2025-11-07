@@ -484,21 +484,21 @@ impl MCTS {
     fn run_simulations(
         &self,
         py: Python,
-        root_node: &MCTSNode,
+        root: &MCTSNode,
         state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
-        if root_node.children.is_empty() {
-            let state_repr_numpy = state.get_state(py)?;
+        if root.children.is_empty() {
+            let state_repr = state.get_state(py)?;
             let np = PyModule::import(py, "numpy")?;
-            let batch_repr = np.call_method1("expand_dims", (state_repr_numpy, 0))?;
+            let batch_repr = np.call_method1("expand_dims", (state_repr, 0))?;
 
-            let result_obj = self.network.call_method1(py, "predict", (batch_repr,))?;
-            let (policy_array, value_array): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
-                result_obj.extract(py)?;
-            let value_vec = value_array.to_vec()?;
+            let result = self.network.call_method1(py, "predict", (batch_repr,))?;
+            let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
+                result.extract(py)?;
 
-            let policy_view = unsafe { policy_array.as_array() };
+            let value_vec = value.to_vec()?;
+            let policy_view = unsafe { policy.as_array() };
             let policy_slice = policy_view
                 .slice(s![0, ..])
                 .to_slice()
@@ -513,15 +513,15 @@ impl MCTS {
                 },
             );
 
-            root_node.expand(&policy_map);
-            self._add_dirichlet_noise(root_node);
+            root.expand(&policy_map);
+            self._add_dirichlet_noise(root);
         }
 
         struct LeafToEvaluate<'a> {
             path: Vec<(&'a MCTSNode, usize)>,
             state: State,
         }
-        #[allow(non_camel_case_types)]
+
         enum SimulationResult<'a> {
             Terminal {
                 path: Vec<(&'a MCTSNode, usize)>,
@@ -539,7 +539,7 @@ impl MCTS {
             .into_par_iter()
             .map(|_| {
                 let mut path: Vec<(&MCTSNode, usize)> = Vec::new();
-                let mut node = root_node;
+                let mut node = root;
                 let mut current_state = state.clone();
 
                 while !node.children.is_empty() {
@@ -611,21 +611,18 @@ impl MCTS {
             let np = PyModule::import(py, "numpy")?;
             let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
 
-            let result_obj = self
+            let result = self
                 .network
                 .call_method1(py, "predict", (batch_numpy_array,))?;
 
-            let (policies, value_array): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
-                result_obj.extract(py)?;
-            let value_vec = value_array.to_vec()?;
+            let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
+                result.extract(py)?;
+            let value_vec = value.to_vec()?;
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
-                let leaf_node = item
-                    .path
-                    .last()
-                    .map_or(root_node, |(parent, action)| unsafe {
-                        &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
-                    });
+                let leaf_node = item.path.last().map_or(root, |(parent, action)| unsafe {
+                    &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
+                });
 
                 let policies_view = unsafe { policies.as_array() };
                 let policy_slice = policies_view
@@ -654,14 +651,14 @@ impl MCTS {
     fn get_move_probs<'py>(
         &self,
         py: Python<'py>,
-        root_node: &MCTSNode,
+        root: &MCTSNode,
         state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
         let option_vec = state.get_move_option();
         let option: HashSet<usize> = option_vec.iter().copied().collect();
 
-        let visit_counts: HashMap<usize, usize> = root_node
+        let visit_counts: HashMap<usize, usize> = root
             .visit_count
             .iter()
             .filter_map(|e| {

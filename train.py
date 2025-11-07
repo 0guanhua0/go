@@ -378,14 +378,14 @@ class GPUWorker(Process):
 
             with torch.no_grad():
                 policy_logits, value_preds = model(batch)
-                policy_probs_batch = F.softmax(policy_logits, dim=1).cpu()
+                policy_batch = F.softmax(policy_logits, dim=1).cpu()
                 value_preds_batch = value_preds.cpu()
 
             start_index = 0
             for i, worker_id in enumerate(worker_ids):
                 num_samples = tensor_batches[i].shape[0]
                 end_index = start_index + num_samples
-                policy_result = policy_probs_batch[start_index:end_index].contiguous()
+                policy_result = policy_batch[start_index:end_index].contiguous()
                 value_result = (
                     value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
                 )
@@ -440,28 +440,12 @@ class NetworkWrapper:
         assert self.model_id in ["best", "next"]
 
     def predict(self, state_batch):
-        if isinstance(state_batch, torch.Tensor):
-            tensor_batch = state_batch.to(dtype=torch.float32)
-        else:
-            tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
-
-        if tensor_batch.ndim != 4:
-            raise AssertionError(
-                "Input tensor must have shape (batch_size, feature, board, board)."
-            )
-
-        tensor_batch = tensor_batch.contiguous()
+        tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32).contiguous()
         self.request_queue.put(
             ("INFER", (self.worker_id, self.model_id, tensor_batch.cpu()))
         )
-        policy_probs, value = self.result_pipe.recv()
-
-        if not isinstance(policy_probs, torch.Tensor):
-            policy_probs = torch.as_tensor(policy_probs, dtype=torch.float32)
-        if not isinstance(value, torch.Tensor):
-            value = torch.as_tensor(value, dtype=torch.float32)
-
-        return policy_probs.cpu().numpy(), value.cpu().numpy()
+        policy, value = self.result_pipe.recv()
+        return policy.cpu().numpy(), value.cpu().numpy()
 
 
 def evaluate_game_task(worker_id, is_next_black):
