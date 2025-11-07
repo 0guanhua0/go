@@ -294,21 +294,21 @@ impl State {
         self.current_player = -player;
     }
 
-    fn get_move_option(&self) -> Vec<usize> {
-        let mut option = Vec::with_capacity(self.board_size * self.board_size + 1);
+    fn get_action(&self) -> Vec<usize> {
+        let mut action = Vec::with_capacity(self.board_size * self.board_size + 1);
 
         for r in 0..self.board_size {
             for c in 0..self.board_size {
                 if self.check(r, c, self.current_player) {
-                    option.push(r * self.board_size + c);
+                    action.push(r * self.board_size + c);
                 }
             }
         }
 
         let pass = self.board_size * self.board_size;
-        option.push(pass);
+        action.push(pass);
 
-        option
+        action
     }
 
     fn is_game_over(&self) -> (bool, Option<i8>) {
@@ -366,8 +366,8 @@ struct MCTSNode {
 }
 
 impl MCTSNode {
-    fn expand(&self, action_priors: &HashMap<usize, f32>) {
-        for (&action, &prob) in action_priors {
+    fn expand(&self, policy_norm: &HashMap<usize, f32>) {
+        for (&action, &prob) in policy_norm {
             if !self.children.contains_key(&action) {
                 self.children.insert(action, MCTSNode::new());
                 self.prior_prob.insert(action, prob);
@@ -502,18 +502,18 @@ impl MCTS {
             let policy_slice = policy_view
                 .slice(s![0, ..])
                 .to_slice()
-                .ok_or_else(|| PyValueError::new_err("failed to slice policy array"))?;
+                .ok_or_else(|| PyValueError::new_err("slice policy array err"))?;
 
-            let (policy_map, _) = self._get_normalized_priors(state, policy_slice)?;
+            let policy_norm = self.get_policy_norm(state, policy_slice)?;
             self.transposition_table.insert(
                 state.hash,
                 TTval {
-                    policy: policy_map.clone(),
+                    policy: policy_norm.clone(),
                     value: value_vec[0],
                 },
             );
 
-            root.expand(&policy_map);
+            root.expand(&policy_norm);
             self._add_dirichlet_noise(root);
         }
 
@@ -630,18 +630,18 @@ impl MCTS {
                     .to_slice()
                     .expect("policy slice fail");
 
-                let (policy_map, _) = self._get_normalized_priors(&item.state, policy_slice)?;
+                let policy_norm = self.get_policy_norm(&item.state, policy_slice)?;
                 let value = value_vec[i];
 
                 self.transposition_table.insert(
                     item.state.hash,
                     TTval {
-                        policy: policy_map.clone(),
+                        policy: policy_norm.clone(),
                         value,
                     },
                 );
 
-                leaf_node.expand(&policy_map);
+                leaf_node.expand(&policy_norm);
                 self.backup(&item.path, value);
             }
         }
@@ -655,15 +655,15 @@ impl MCTS {
         state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let option_vec = state.get_move_option();
-        let option: HashSet<usize> = option_vec.iter().copied().collect();
+        let action = state.get_action();
+        let action_set: HashSet<usize> = action.iter().copied().collect();
 
         let visit_counts: HashMap<usize, usize> = root
             .visit_count
             .iter()
             .filter_map(|e| {
                 let action = *e.key();
-                if option.contains(&action) {
+                if action_set.contains(&action) {
                     Some((action, *e.value()))
                 } else {
                     None
@@ -673,12 +673,12 @@ impl MCTS {
         let out_dict = PyDict::new(py);
 
         if visit_counts.is_empty() {
-            if option_vec.is_empty() {
+            if action.is_empty() {
                 return Ok(out_dict);
             }
-            let prob = 1.0 / option_vec.len() as f32;
-            for action in option_vec {
-                out_dict.set_item(action, prob)?;
+            let prob = 1.0 / action.len() as f32;
+            for a in action {
+                out_dict.set_item(a, prob)?;
             }
             return Ok(out_dict);
         }
@@ -719,8 +719,8 @@ impl MCTS {
 
 impl MCTS {
     fn _add_dirichlet_noise(&self, node: &MCTSNode) {
-        let actions: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
-        if actions.is_empty() {
+        let action: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
+        if action.is_empty() {
             return;
         }
 
@@ -729,7 +729,7 @@ impl MCTS {
             Err(_) => return,
         };
         let mut rng = rand::rng();
-        let mut samples: Vec<f32> = (0..actions.len())
+        let mut samples: Vec<f32> = (0..action.len())
             .map(|_| gamma_dist.sample(&mut rng))
             .collect();
         let sum: f32 = samples.iter().sum();
@@ -740,41 +740,23 @@ impl MCTS {
 
         samples.iter_mut().for_each(|s| *s /= sum);
 
-        for (i, &action) in actions.iter().enumerate() {
+        for (i, &action) in action.iter().enumerate() {
             if let Some(mut p) = node.prior_prob.get_mut(&action) {
                 *p = (1.0 - self.epsilon) * (*p) + self.epsilon * samples[i];
             }
         }
     }
 
-    fn _get_normalized_priors(
-        &self,
-        state: &State,
-        policy_raw: &[f32],
-    ) -> PyResult<(HashMap<usize, f32>, f32)> {
-        let option = state.get_move_option();
-        let mut action_priors = HashMap::new();
-        let mut prob_sum = 0.0;
+    fn get_policy_norm(&self, state: &State, policy_raw: &[f32]) -> PyResult<HashMap<usize, f32>> {
+        let action = state.get_action();
+        let mut policy_norm = HashMap::new();
+        let prob: f32 = action.iter().map(|&a| policy_raw[a]).sum();
 
-        for &action in &option {
-            if let Some(&prob) = policy_raw.get(action) {
-                action_priors.insert(action, prob);
-                prob_sum += prob;
-            }
+        for &a in &action {
+            policy_norm.insert(a, policy_raw[a] / prob);
         }
 
-        if prob_sum > 1e-6 {
-            for prob in action_priors.values_mut() {
-                *prob /= prob_sum;
-            }
-        } else if !action_priors.is_empty() {
-            let uniform_prob = 1.0 / action_priors.len() as f32;
-            for prob in action_priors.values_mut() {
-                *prob = uniform_prob;
-            }
-        }
-
-        Ok((action_priors, prob_sum))
+        Ok(policy_norm)
     }
 
     fn backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
