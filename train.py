@@ -80,7 +80,7 @@ class CPUWorker:
         resigned = False
 
         while True:
-            game_over, winner = state.is_game_over()
+            game_over, winner = state.check_terminate()
             if game_over:
                 break
 
@@ -97,11 +97,10 @@ class CPUWorker:
             if not disable_resignation:
                 best_action = max(move_probs, key=move_probs.get) if move_probs else -1
                 best_child_value = mean_act_val.get(best_action, -1.0)
-                if (
-                    root_value < resignation_threshold
-                    and best_child_value < resignation_threshold
-                ):
-                    winner = -state.current_player()
+                game_over, winner = state.check_terminate(
+                    root_value, best_child_value, resignation_threshold
+                )
+                if game_over:
                     resigned = True
                     break
 
@@ -463,7 +462,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
     white_mcts = MCTS(white_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = MCTSNode(), MCTSNode()
     while True:
-        game_over, winner = state.is_game_over()
+        game_over, winner = state.check_terminate()
         if game_over:
             if winner == 0:
                 return 0

@@ -63,11 +63,6 @@ impl State {
         self.board[r * self.board_size + c] = val;
     }
 
-    fn game_over(&self) -> bool {
-        let max_moves = self.board_size * self.board_size * 2;
-        self.pass_consecutive >= 2 || self.move_count >= max_moves
-    }
-
     fn neighbors(&self, r: usize, c: usize) -> Vec<(usize, usize)> {
         [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
             .into_iter()
@@ -311,8 +306,15 @@ impl State {
         action
     }
 
-    fn is_game_over(&self) -> (bool, Option<i8>) {
-        if self.game_over() {
+    #[pyo3(signature = (root_value=None, best_child_value=None, resignation_threshold=None))]
+    fn check_terminate(
+        &self,
+        root_value: Option<f32>,
+        best_child_value: Option<f32>,
+        resignation_threshold: Option<f32>,
+    ) -> (bool, Option<i8>) {
+        let max_move = self.board_size * self.board_size * 2;
+        if self.pass_consecutive >= 2 || self.move_count >= max_move {
             let (black_score, white_score) = self.get_score();
             let winner = if black_score > white_score {
                 1
@@ -322,6 +324,14 @@ impl State {
                 0
             };
             (true, Some(winner))
+        } else if let (Some(root), Some(best), Some(threshold)) =
+            (root_value, best_child_value, resignation_threshold)
+        {
+            if root < threshold && best < threshold {
+                (true, Some(-self.current_player))
+            } else {
+                (false, None)
+            }
         } else {
             (false, None)
         }
@@ -417,7 +427,7 @@ impl MCTSNode {
         let total_visits: f32 = self
             .visit_count
             .iter()
-            .map(|entry| *entry.value() as f32)
+            .map(|count| *count.value() as f32)
             .sum();
         let scale = total_visits.max(1.0).sqrt();
 
@@ -540,35 +550,34 @@ impl MCTS {
             .map(|_| {
                 let mut path: Vec<(&MCTSNode, usize)> = Vec::new();
                 let mut node = root;
-                let mut current_state = state.clone();
+                let mut state_curr = state.clone();
 
                 while !node.children.is_empty() {
                     let action = node.select(self.c_puct).unwrap();
                     path.push((node, action));
-                    let board_size = current_state.board_size;
-                    let player = current_state.current_player;
-                    if action == board_size * board_size {
-                        current_state.apply_move(board_size, board_size, player);
+                    let board_size = state_curr.board_size;
+                    let player = state_curr.current_player;
+                    let (row, col) = if action == board_size * board_size {
+                        (board_size, board_size)
                     } else {
-                        let r = action / board_size;
-                        let c = action % board_size;
-                        current_state.apply_move(r, c, player);
-                    }
+                        (action / board_size, action % board_size)
+                    };
+                    state_curr.apply_move(row, col, player);
 
                     let child_ref = node.children.get(&action).unwrap();
                     node = unsafe { &*(child_ref.value() as *const MCTSNode) };
                 }
 
-                let (is_over, winner_opt) = current_state.is_game_over();
+                let (is_over, winner) = state_curr.check_terminate(None, None, None);
                 if is_over {
-                    let winner = winner_opt.unwrap_or(0);
+                    let winner = winner.unwrap_or(0);
                     let value = if winner == 0 {
                         0.0
                     } else {
                         (winner as f32) * (state.current_player as f32)
                     };
                     SimulationResult::Terminal { path, value }
-                } else if let Some(entry) = self.transposition_table.get(&current_state.hash) {
+                } else if let Some(entry) = self.transposition_table.get(&state_curr.hash) {
                     SimulationResult::TtHit {
                         path,
                         node_to_expand: node,
@@ -577,7 +586,7 @@ impl MCTS {
                 } else {
                     SimulationResult::NeedsEvaluation(LeafToEvaluate {
                         path,
-                        state: current_state,
+                        state: state_curr,
                     })
                 }
             })
