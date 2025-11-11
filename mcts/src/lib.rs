@@ -469,6 +469,24 @@ struct TTval {
     value: f32,
 }
 
+struct LeafToEvaluate<'a> {
+    path: Vec<(&'a MCTSNode, usize)>,
+    state: State,
+}
+
+enum SimulationResult<'a> {
+    Terminal {
+        path: Vec<(&'a MCTSNode, usize)>,
+        value: f32,
+    },
+    TTHit {
+        path: Vec<(&'a MCTSNode, usize)>,
+        node_to_expand: &'a MCTSNode,
+        entry: TTval,
+    },
+    NeedsEvaluation(LeafToEvaluate<'a>),
+}
+
 #[pyclass]
 struct MCTS {
     network: PyObject,
@@ -527,24 +545,6 @@ impl MCTS {
             self._add_dirichlet_noise(root);
         }
 
-        struct LeafToEvaluate<'a> {
-            path: Vec<(&'a MCTSNode, usize)>,
-            state: State,
-        }
-
-        enum SimulationResult<'a> {
-            Terminal {
-                path: Vec<(&'a MCTSNode, usize)>,
-                value: f32,
-            },
-            TtHit {
-                path: Vec<(&'a MCTSNode, usize)>,
-                node_to_expand: &'a MCTSNode,
-                entry: TTval,
-            },
-            NeedsEvaluation(LeafToEvaluate<'a>),
-        }
-
         let simulation_results: Vec<SimulationResult> = (0..num_simulations)
             .into_par_iter()
             .map(|_| {
@@ -570,15 +570,10 @@ impl MCTS {
 
                 let (is_over, winner) = state_curr.check_terminate(None, None, None);
                 if is_over {
-                    let winner = winner.unwrap_or(0);
-                    let value = if winner == 0 {
-                        0.0
-                    } else {
-                        (winner as f32) * (state.current_player as f32)
-                    };
+                    let value = (winner.unwrap() * state.current_player) as f32;
                     SimulationResult::Terminal { path, value }
                 } else if let Some(entry) = self.transposition_table.get(&state_curr.hash) {
-                    SimulationResult::TtHit {
+                    SimulationResult::TTHit {
                         path,
                         node_to_expand: node,
                         entry: entry.value().clone(),
@@ -598,7 +593,7 @@ impl MCTS {
                 SimulationResult::Terminal { path, value } => {
                     self.backup(&path, value);
                 }
-                SimulationResult::TtHit {
+                SimulationResult::TTHit {
                     path,
                     node_to_expand,
                     entry,
