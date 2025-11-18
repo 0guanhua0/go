@@ -334,7 +334,7 @@ class GPUWorker(Process):
             self.main_pipe.send({"status": "LOAD_DONE"})
             logging.info("Lightweight checkpoint loading complete.")
         elif command == "STOP":
-            self.stop()
+            self.stop_event.set()
 
     def _process_inference_batch(self, requests_by_model):
         for model_name, model_requests in requests_by_model.items():
@@ -371,7 +371,7 @@ class GPUWorker(Process):
                 dihedral_batch.append(transform_id_batch)
                 transform.append(idx.tolist())
 
-            batch = torch.cat(dihedral_batch, dim=0).to(self.device, non_blocking=True)
+            batch = torch.cat(dihedral_batch, dim=0).to(self.device)
 
             model = self.models[model_name]
 
@@ -402,19 +402,19 @@ class GPUWorker(Process):
                 )
                 start_index = end_index
 
-    def _train_step(self, states, policies, values):
+    def _train_step(self, state, policy, value):
         self.models["next"].train()
 
-        state_tensors = states.to(self.device, non_blocking=True)
-        policy_targets = policies.to(self.device, non_blocking=True)
-        value_targets = values.to(self.device, non_blocking=True)
+        state = state.to(self.device)
+        policy = policy.to(self.device)
+        value = value.to(self.device)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad()
 
-        policy_pred_logits, value_pred = self.models["next"](state_tensors)
+        policy_next, value_next = self.models["next"](state)
 
-        policy_loss = F.cross_entropy(policy_pred_logits, policy_targets)
-        value_loss = F.mse_loss(value_pred, value_targets)
+        policy_loss = F.cross_entropy(policy_next, policy)
+        value_loss = F.mse_loss(value_next, value)
         l2_penalty = torch.tensor(0.0, device=self.device)
         for p in self.models["next"].parameters():
             if p.requires_grad and p.dim() > 1:
@@ -425,9 +425,6 @@ class GPUWorker(Process):
         self.optimizer.step()
         self.models["next"].eval()
         return loss.item()
-
-    def stop(self):
-        self.stop_event.set()
 
 
 class NetworkWrapper:
@@ -698,6 +695,9 @@ def main(args):
             if response["status"] == "TRAIN_DONE":
                 total_loss += response["loss"]
                 batches_done += 1
+                logging.info(
+                    f"Training batch {batches_done}: loss={response['loss']:.4f}"
+                )
             if (i + 1) % 50 == 0:
                 logging.info(
                     f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(buffer)}"

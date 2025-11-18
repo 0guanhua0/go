@@ -376,8 +376,8 @@ struct MCTSNode {
 }
 
 impl MCTSNode {
-    fn expand(&self, policy_norm: &HashMap<usize, f32>) {
-        for (&action, &prob) in policy_norm {
+    fn expand(&self, stat: &HashMap<usize, f32>) {
+        for (&action, &prob) in stat {
             if !self.children.contains_key(&action) {
                 self.children.insert(action, MCTSNode::new());
                 self.prior_prob.insert(action, prob);
@@ -481,7 +481,7 @@ enum SimulationResult<'a> {
     },
     TTHit {
         path: Vec<(&'a MCTSNode, usize)>,
-        node_to_expand: &'a MCTSNode,
+        node: &'a MCTSNode,
         entry: TTval,
     },
     NeedsEvaluation(LeafToEvaluate<'a>),
@@ -532,16 +532,16 @@ impl MCTS {
                 .to_slice()
                 .ok_or_else(|| PyValueError::new_err("slice policy array err"))?;
 
-            let policy_norm = self.get_policy_norm(state, policy_slice)?;
+            let stat = self.get_stat(state, policy_slice)?;
             self.transposition_table.insert(
                 state.hash,
                 TTval {
-                    policy: policy_norm.clone(),
+                    policy: stat.clone(),
                     value: value_vec[0],
                 },
             );
 
-            root.expand(&policy_norm);
+            root.expand(&stat);
             self._add_dirichlet_noise(root);
         }
 
@@ -575,7 +575,7 @@ impl MCTS {
                 } else if let Some(entry) = self.transposition_table.get(&state_curr.hash) {
                     SimulationResult::TTHit {
                         path,
-                        node_to_expand: node,
+                        node,
                         entry: entry.value().clone(),
                     }
                 } else {
@@ -593,12 +593,8 @@ impl MCTS {
                 SimulationResult::Terminal { path, value } => {
                     self.backup(&path, value);
                 }
-                SimulationResult::TTHit {
-                    path,
-                    node_to_expand,
-                    entry,
-                } => {
-                    node_to_expand.expand(&entry.policy);
+                SimulationResult::TTHit { path, node, entry } => {
+                    node.expand(&entry.policy);
                     self.backup(&path, entry.value);
                 }
                 SimulationResult::NeedsEvaluation(leaf) => {
@@ -634,18 +630,18 @@ impl MCTS {
                     .to_slice()
                     .expect("policy slice fail");
 
-                let policy_norm = self.get_policy_norm(&item.state, policy_slice)?;
+                let stat = self.get_stat(&item.state, policy_slice)?;
                 let value = value_vec[i];
 
                 self.transposition_table.insert(
                     item.state.hash,
                     TTval {
-                        policy: policy_norm.clone(),
+                        policy: stat.clone(),
                         value,
                     },
                 );
 
-                leaf_node.expand(&policy_norm);
+                leaf_node.expand(&stat);
                 self.backup(&item.path, value);
             }
         }
@@ -751,16 +747,20 @@ impl MCTS {
         }
     }
 
-    fn get_policy_norm(&self, state: &State, policy_raw: &[f32]) -> PyResult<HashMap<usize, f32>> {
+    fn get_stat(&self, state: &State, policy_raw: &[f32]) -> PyResult<HashMap<usize, f32>> {
         let action = state.get_action();
-        let mut policy_norm = HashMap::new();
+        let mut stat = HashMap::new();
         let prob: f32 = action.iter().map(|&a| policy_raw[a]).sum();
 
-        for &a in &action {
-            policy_norm.insert(a, policy_raw[a] / prob);
+        if prob < f32::EPSILON {
+            panic!("invalid policy sum for action{:?}", action);
         }
 
-        Ok(policy_norm)
+        for &a in &action {
+            stat.insert(a, policy_raw[a] / prob);
+        }
+
+        Ok(stat)
     }
 
     fn backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
