@@ -49,7 +49,7 @@ pub struct State {
     current_player: i8,
     board_history: VecDeque<Vec<i8>>,
     pass_consecutive: usize,
-    move_count: usize,
+    move_cnt: usize,
     hash: u64,
     hash_history: HashSet<u64>,
 }
@@ -195,14 +195,14 @@ impl State {
             current_player: 1,
             board_history,
             pass_consecutive: 0,
-            move_count: 0,
+            move_cnt: 0,
             hash: 0,
             hash_history,
         }
     }
 
-    fn move_count(&self) -> usize {
-        self.move_count
+    fn move_cnt(&self) -> usize {
+        self.move_cnt
     }
 
     fn current_player(&self) -> i8 {
@@ -285,25 +285,25 @@ impl State {
             self.board_history.pop_back();
         }
         self.hash_history.insert(self.hash);
-        self.move_count += 1;
+        self.move_cnt += 1;
         self.current_player = -player;
     }
 
-    fn get_action(&self) -> Vec<usize> {
-        let mut action = Vec::with_capacity(self.board_size * self.board_size + 1);
+    fn get_act(&self) -> Vec<usize> {
+        let mut act = Vec::with_capacity(self.board_size * self.board_size + 1);
 
         for r in 0..self.board_size {
             for c in 0..self.board_size {
                 if self.check(r, c, self.current_player) {
-                    action.push(r * self.board_size + c);
+                    act.push(r * self.board_size + c);
                 }
             }
         }
 
         let pass = self.board_size * self.board_size;
-        action.push(pass);
+        act.push(pass);
 
-        action
+        act
     }
 
     #[pyo3(signature = (root_value=None, best_child_value=None, resignation_threshold=None))]
@@ -314,7 +314,7 @@ impl State {
         resignation_threshold: Option<f32>,
     ) -> (bool, Option<i8>) {
         let max_move = self.board_size * self.board_size * 2;
-        if self.pass_consecutive >= 2 || self.move_count >= max_move {
+        if self.pass_consecutive >= 2 || self.move_cnt >= max_move {
             let (black_score, white_score) = self.get_score();
             let winner = if black_score > white_score {
                 1
@@ -369,21 +369,21 @@ impl State {
 #[derive(Clone)]
 struct MCTSNode {
     children: DashMap<usize, MCTSNode>,
-    visit_count: DashMap<usize, usize>,
-    total_action_value: DashMap<usize, f32>,
-    mean_action_value: DashMap<usize, f32>,
+    visit_cnt: DashMap<usize, usize>,
+    total_act_val: DashMap<usize, f32>,
+    mean_act_val: DashMap<usize, f32>,
     prior_prob: DashMap<usize, f32>,
 }
 
 impl MCTSNode {
     fn expand(&self, stat: &HashMap<usize, f32>) {
-        for (&action, &prob) in stat {
-            if !self.children.contains_key(&action) {
-                self.children.insert(action, MCTSNode::new());
-                self.prior_prob.insert(action, prob);
-                self.visit_count.insert(action, 0);
-                self.total_action_value.insert(action, 0.0);
-                self.mean_action_value.insert(action, 0.0);
+        for (&act, &prob) in stat {
+            if !self.children.contains_key(&act) {
+                self.children.insert(act, MCTSNode::new());
+                self.prior_prob.insert(act, prob);
+                self.visit_cnt.insert(act, 0);
+                self.total_act_val.insert(act, 0.0);
+                self.mean_act_val.insert(act, 0.0);
             }
         }
     }
@@ -395,37 +395,35 @@ impl MCTSNode {
     fn new() -> Self {
         MCTSNode {
             children: DashMap::new(),
-            visit_count: DashMap::new(),
-            total_action_value: DashMap::new(),
+            visit_cnt: DashMap::new(),
+            total_act_val: DashMap::new(),
             prior_prob: DashMap::new(),
-            mean_action_value: DashMap::new(),
+            mean_act_val: DashMap::new(),
         }
     }
 
-    fn visit_count<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+    fn visit_cnt<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
         let dict = PyDict::new(py);
-        for item in self.visit_count.iter() {
+        for item in self.visit_cnt.iter() {
             dict.set_item(*item.key(), *item.value()).unwrap();
         }
         dict
     }
 
-    fn mean_action_value<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+    fn mean_act_val<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
         let dict = PyDict::new(py);
-        for item in self.mean_action_value.iter() {
+        for item in self.mean_act_val.iter() {
             dict.set_item(*item.key(), *item.value()).unwrap();
         }
         dict
     }
 
-    fn get_child(&self, action: usize) -> Option<MCTSNode> {
-        self.children
-            .get(&action)
-            .map(|child| child.value().clone())
+    fn get_child(&self, act: usize) -> Option<MCTSNode> {
+        self.children.get(&act).map(|child| child.value().clone())
     }
     fn select(&self, c_puct: f32) -> Option<usize> {
         let total_visits: f32 = self
-            .visit_count
+            .visit_cnt
             .iter()
             .map(|count| *count.value() as f32)
             .sum();
@@ -434,20 +432,20 @@ impl MCTSNode {
         let mut best = (f32::NEG_INFINITY, None);
 
         for child in self.children.iter() {
-            let action = *child.key();
+            let act = *child.key();
             let n = self
-                .visit_count
-                .get(&action)
+                .visit_cnt
+                .get(&act)
                 .map(|count| *count.value() as f32)
                 .unwrap_or(0.0);
             let q = self
-                .mean_action_value
-                .get(&action)
+                .mean_act_val
+                .get(&act)
                 .map(|value| *value.value())
                 .unwrap_or(0.0);
             let p = self
                 .prior_prob
-                .get(&action)
+                .get(&act)
                 .map(|value| *value.value())
                 .unwrap_or(0.0);
 
@@ -455,7 +453,7 @@ impl MCTSNode {
             let score = q + u;
 
             if score > best.0 {
-                best = (score, Some(action));
+                best = (score, Some(act));
             }
         }
 
@@ -553,18 +551,18 @@ impl MCTS {
                 let mut state_curr = state.clone();
 
                 while !node.children.is_empty() {
-                    let action = node.select(self.c_puct).unwrap();
-                    path.push((node, action));
+                    let act = node.select(self.c_puct).unwrap();
+                    path.push((node, act));
                     let board_size = state_curr.board_size;
                     let player = state_curr.current_player;
-                    let (row, col) = if action == board_size * board_size {
+                    let (row, col) = if act == board_size * board_size {
                         (board_size, board_size)
                     } else {
-                        (action / board_size, action % board_size)
+                        (act / board_size, act % board_size)
                     };
                     state_curr.apply_move(row, col, player);
 
-                    let child_ref = node.children.get(&action).unwrap();
+                    let child_ref = node.children.get(&act).unwrap();
                     node = unsafe { &*(child_ref.value() as *const MCTSNode) };
                 }
 
@@ -620,8 +618,8 @@ impl MCTS {
             let value_vec = value.to_vec()?;
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
-                let leaf_node = item.path.last().map_or(root, |(parent, action)| unsafe {
-                    &*(parent.children.get(action).unwrap().value() as *const MCTSNode)
+                let leaf_node = item.path.last().map_or(root, |(parent, act)| unsafe {
+                    &*(parent.children.get(act).unwrap().value() as *const MCTSNode)
                 });
 
                 let policies_view = unsafe { policies.as_array() };
@@ -648,79 +646,44 @@ impl MCTS {
         Ok(())
     }
 
-    fn get_move_probs<'py>(
+    fn get_act_prob<'py>(
         &self,
         py: Python<'py>,
         root: &MCTSNode,
         state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let action = state.get_action();
-        let action_set: HashSet<usize> = action.iter().copied().collect();
-
-        let visit_counts: HashMap<usize, usize> = root
-            .visit_count
-            .iter()
-            .filter_map(|e| {
-                let action = *e.key();
-                if action_set.contains(&action) {
-                    Some((action, *e.value()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let out_dict = PyDict::new(py);
-
-        if visit_counts.is_empty() {
-            if action.is_empty() {
-                return Ok(out_dict);
-            }
-            let prob = 1.0 / action.len() as f32;
-            for a in action {
-                out_dict.set_item(a, prob)?;
-            }
-            return Ok(out_dict);
-        }
+        let act_prob = PyDict::new(py);
 
         if temp == 0.0 {
-            if let Some(best_action) = visit_counts
+            let max_act = root
+                .visit_cnt
                 .iter()
-                .max_by_key(|&(_, count)| count)
-                .map(|(k, _)| k)
-            {
-                for action in visit_counts.keys() {
-                    out_dict.set_item(action, if action == best_action { 1.0 } else { 0.0 })?;
-                }
-            }
-            return Ok(out_dict);
+                .max_by_key(|e| *e.value())
+                .expect("empty visit_cnt");
+            act_prob.set_item(*max_act.key(), 1.0)?;
+            return Ok(act_prob);
         }
 
-        let inv_temp = 1.0 / temp;
-        let powered_counts: HashMap<_, _> = visit_counts
+        let cnt_powf: HashMap<_, _> = root
+            .visit_cnt
             .iter()
-            .map(|(&a, &c)| (a, (c as f32).powf(inv_temp)))
+            .map(|e| (*e.key(), (*e.value() as f32).powf(1.0 / temp)))
             .collect();
-        let total_powered_count: f32 = powered_counts.values().sum();
+        let total: f32 = cnt_powf.values().sum();
 
-        if total_powered_count < 1e-6 {
-            let prob = 1.0 / visit_counts.len() as f32;
-            for action in visit_counts.keys() {
-                out_dict.set_item(action, prob)?;
-            }
-        } else {
-            for (action, powered_count) in powered_counts {
-                out_dict.set_item(action, powered_count / total_powered_count)?;
-            }
+        for (act, cnt) in cnt_powf {
+            act_prob.set_item(act, cnt / total)?;
         }
-        Ok(out_dict)
+
+        Ok(act_prob)
     }
 }
 
 impl MCTS {
     fn _add_dirichlet_noise(&self, node: &MCTSNode) {
-        let action: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
-        if action.is_empty() {
+        let acts: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
+        if acts.is_empty() {
             return;
         }
 
@@ -729,7 +692,7 @@ impl MCTS {
             Err(_) => return,
         };
         let mut rng = rand::rng();
-        let mut samples: Vec<f32> = (0..action.len())
+        let mut samples: Vec<f32> = (0..acts.len())
             .map(|_| gamma_dist.sample(&mut rng))
             .collect();
         let sum: f32 = samples.iter().sum();
@@ -740,23 +703,23 @@ impl MCTS {
 
         samples.iter_mut().for_each(|s| *s /= sum);
 
-        for (i, &action) in action.iter().enumerate() {
-            if let Some(mut p) = node.prior_prob.get_mut(&action) {
+        for (i, &act) in acts.iter().enumerate() {
+            if let Some(mut p) = node.prior_prob.get_mut(&act) {
                 *p = (1.0 - self.epsilon) * (*p) + self.epsilon * samples[i];
             }
         }
     }
 
     fn get_stat(&self, state: &State, policy_raw: &[f32]) -> PyResult<HashMap<usize, f32>> {
-        let action = state.get_action();
+        let acts = state.get_act();
         let mut stat = HashMap::new();
-        let prob: f32 = action.iter().map(|&a| policy_raw[a]).sum();
+        let prob: f32 = acts.iter().map(|&a| policy_raw[a]).sum();
 
         if prob < f32::EPSILON {
-            panic!("invalid policy sum for action{:?}", action);
+            panic!("invalid policy sum for acts {:?}", acts);
         }
 
-        for &a in &action {
+        for &a in &acts {
             stat.insert(a, policy_raw[a] / prob);
         }
 
@@ -765,15 +728,15 @@ impl MCTS {
 
     fn backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
         let mut current_value = -value;
-        for &(parent, action) in path.iter().rev() {
+        for &(parent, act) in path.iter().rev() {
             if let (Some(mut count), Some(mut total_val)) = (
-                parent.visit_count.get_mut(&action),
-                parent.total_action_value.get_mut(&action),
+                parent.visit_cnt.get_mut(&act),
+                parent.total_act_val.get_mut(&act),
             ) {
                 *count += 1;
                 *total_val += current_value;
                 let mean_val = *total_val / (*count as f32);
-                parent.mean_action_value.insert(action, mean_val);
+                parent.mean_act_val.insert(act, mean_val);
             }
             current_value = -current_value;
         }

@@ -74,7 +74,7 @@ class CPUWorker:
         sgf_game.get_root().set("PB", "AlphaGoZero-Best")
         sgf_node = sgf_game.get_root()
 
-        root_node = MCTSNode()
+        root = MCTSNode()
         game_history = []
         state_repr = state.get_state()
         resigned = False
@@ -84,21 +84,19 @@ class CPUWorker:
             if game_over:
                 break
 
-            mcts.run_simulations(root_node, state, config.NUM_SIMULATIONS)
+            mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
 
-            temp = 1.0 if state.move_count() < 30 else 0.0
-            move_probs = mcts.get_move_probs(root_node, state, temp)
-            mean_act_val = root_node.mean_action_value()
-            root_value = sum(
-                prob * mean_act_val.get(action, 0.0)
-                for action, prob in move_probs.items()
+            temp = 1.0 if state.move_cnt() < 30 else 0.0
+            act_prob = mcts.get_act_prob(root, state, temp)
+            root_val = sum(
+                prob * root.mean_act_val().get(act) for act, prob in act_prob.items()
             )
 
             if not disable_resignation:
-                best_action = max(move_probs, key=move_probs.get) if move_probs else -1
-                best_child_value = mean_act_val.get(best_action, -1.0)
+                best_act = max(act_prob, key=act_prob.get)
+                best_child_value = root.mean_act_val().get(best_act, -1.0)
                 game_over, winner = state.check_terminate(
-                    root_value, best_child_value, resignation_threshold
+                    root_val, best_child_value, resignation_threshold
                 )
                 if game_over:
                     resigned = True
@@ -107,29 +105,29 @@ class CPUWorker:
             policy_target = torch.zeros(
                 config.board * config.board + 1, dtype=torch.float32
             )
-            for action, prob in move_probs.items():
-                policy_target[action] = prob
+            for act, prob in act_prob.items():
+                policy_target[act] = prob
 
             game_history.append(
                 (
                     state_repr,
                     policy_target,
                     state.current_player(),
-                    root_value,
+                    root_val,
                 )
             )
-            action_to_play = torch.multinomial(policy_target, 1).item()
+            act_to_play = torch.multinomial(policy_target, 1).item()
 
             player_color = "b" if state.current_player() == 1 else "w"
-            sgf_coords = to_sgf_coords(action_to_play, config.board)
+            sgf_coords = to_sgf_coords(act_to_play, config.board)
             sgf_node = sgf_node.new_child()
             sgf_node.set_move(player_color, sgf_coords)
 
-            x, y = action_to_coords(action_to_play, config.board)
+            x, y = action_to_coords(act_to_play, config.board)
             state.apply_move(x, y, state.current_player())
             state_repr = state.get_state()
-            child_node = root_node.get_child(action_to_play)
-            root_node = child_node if child_node is not None else MCTSNode()
+            child_node = root.get_child(act_to_play)
+            root = child_node if child_node is not None else MCTSNode()
 
         data = []
         non_resigned_data = []
@@ -137,7 +135,7 @@ class CPUWorker:
             z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
             data.append((torch.from_numpy(state_repr_hist), policy, z))
             if disable_resignation:
-                non_resigned_data.append({"root_value": r_val, "final_reward": z})
+                non_resigned_data.append({"root_val": r_val, "final_reward": z})
 
         self.buffer.add(data)
 
@@ -475,18 +473,16 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
 
         mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
 
-        move_probs = mcts.get_move_probs(root, state, temp=0)
-        action_to_play = (
-            max(move_probs, key=move_probs.get) if move_probs else (config.board**2)
-        )
-        x, y = action_to_coords(action_to_play, config.board)
+        act_prob = mcts.get_act_prob(root, state, temp=0)
+        act_to_play = max(act_prob, key=act_prob.get) if act_prob else (config.board**2)
+        x, y = action_to_coords(act_to_play, config.board)
         state.apply_move(x, y, state.current_player())
         if current_player_is_black:
-            black_child = black_root.get_child(action_to_play)
+            black_child = black_root.get_child(act_to_play)
             black_root = black_child if black_child is not None else MCTSNode()
             white_root = MCTSNode()
         else:
-            white_child = white_root.get_child(action_to_play)
+            white_child = white_root.get_child(act_to_play)
             white_root = white_child if white_child is not None else MCTSNode()
             black_root = MCTSNode()
 
@@ -661,7 +657,7 @@ def main(args):
                 if game_result and game_result["disable_resignation"]:
                     for data_point in game_result["non_resigned_data"]:
                         non_resignation_history.append(
-                            (data_point["root_value"], data_point["final_reward"])
+                            (data_point["root_val"], data_point["final_reward"])
                         )
                 done_workers.append(worker_id)
 
@@ -715,7 +711,7 @@ def main(args):
             if game_result and game_result["disable_resignation"]:
                 for data_point in game_result["non_resigned_data"]:
                     non_resignation_history.append(
-                        (data_point["root_value"], data_point["final_reward"])
+                        (data_point["root_val"], data_point["final_reward"])
                     )
         active_sp_tasks.clear()
 
