@@ -8,7 +8,14 @@ import time
 import torch
 import torch.nn.functional as F
 from sgfmill import sgf
-from torch.multiprocessing import Event, Pipe, Pool, Process, set_start_method
+from torch.multiprocessing import (
+    Event,
+    Pipe,
+    Pool,
+    Process,
+    current_process,
+    set_start_method,
+)
 
 import config
 import dihedral
@@ -49,10 +56,15 @@ class CPUWorker:
             format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
         )
 
-    def __init__(self, worker_id):
-        self.worker_id = worker_id
+    def __init__(self):
+        identity = current_process()._identity
+        raw_worker_id = identity[0] - 1 if identity else 0
+        if self.result_pipes:
+            self.worker_id = raw_worker_id % len(self.result_pipes)
+        else:
+            self.worker_id = raw_worker_id
 
-    def play_game(self, generation_num, resignation_threshold, disable_resignation):
+    def play_game(self, v_resign, allow_resign):
         network_wrapper = NetworkWrapper(
             self.worker_id,
             model_id="best",
@@ -92,19 +104,17 @@ class CPUWorker:
                 prob * root.mean_act_val().get(act) for act, prob in act_prob.items()
             )
 
-            if not disable_resignation:
+            if allow_resign:
                 best_act = max(act_prob, key=act_prob.get)
-                best_child_value = root.mean_act_val().get(best_act, -1.0)
+                best_child_value = root.mean_act_val().get(best_act)
                 game_over, winner = state.check_terminate(
-                    root_val, best_child_value, resignation_threshold
+                    root_val, best_child_value, v_resign
                 )
                 if game_over:
                     resigned = True
                     break
 
-            policy_target = torch.zeros(
-                config.board * config.board + 1, dtype=torch.float32
-            )
+            policy_target = torch.zeros(config.board * config.board + 1)
             for act, prob in act_prob.items():
                 policy_target[act] = prob
 
@@ -127,14 +137,14 @@ class CPUWorker:
             state.apply_move(x, y, state.current_player())
             state_repr = state.get_state()
             child_node = root.get_child(act_to_play)
-            root = child_node if child_node is not None else MCTSNode()
+            root = child_node
 
         data = []
         non_resigned_data = []
         for state_repr_hist, policy, player, r_val in game_history:
             z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
             data.append((torch.from_numpy(state_repr_hist), policy, z))
-            if disable_resignation:
+            if not allow_resign:
                 non_resigned_data.append({"root_val": r_val, "final_reward": z})
 
         self.buffer.add(data)
@@ -143,25 +153,19 @@ class CPUWorker:
         if resigned:
             sgf_result = "B+R" if winner == 1 else "W+R"
         else:
-            try:
-                black_score, white_score = state.get_score()
-                if winner == 1:
-                    margin = black_score - white_score
-                    sgf_result = f"B+{margin:.1f}"
-                elif winner == -1:
-                    margin = white_score - black_score
-                    sgf_result = f"W+{margin:.1f}"
-                else:
-                    sgf_result = "Jigo"
-            except Exception:
-                sgf_result = "Void"
+            black_score, white_score = state.get_score()
+            if winner == 1:
+                margin = black_score - white_score
+                sgf_result = f"B+{margin:.1f}"
+            elif winner == -1:
+                margin = white_score - black_score
+                sgf_result = f"W+{margin:.1f}"
+            else:
+                sgf_result = "Jigo"
 
         sgf_game.get_root().set("RE", sgf_result)
 
-        filename = (
-            time.strftime("%Y%m%d-%H%M%S")
-            + f"-gen-{generation_num}-worker-{self.worker_id}.sgf"
-        )
+        filename = time.strftime("%Y%m%d-%H%M%S") + f"-worker-{self.worker_id}.sgf"
         with open(filename, "wb") as f:
             f.write(sgf_game.serialise())
 
@@ -173,7 +177,7 @@ class CPUWorker:
 
         return {
             "moves": len(data),
-            "disable_resignation": disable_resignation,
+            "allow_resign": allow_resign,
             "non_resigned_data": non_resigned_data,
         }
 
@@ -193,13 +197,9 @@ class CPUWorker:
         winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
         return winner_result
 
-    def play_game_task(
-        worker_id, generation_num, resignation_threshold, disable_resignation
-    ):
-        worker = CPUWorker(worker_id)
-        return worker.play_game(
-            generation_num, resignation_threshold, disable_resignation
-        )
+    def play_game_task(v_resign, allow_resign):
+        worker = CPUWorker()
+        return worker.play_game(v_resign, allow_resign)
 
 
 class GPUWorker(Process):
@@ -442,8 +442,8 @@ class NetworkWrapper:
         return policy.cpu().numpy(), value.cpu().numpy()
 
 
-def evaluate_game_task(worker_id, is_next_black):
-    worker = CPUWorker(worker_id)
+def evaluate_game_task(is_next_black=False):
+    worker = CPUWorker()
     return worker.evaluate_game(is_next_black)
 
 
@@ -577,15 +577,15 @@ def main(args):
     if run.resumed:
         start_generation, best_model_elo = load_checkpoint(run, config)
 
-    resignation_threshold = config.RESIGNATION_THRESHOLD
+    v_resign = config.RESIGNATION_THRESHOLD
     non_resignation_history = collections.deque()
 
     active_sp_tasks = {}
 
-    def dispatch_sp_task(worker_id, gen_num, threshold, disable_resign):
+    def dispatch_sp_task(v_resign, allow_resign):
         return cpu_worker_pool.apply_async(
             CPUWorker.play_game_task,
-            args=(worker_id, gen_num, threshold, disable_resign),
+            args=(v_resign, allow_resign),
         )
 
     min_initial_data = config.BATCH_SIZE * 20
@@ -593,10 +593,8 @@ def main(args):
         logging.info(f"--- Starting initial buffer fill (current: {len(buffer)}) ---")
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
-                disable_resign = worker_id % 10 == 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    worker_id, 0, resignation_threshold, disable_resign
-                )
+                allow_resign = worker_id % 10 != 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
         while len(buffer) < min_initial_data:
             done_workers = [
                 worker_id
@@ -605,10 +603,8 @@ def main(args):
             ]
             for worker_id in done_workers:
                 active_sp_tasks[worker_id].get()
-                disable_resign = worker_id % 10 == 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    worker_id, 0, resignation_threshold, disable_resign
-                )
+                allow_resign = worker_id % 10 != 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
             logging.info(f"Buffer size: {len(buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
@@ -620,7 +616,7 @@ def main(args):
 
         if len(non_resignation_history) > 1000:
             logging.info("Updating resignation threshold...")
-            best_threshold = resignation_threshold
+            best_threshold = v_resign
             min_diff = float("inf")
 
             for v_candidate in torch.arange(-0.99, -0.50, 0.01, dtype=torch.float32):
@@ -638,23 +634,21 @@ def main(args):
                     min_diff = 0.05 - fp_rate
                     best_threshold = v_candidate
 
-            if best_threshold != resignation_threshold:
+            if best_threshold != v_resign:
                 logging.info(
-                    f"New resignation threshold: {best_threshold:.2f} (previously {resignation_threshold:.2f})"
+                    f"New resignation threshold: {best_threshold:.2f} (previously {v_resign:.2f})"
                 )
-                resignation_threshold = best_threshold
+                v_resign = best_threshold
             else:
-                logging.info(
-                    f"Resignation threshold remains {resignation_threshold:.2f}"
-                )
-            log_data.update({"resignation_threshold": resignation_threshold})
+                logging.info(f"Resignation threshold remains {v_resign:.2f}")
+            log_data.update({"resignation_threshold": v_resign})
 
         logging.info("[1/3] Managing self-play pool and training...")
         done_workers = []
         for worker_id, result in list(active_sp_tasks.items()):
             if result.ready():
                 game_result = result.get()
-                if game_result and game_result["disable_resignation"]:
+                if game_result and not game_result["allow_resign"]:
                     for data_point in game_result["non_resigned_data"]:
                         non_resignation_history.append(
                             (data_point["root_val"], data_point["final_reward"])
@@ -662,17 +656,13 @@ def main(args):
                 done_workers.append(worker_id)
 
         for worker_id in done_workers:
-            disable_resign = worker_id % 10 == 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(
-                worker_id, generation, resignation_threshold, disable_resign
-            )
+            allow_resign = worker_id % 10 != 0
+            active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
 
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks or active_sp_tasks[worker_id].ready():
-                disable_resign = worker_id % 10 == 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    worker_id, generation, resignation_threshold, disable_resign
-                )
+                allow_resign = worker_id % 10 != 0
+                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
 
         if len(buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
@@ -691,9 +681,10 @@ def main(args):
             if response["status"] == "TRAIN_DONE":
                 total_loss += response["loss"]
                 batches_done += 1
-                logging.info(
-                    f"Training batch {batches_done}: loss={response['loss']:.4f}"
-                )
+                if batches_done % 100 == 0:
+                    logging.info(
+                        f"Training batch {batches_done}: loss={response['loss']:.4f}"
+                    )
             if (i + 1) % 50 == 0:
                 logging.info(
                     f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(buffer)}"
@@ -708,7 +699,7 @@ def main(args):
         # Collect final results from the generation's games
         for worker_id, result in list(active_sp_tasks.items()):
             game_result = result.get()
-            if game_result and game_result["disable_resignation"]:
+            if game_result and not game_result["allow_resign"]:
                 for data_point in game_result["non_resigned_data"]:
                     non_resignation_history.append(
                         (data_point["root_val"], data_point["final_reward"])
@@ -721,26 +712,15 @@ def main(args):
         logging.info(
             f"Current Best ELO: {best_model_elo:.0f}. Expected Win Rate for Next: {expected_win_rate:.2%}"
         )
-        eval_results = []
-        num_games_to_play = config.NUM_EVAL_GAMES
-        for i in range(0, num_games_to_play, num_cpu_workers):
-            batch_indices = range(i, min(i + num_cpu_workers, num_games_to_play))
-            tasks_in_batch = [
-                cpu_worker_pool.apply_async(
-                    evaluate_game_task, args=(j, game_idx % 2 == 0)
-                )
-                for j, game_idx in enumerate(batch_indices)
-            ]
-            for res in tasks_in_batch:
-                eval_results.append(res.get())
-                if len(eval_results) % 20 == 0:
-                    logging.info(
-                        f"Evaluation games finished: {len(eval_results)}/{num_games_to_play}"
-                    )
+        eval_tasks = [
+            cpu_worker_pool.apply_async(evaluate_game_task, args=(i % 2 == 0,))
+            for i in range(config.EVAL_GAME)
+        ]
+        eval_res = [res.get() for res in eval_tasks]
 
-        next_wins = sum(1 for r in eval_results if r is not None and r > 0)
-        draws = sum(1 for r in eval_results if r is not None and r == 0)
-        games_played = len(eval_results)
+        next_wins = sum(1 for r in eval_res if r is not None and r > 0)
+        draws = sum(1 for r in eval_res if r is not None and r == 0)
+        games_played = len(eval_res)
         actual_score = (
             (next_wins + 0.5 * draws) / games_played if games_played > 0 else 0.0
         )
@@ -785,10 +765,8 @@ def main(args):
             "Evaluation complete. Resuming self-play for the next generation..."
         )
         for worker_id in range(num_cpu_workers):
-            disable_resign = worker_id % 10 == 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(
-                worker_id, generation, resignation_threshold, disable_resign
-            )
+            allow_resign = worker_id % 10 != 0
+            active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
 
     logging.info("\nTraining complete! Shutting down...")
     final_generation = locals().get("generation", config.MAX_GENERATIONS)
