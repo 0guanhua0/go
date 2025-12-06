@@ -21,7 +21,7 @@ import config
 import dihedral
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
-from mcts import MCTS, MCTSNode, State
+from mcts import MCTS, Node, State
 from network import AlphaGoZeroNet
 from ring import Ring
 
@@ -86,8 +86,8 @@ class Worker:
             config.DIRICHLET_ALPHA,
             config.DIRICHLET_EPSILON,
         )
-        black_mcts = MCTS(black, *common_mcts_args)
-        white_mcts = MCTS(white, *common_mcts_args)
+        black_mcts = MCTS(*common_mcts_args)
+        white_mcts = MCTS(*common_mcts_args)
 
         sgf_game = sgf.Sgf_game(size=config.board)
         sgf_game.get_root().set_raw("KM", b"7.5")
@@ -95,7 +95,7 @@ class Worker:
         sgf_game.get_root().set("PB", "AlphaGoZero-Best")
         sgf_node = sgf_game.get_root()
 
-        root = MCTSNode()
+        root = Node()
         game_history = []
         state_repr = state.get_state()
         resigned = False
@@ -106,7 +106,8 @@ class Worker:
                 break
 
             mcts = black_mcts if state.current_player() == 1 else white_mcts
-            mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
+            network = black if state.current_player() == 1 else white
+            mcts.simulate(network, root, state, config.NUM_SIMULATIONS)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, state, temp)
@@ -451,9 +452,9 @@ def evaluate_game_task(is_next_black=False):
 
 def eval_game(black_wrapper, white_wrapper, is_next_black):
     state = State(config.board)
-    black_mcts = MCTS(black_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    white_mcts = MCTS(white_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    black_root, white_root = MCTSNode(), MCTSNode()
+    black_mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+    white_mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+    black_root, white_root = Node(), Node()
     while True:
         game_over, winner = state.check_terminate()
         if game_over:
@@ -469,7 +470,12 @@ def eval_game(black_wrapper, white_wrapper, is_next_black):
             else (white_mcts, white_root, False)
         )
 
-        mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
+        mcts.simulate(
+            black_wrapper if current_player_is_black else white_wrapper,
+            root,
+            state,
+            config.NUM_SIMULATIONS,
+        )
 
         act_prob = mcts.get_act_prob(root, state, temp=0)
         act_to_play = max(act_prob, key=act_prob.get)
@@ -477,12 +483,12 @@ def eval_game(black_wrapper, white_wrapper, is_next_black):
         state.apply_move(x, y, state.current_player())
         if current_player_is_black:
             black_child = black_root.get_child(act_to_play)
-            black_root = black_child if black_child is not None else MCTSNode()
-            white_root = MCTSNode()
+            black_root = black_child if black_child is not None else Node()
+            white_root = Node()
         else:
             white_child = white_root.get_child(act_to_play)
-            white_root = white_child if white_child is not None else MCTSNode()
-            black_root = MCTSNode()
+            white_root = white_child if white_child is not None else Node()
+            black_root = Node()
 
 
 def main(args):

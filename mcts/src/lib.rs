@@ -353,19 +353,19 @@ impl State {
 
 #[pyclass]
 #[derive(Clone)]
-struct MCTSNode {
-    children: DashMap<usize, MCTSNode>,
+struct Node {
+    children: DashMap<usize, Node>,
     visit_cnt: DashMap<usize, usize>,
     total_act_val: DashMap<usize, f32>,
     mean_act_val: DashMap<usize, f32>,
     prior_prob: DashMap<usize, f32>,
 }
 
-impl MCTSNode {
+impl Node {
     fn expand(&self, stat: &HashMap<usize, f32>) {
         for (&act, &prob) in stat {
             if !self.children.contains_key(&act) {
-                self.children.insert(act, MCTSNode::new());
+                self.children.insert(act, Node::new());
                 self.prior_prob.insert(act, prob);
                 self.visit_cnt.insert(act, 0);
                 self.total_act_val.insert(act, 0.0);
@@ -376,10 +376,10 @@ impl MCTSNode {
 }
 
 #[pymethods]
-impl MCTSNode {
+impl Node {
     #[new]
     fn new() -> Self {
-        MCTSNode {
+        Node {
             children: DashMap::new(),
             visit_cnt: DashMap::new(),
             total_act_val: DashMap::new(),
@@ -404,7 +404,7 @@ impl MCTSNode {
         dict
     }
 
-    fn get_child(&self, act: usize) -> Option<MCTSNode> {
+    fn get_child(&self, act: usize) -> Option<Node> {
         self.children.get(&act).map(|child| child.value().clone())
     }
     fn select(&self, c_puct: f32) -> Option<usize> {
@@ -454,18 +454,18 @@ struct TTval {
 }
 
 struct LeafToEvaluate<'a> {
-    path: Vec<(&'a MCTSNode, usize)>,
+    path: Vec<(&'a Node, usize)>,
     state: State,
 }
 
 enum SimulationResult<'a> {
     Terminal {
-        path: Vec<(&'a MCTSNode, usize)>,
+        path: Vec<(&'a Node, usize)>,
         value: f32,
     },
     TTHit {
-        path: Vec<(&'a MCTSNode, usize)>,
-        node: &'a MCTSNode,
+        path: Vec<(&'a Node, usize)>,
+        node: &'a Node,
         entry: TTval,
     },
     NeedsEvaluation(LeafToEvaluate<'a>),
@@ -473,7 +473,6 @@ enum SimulationResult<'a> {
 
 #[pyclass]
 struct MCTS {
-    network: PyObject,
     c_puct: f32,
     dirichlet_alpha: f32,
     epsilon: f32,
@@ -483,9 +482,8 @@ struct MCTS {
 #[pymethods]
 impl MCTS {
     #[new]
-    fn new(network: PyObject, c_puct: f32, dirichlet_alpha: f32, epsilon: f32) -> Self {
+    fn new(c_puct: f32, dirichlet_alpha: f32, epsilon: f32) -> Self {
         MCTS {
-            network,
             c_puct,
             dirichlet_alpha,
             epsilon,
@@ -493,10 +491,11 @@ impl MCTS {
         }
     }
 
-    fn run_simulations(
+    fn simulate(
         &self,
         py: Python,
-        root: &MCTSNode,
+        network: PyObject,
+        root: &Node,
         state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
@@ -505,7 +504,7 @@ impl MCTS {
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr, 0))?;
 
-            let result = self.network.call_method1(py, "predict", (batch_repr,))?;
+            let result = network.call_method1(py, "predict", (batch_repr,))?;
             let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result.extract(py)?;
 
@@ -532,7 +531,7 @@ impl MCTS {
         let simulation_results: Vec<SimulationResult> = (0..num_simulations)
             .into_par_iter()
             .map(|_| {
-                let mut path: Vec<(&MCTSNode, usize)> = Vec::new();
+                let mut path: Vec<(&Node, usize)> = Vec::new();
                 let mut node = root;
                 let mut state_curr = state.clone();
 
@@ -549,7 +548,7 @@ impl MCTS {
                     state_curr.apply_move(row, col, player);
 
                     let child_ref = node.children.get(&act).unwrap();
-                    node = unsafe { &*(child_ref.value() as *const MCTSNode) };
+                    node = unsafe { &*(child_ref.value() as *const Node) };
                 }
 
                 let (is_over, winner) = state_curr.check_terminate();
@@ -595,9 +594,7 @@ impl MCTS {
             let np = PyModule::import(py, "numpy")?;
             let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
 
-            let result = self
-                .network
-                .call_method1(py, "predict", (batch_numpy_array,))?;
+            let result = network.call_method1(py, "predict", (batch_numpy_array,))?;
 
             let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result.extract(py)?;
@@ -605,7 +602,7 @@ impl MCTS {
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
                 let leaf_node = item.path.last().map_or(root, |(parent, act)| unsafe {
-                    &*(parent.children.get(act).unwrap().value() as *const MCTSNode)
+                    &*(parent.children.get(act).unwrap().value() as *const Node)
                 });
 
                 let policies_view = unsafe { policies.as_array() };
@@ -635,7 +632,7 @@ impl MCTS {
     fn get_act_prob<'py>(
         &self,
         py: Python<'py>,
-        root: &MCTSNode,
+        root: &Node,
         state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
@@ -667,7 +664,7 @@ impl MCTS {
 }
 
 impl MCTS {
-    fn _add_dirichlet_noise(&self, node: &MCTSNode) {
+    fn _add_dirichlet_noise(&self, node: &Node) {
         let acts: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
         if acts.is_empty() {
             return;
@@ -712,7 +709,7 @@ impl MCTS {
         Ok(stat)
     }
 
-    fn backup(&self, path: &[(&MCTSNode, usize)], value: f32) {
+    fn backup(&self, path: &[(&Node, usize)], value: f32) {
         let mut current_value = -value;
         for &(parent, act) in path.iter().rev() {
             if let (Some(mut count), Some(mut total_val)) = (
@@ -750,7 +747,7 @@ mod tests {
 #[pymodule]
 fn mcts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MCTS>()?;
-    m.add_class::<MCTSNode>()?;
+    m.add_class::<Node>()?;
     m.add_class::<State>()?;
     Ok(())
 }
