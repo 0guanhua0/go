@@ -306,13 +306,7 @@ impl State {
         act
     }
 
-    #[pyo3(signature = (root_value=None, best_child_value=None, resignation_threshold=None))]
-    fn check_terminate(
-        &self,
-        root_value: Option<f32>,
-        best_child_value: Option<f32>,
-        resignation_threshold: Option<f32>,
-    ) -> (bool, Option<i8>) {
+    fn check_terminate(&self) -> (bool, Option<i8>) {
         let max_move = self.board_size * self.board_size * 2;
         if self.pass_consecutive >= 2 || self.move_cnt >= max_move {
             let (black_score, white_score) = self.get_score();
@@ -324,14 +318,6 @@ impl State {
                 0
             };
             (true, Some(winner))
-        } else if let (Some(root), Some(best), Some(threshold)) =
-            (root_value, best_child_value, resignation_threshold)
-        {
-            if root < threshold && best < threshold {
-                (true, Some(-self.current_player))
-            } else {
-                (false, None)
-            }
         } else {
             (false, None)
         }
@@ -566,7 +552,7 @@ impl MCTS {
                     node = unsafe { &*(child_ref.value() as *const MCTSNode) };
                 }
 
-                let (is_over, winner) = state_curr.check_terminate(None, None, None);
+                let (is_over, winner) = state_curr.check_terminate();
                 if is_over {
                     let value = (winner.unwrap() * state.current_player) as f32;
                     SimulationResult::Terminal { path, value }

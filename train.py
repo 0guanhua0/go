@@ -59,10 +59,7 @@ class CPUWorker:
     def __init__(self):
         identity = current_process()._identity
         raw_worker_id = identity[0] - 1 if identity else 0
-        if self.result_pipes:
-            self.worker_id = raw_worker_id % len(self.result_pipes)
-        else:
-            self.worker_id = raw_worker_id
+        self.worker_id = raw_worker_id % len(self.result_pipes)
 
     def play_game(self, v_resign, allow_resign):
         network_wrapper = NetworkWrapper(
@@ -105,12 +102,10 @@ class CPUWorker:
             )
 
             if allow_resign:
-                best_act = max(act_prob, key=act_prob.get)
-                best_child_value = root.mean_act_val().get(best_act)
-                game_over, winner = state.check_terminate(
-                    root_val, best_child_value, v_resign
-                )
-                if game_over:
+                max_act = max(act_prob, key=act_prob.get)
+                max_val = root.mean_act_val().get(max_act)
+                if root_val < v_resign and max_val < v_resign:
+                    game_over, winner = True, -state.current_player()
                     resigned = True
                     break
 
