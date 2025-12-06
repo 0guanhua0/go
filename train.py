@@ -41,7 +41,7 @@ def to_sgf_coords(action, board):
     return (y, x)
 
 
-class CPUWorker:
+class Worker:
     request_queue = None
     result_pipes = None
     buffer = None
@@ -59,23 +59,35 @@ class CPUWorker:
     def __init__(self):
         identity = current_process()._identity
         raw_worker_id = identity[0] - 1 if identity else 0
-        self.worker_id = raw_worker_id % len(self.result_pipes)
+        if self.result_pipes:
+            self.worker_id = raw_worker_id % len(self.result_pipes)
+        else:
+            self.worker_id = raw_worker_id
 
-    def play_game(self, v_resign, allow_resign):
-        network_wrapper = NetworkWrapper(
-            self.worker_id,
-            model_id="best",
-            request_queue=self.request_queue,
-            result_pipe=self.result_pipes[self.worker_id],
-        )
+        self.networks = {
+            "best": NetworkWrapper(
+                self.worker_id,
+                model_id="best",
+                request_queue=self.request_queue,
+                result_pipe=self.result_pipes[self.worker_id],
+            ),
+            "next": NetworkWrapper(
+                self.worker_id,
+                model_id="next",
+                request_queue=self.request_queue,
+                result_pipe=self.result_pipes[self.worker_id],
+            ),
+        }
 
+    def train_game(self, black, white, v_resign, allow_resign):
         state = State(config.board)
-        mcts = MCTS(
-            network_wrapper,
+        common_mcts_args = (
             config.C_PUCT,
             config.DIRICHLET_ALPHA,
             config.DIRICHLET_EPSILON,
         )
+        black_mcts = MCTS(black, *common_mcts_args)
+        white_mcts = MCTS(white, *common_mcts_args)
 
         sgf_game = sgf.Sgf_game(size=config.board)
         sgf_game.get_root().set_raw("KM", b"7.5")
@@ -93,6 +105,7 @@ class CPUWorker:
             if game_over:
                 break
 
+            mcts = black_mcts if state.current_player() == 1 else white_mcts
             mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
@@ -176,28 +189,22 @@ class CPUWorker:
             "non_resigned_data": non_resigned_data,
         }
 
-    def evaluate_game(self, is_next_black):
-        next_wrapper = NetworkWrapper(
-            self.worker_id,
-            model_id="next",
-            request_queue=self.request_queue,
-            result_pipe=self.result_pipes[self.worker_id],
-        )
-        best_wrapper = NetworkWrapper(
-            self.worker_id,
-            model_id="best",
-            request_queue=self.request_queue,
-            result_pipe=self.result_pipes[self.worker_id],
-        )
-        winner_result = evaluate_game(next_wrapper, best_wrapper, is_next_black)
+    def eval_game(self, is_next_black):
+        black_model_id = "next" if is_next_black else "best"
+        white_model_id = "best" if is_next_black else "next"
+        black_wrapper = self.networks[black_model_id]
+        white_wrapper = self.networks[white_model_id]
+        winner_result = eval_game(black_wrapper, white_wrapper, is_next_black)
         return winner_result
 
     def play_game_task(v_resign, allow_resign):
-        worker = CPUWorker()
-        return worker.play_game(v_resign, allow_resign)
+        worker = Worker()
+        return worker.train_game(
+            worker.networks["best"], worker.networks["best"], v_resign, allow_resign
+        )
 
 
-class GPUWorker(Process):
+class GPU(Process):
     def __init__(self, request_queue, result_pipes, main_pipe, device_str):
         super().__init__()
         self.request_queue = request_queue
@@ -438,18 +445,14 @@ class NetworkWrapper:
 
 
 def evaluate_game_task(is_next_black=False):
-    worker = CPUWorker()
-    return worker.evaluate_game(is_next_black)
+    worker = Worker()
+    return worker.eval_game(is_next_black)
 
 
-def evaluate_game(next_wrapper, best_wrapper, is_next_black):
-    if is_next_black:
-        black_player, white_player = next_wrapper, best_wrapper
-    else:
-        black_player, white_player = best_wrapper, next_wrapper
+def eval_game(black_wrapper, white_wrapper, is_next_black):
     state = State(config.board)
-    black_mcts = MCTS(black_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    white_mcts = MCTS(white_player, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+    black_mcts = MCTS(black_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+    white_mcts = MCTS(white_wrapper, config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = MCTSNode(), MCTSNode()
     while True:
         game_over, winner = state.check_terminate()
@@ -469,7 +472,7 @@ def evaluate_game(next_wrapper, best_wrapper, is_next_black):
         mcts.run_simulations(root, state, config.NUM_SIMULATIONS)
 
         act_prob = mcts.get_act_prob(root, state, temp=0)
-        act_to_play = max(act_prob, key=act_prob.get) if act_prob else (config.board**2)
+        act_to_play = max(act_prob, key=act_prob.get)
         x, y = action_to_coords(act_to_play, config.board)
         state.apply_move(x, y, state.current_player())
         if current_player_is_black:
@@ -548,7 +551,7 @@ def main(args):
         logging.info(f"--- Resuming training from generation {start_generation} ---")
         return start_generation, start_elo
 
-    accelerator_worker = GPUWorker(
+    accelerator_worker = GPU(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
     )
     accelerator_worker.daemon = True
@@ -561,10 +564,10 @@ def main(args):
     )
     pool_init_args = (gpu_request_queue, worker_conns, buffer)
     cpu_worker_pool = Pool(
-        processes=num_cpu_workers, initializer=CPUWorker.init, initargs=pool_init_args
+        processes=num_cpu_workers, initializer=Worker.init, initargs=pool_init_args
     )
     logging.info(
-        f"Started a CPU worker pool with {num_cpu_workers} workers and 1 GPUWorker process."
+        f"Started a CPU worker pool with {num_cpu_workers} workers and 1 GPU process."
     )
 
     start_generation = 1
@@ -579,7 +582,7 @@ def main(args):
 
     def dispatch_sp_task(v_resign, allow_resign):
         return cpu_worker_pool.apply_async(
-            CPUWorker.play_game_task,
+            Worker.play_game_task,
             args=(v_resign, allow_resign),
         )
 
