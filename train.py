@@ -1,5 +1,6 @@
 import argparse
 import collections
+import hashlib
 import logging
 import os
 import queue
@@ -41,6 +42,15 @@ def to_sgf_coords(action, board):
     return (y, x)
 
 
+def model_hash(weight):
+    hasher = hashlib.sha256()
+    for w in weight:
+        weight_bytes = w.detach().cpu().contiguous().numpy().tobytes()
+        weight_hash = hashlib.sha256(weight_bytes).digest()
+        hasher.update(weight_hash)
+    return hasher.hexdigest()
+
+
 class Worker:
     request_queue = None
     result_pipes = None
@@ -79,20 +89,17 @@ class Worker:
             ),
         }
 
-    def train_game(self, black, white, v_resign, allow_resign):
+    def self_play(self, black, white, allow_resign, v_resign):
         state = State(config.board)
         common_mcts_args = (
             config.C_PUCT,
             config.DIRICHLET_ALPHA,
             config.DIRICHLET_EPSILON,
         )
-        black_mcts = MCTS(*common_mcts_args)
-        white_mcts = MCTS(*common_mcts_args)
+        mcts = MCTS(*common_mcts_args)
 
         sgf_game = sgf.Sgf_game(size=config.board)
         sgf_game.get_root().set_raw("KM", b"7.5")
-        sgf_game.get_root().set("PW", "AlphaGoZero-Best")
-        sgf_game.get_root().set("PB", "AlphaGoZero-Best")
         sgf_node = sgf_game.get_root()
 
         root = Node()
@@ -100,12 +107,13 @@ class Worker:
         state_repr = state.get_state()
         resigned = False
 
+        black_resign, white_resign = [], []
+
         while True:
             game_over, winner = state.check_terminate()
             if game_over:
                 break
 
-            mcts = black_mcts if state.current_player() == 1 else white_mcts
             network = black if state.current_player() == 1 else white
             mcts.simulate(network, root, state, config.NUM_SIMULATIONS)
 
@@ -115,13 +123,18 @@ class Worker:
                 prob * root.mean_act_val().get(act) for act, prob in act_prob.items()
             )
 
-            if allow_resign:
-                max_act = max(act_prob, key=act_prob.get)
-                max_val = root.mean_act_val().get(max_act)
-                if root_val < v_resign and max_val < v_resign:
+            max_act = max(act_prob, key=act_prob.get)
+            max_val = root.mean_act_val().get(max_act)
+            if root_val < v_resign and max_val < v_resign:
+                if allow_resign:
                     game_over, winner = True, -state.current_player()
                     resigned = True
                     break
+                else:
+                    if state.current_player() == 1 and len(black_resign) == 0:
+                        black_resign += [root_val, max_val]
+                    elif state.current_player() == -1 and len(white_resign) == 0:
+                        white_resign += [root_val, max_val]
 
             policy_target = torch.zeros(config.board * config.board + 1)
             for act, prob in act_prob.items():
@@ -149,14 +162,17 @@ class Worker:
             root = child_node
 
         data = []
-        non_resigned_data = []
         for state_repr_hist, policy, player, r_val in game_history:
             z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
             data.append((torch.from_numpy(state_repr_hist), policy, z))
-            if not allow_resign:
-                non_resigned_data.append({"root_val": r_val, "final_reward": z})
 
         self.buffer.add(data)
+
+        v_resign_tune = []
+        if winner == 1 and black_resign:
+            v_resign_tune.extend(black_resign)
+        elif winner == -1 and white_resign:
+            v_resign_tune.extend(white_resign)
 
         sgf_result = ""
         if resigned:
@@ -186,8 +202,7 @@ class Worker:
 
         return {
             "moves": len(data),
-            "allow_resign": allow_resign,
-            "non_resigned_data": non_resigned_data,
+            "v_resign_tune": v_resign_tune,
         }
 
     def eval_game(self, is_next_black):
@@ -200,8 +215,8 @@ class Worker:
 
     def play_game_task(v_resign, allow_resign):
         worker = Worker()
-        return worker.train_game(
-            worker.networks["best"], worker.networks["best"], v_resign, allow_resign
+        return worker.self_play(
+            worker.networks["best"], worker.networks["best"], allow_resign, v_resign
         )
 
 
@@ -517,26 +532,42 @@ def main(args):
     gpu_result_conns = [p[1] for p in all_pipes]
     main_gpu_pipe_recv, main_gpu_pipe_send = Pipe(duplex=False)
 
+    resign_dict = collections.defaultdict(list)
+    current_model_id = None
+
+    def add_resign_data(model_id, v_resign_tune):
+        resign_dict[model_id].extend(v_resign_tune)
+        resign_dict[model_id].sort()
+
+    def get_current_model_id():
+        gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
+        gpu_state = main_gpu_pipe_recv.recv()
+        return model_hash(gpu_state["best_model_state_dict"].values())
+
     def save_checkpoint(generation, best_elo, run, cfg):
         gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = main_gpu_pipe_recv.recv()
+        model_id = model_hash(gpu_state["best_model_state_dict"].values())
         checkpoint_data = {
             "generation": generation,
             "best_model_state_dict": gpu_state["best_model_state_dict"],
             "best_model_elo": best_elo,
+            "model_id": model_id,
             "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
         }
         filename = f"checkpoint_gen_{generation}.pt"
         torch.save(checkpoint_data, filename)
-        logging.info(f"Lightweight checkpoint data saved locally to {filename}")
+        logging.info(
+            f"Lightweight checkpoint data saved locally to {filename} (model id: {model_id})"
+        )
         artifact = wandb.Artifact(
             name=cfg.CHECKPOINT_NAME,
             type="model-checkpoint",
             description=f"Lightweight checkpoint after generation {generation}. Contains 'best' model weights and ELO.",
-            metadata={"generation": generation, "elo": best_elo},
+            metadata={"generation": generation, "elo": best_elo, "model_id": model_id},
         )
         artifact.add_file(filename)
-        run.log_artifact(artifact, aliases=["latest", f"gen-{generation}"])
+        run.log_artifact(artifact, aliases=["latest", f"gen-{generation}", model_id])
         logging.info("Checkpoint artifact uploaded to W&B.")
 
     def load_checkpoint(run, cfg):
@@ -550,12 +581,18 @@ def main(args):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         start_generation = checkpoint["generation"] + 1
         start_elo = checkpoint.get("best_model_elo", cfg.ELO_INITIAL)
+        loaded_model_id = checkpoint.get("model_id")
+        if loaded_model_id:
+            logging.info(f"Loaded checkpoint model id: {loaded_model_id}")
+        else:
+            loaded_model_id = model_hash(checkpoint["best_model_state_dict"].values())
+            logging.info(f"Computed checkpoint model id: {loaded_model_id}")
         logging.info(f"Loaded ELO for 'best' model: {start_elo:.0f}")
         gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
         gpu_request_queue.put(("LOAD_CHECKPOINT_DATA", gpu_states))
         main_gpu_pipe_recv.recv()
         logging.info(f"--- Resuming training from generation {start_generation} ---")
-        return start_generation, start_elo
+        return start_generation, start_elo, loaded_model_id
 
     accelerator_worker = GPU(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
@@ -579,10 +616,15 @@ def main(args):
     start_generation = 1
     best_model_elo = config.ELO_INITIAL
     if run.resumed:
-        start_generation, best_model_elo = load_checkpoint(run, config)
+        start_generation, best_model_elo, current_model_id = load_checkpoint(
+            run, config
+        )
+    else:
+        current_model_id = get_current_model_id()
+
+    logging.info(f"Tracking resignation tuning for model id: {current_model_id}")
 
     v_resign = config.RESIGNATION_THRESHOLD
-    non_resignation_history = collections.deque()
 
     active_sp_tasks = {}
 
@@ -606,7 +648,9 @@ def main(args):
                 if result.ready()
             ]
             for worker_id in done_workers:
-                active_sp_tasks[worker_id].get()
+                game_result = active_sp_tasks[worker_id].get()
+                if game_result:
+                    add_resign_data(current_model_id, game_result.get("v_resign_tune"))
                 allow_resign = worker_id % 10 != 0
                 active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
             logging.info(f"Buffer size: {len(buffer)}/{min_initial_data}")
@@ -618,45 +662,19 @@ def main(args):
         log_data = {"generation": generation}
         run.log(log_data, step=generation, commit=False)
 
-        if len(non_resignation_history) > 1000:
-            logging.info("Updating resignation threshold...")
-            best_threshold = v_resign
-            min_diff = float("inf")
-
-            for v_candidate in torch.arange(-0.99, -0.50, 0.01, dtype=torch.float32):
-                v_candidate = float(v_candidate)
-                would_resign = [
-                    d for d in non_resignation_history if d[0] < v_candidate
-                ]
-                if not would_resign:
-                    continue
-
-                false_positives = sum(1 for _, outcome in would_resign if outcome == 1)
-                fp_rate = false_positives / len(would_resign)
-
-                if fp_rate <= 0.05 and (0.05 - fp_rate) < min_diff:
-                    min_diff = 0.05 - fp_rate
-                    best_threshold = v_candidate
-
-            if best_threshold != v_resign:
-                logging.info(
-                    f"New resignation threshold: {best_threshold:.2f} (previously {v_resign:.2f})"
-                )
-                v_resign = best_threshold
-            else:
-                logging.info(f"Resignation threshold remains {v_resign:.2f}")
-            log_data.update({"resignation_threshold": v_resign})
+        model_resign_data = resign_dict.get(current_model_id, [])
+        if model_resign_data:
+            idx = max(0, int(0.05 * (len(model_resign_data) - 1)))
+            v_resign = model_resign_data[idx]
+            logging.info(f"model id {current_model_id}: v_resign {v_resign}")
 
         logging.info("[1/3] Managing self-play pool and training...")
         done_workers = []
         for worker_id, result in list(active_sp_tasks.items()):
             if result.ready():
                 game_result = result.get()
-                if game_result and not game_result["allow_resign"]:
-                    for data_point in game_result["non_resigned_data"]:
-                        non_resignation_history.append(
-                            (data_point["root_val"], data_point["final_reward"])
-                        )
+                if game_result:
+                    add_resign_data(current_model_id, game_result.get("v_resign_tune"))
                 done_workers.append(worker_id)
 
         for worker_id in done_workers:
@@ -703,11 +721,8 @@ def main(args):
         # Collect final results from the generation's games
         for worker_id, result in list(active_sp_tasks.items()):
             game_result = result.get()
-            if game_result and not game_result["allow_resign"]:
-                for data_point in game_result["non_resigned_data"]:
-                    non_resignation_history.append(
-                        (data_point["root_val"], data_point["final_reward"])
-                    )
+            if game_result:
+                add_resign_data(current_model_id, game_result.get("v_resign_tune"))
         active_sp_tasks.clear()
 
         logging.info("Evaluating 'next' model (self-play is paused)...")
@@ -777,15 +792,20 @@ def main(args):
     gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
     gpu_state = main_gpu_pipe_recv.recv()
     best_model_state_dict = gpu_state.get("best_model_state_dict")
+    final_model_id = model_hash(best_model_state_dict.values())
     torch.save(best_model_state_dict, "alphago-zero.pt")
     final_model_artifact = wandb.Artifact(
         "final-model",
         type="model",
         description="Final 'best' model after all training generations.",
-        metadata={"generation": final_generation, "elo": best_model_elo},
+        metadata={
+            "generation": final_generation,
+            "elo": best_model_elo,
+            "model_id": final_model_id,
+        },
     )
     final_model_artifact.add_file("alphago-zero.pt")
-    run.log_artifact(final_model_artifact)
+    run.log_artifact(final_model_artifact, aliases=["final", final_model_id])
 
     if "generation" in locals():
         save_checkpoint(final_generation, best_model_elo, run, config)
