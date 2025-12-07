@@ -200,12 +200,10 @@ class Worker:
             "v_resign_tune": v_resign_tune,
         }
 
-    def eval_game(self, is_next_black):
-        black_model_id = "next" if is_next_black else "best"
-        white_model_id = "best" if is_next_black else "next"
-        black_wrapper = self.networks[black_model_id]
-        white_wrapper = self.networks[white_model_id]
-        winner_result = eval_game(black_wrapper, white_wrapper, is_next_black)
+    def eval_game(self):
+        black_wrapper = self.networks["best"]
+        white_wrapper = self.networks["next"]
+        winner_result = eval_game(black_wrapper, white_wrapper)
         return winner_result
 
     def play_game_task(v_resign, allow_resign):
@@ -455,33 +453,26 @@ class NetworkWrapper:
         return policy.cpu().numpy(), value.cpu().numpy()
 
 
-def evaluate_game_task(is_next_black=False):
+def evaluate_game_task():
     worker = Worker()
-    return worker.eval_game(is_next_black)
+    return worker.eval_game()
 
 
-def eval_game(black_wrapper, white_wrapper, is_next_black):
+def eval_game(black, white):
     state = State(config.board)
-    black_mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    white_mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+    mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
     black_root, white_root = Node(), Node()
     while True:
         game_over, winner = state.check_terminate()
         if game_over:
             if winner == 0:
                 return 0
-            next_won = (winner == 1 and is_next_black) or (
-                winner == -1 and not is_next_black
-            )
+            next_won = winner == -1
             return 1 if next_won else -1
-        mcts, root, current_player_is_black = (
-            (black_mcts, black_root, True)
-            if state.current_player() == 1
-            else (white_mcts, white_root, False)
-        )
+        root = black_root if state.current_player() == 1 else white_root
 
         mcts.simulate(
-            black_wrapper if current_player_is_black else white_wrapper,
+            black if state.current_player() == 1 else white,
             root,
             state,
             config.NUM_SIMULATIONS,
@@ -491,13 +482,13 @@ def eval_game(black_wrapper, white_wrapper, is_next_black):
         act_to_play = max(act_prob, key=act_prob.get)
         x, y = action_to_coords(act_to_play, config.board)
         state.apply_move(x, y, state.current_player())
-        if current_player_is_black:
+        if state.current_player() == 1:
             black_child = black_root.get_child(act_to_play)
-            black_root = black_child if black_child is not None else Node()
+            black_root = black_child
             white_root = Node()
         else:
             white_child = white_root.get_child(act_to_play)
-            white_root = white_child if white_child is not None else Node()
+            white_root = white_child
             black_root = Node()
 
 
@@ -723,8 +714,8 @@ def main(args):
             f"Current Best ELO: {best_model_elo:.0f}. Expected Win Rate for Next: {expected_win_rate:.2%}"
         )
         eval_tasks = [
-            cpu_worker_pool.apply_async(evaluate_game_task, args=(i % 2 == 0,))
-            for i in range(config.EVAL_GAME)
+            cpu_worker_pool.apply_async(evaluate_game_task)
+            for _ in range(config.EVAL_GAME)
         ]
         eval_res = [res.get() for res in eval_tasks]
 
@@ -758,7 +749,7 @@ def main(args):
         )
         logging.info("[3/3] Model promotion and checkpoint phase...")
         promoted = False
-        if win_rate > config.EVAL_WIN_THRESHOLD:
+        if win_rate > config.EVAL_THRESHOLD:
             logging.info(">>> New best model found! Promoting 'next' model. <<<")
             gpu_request_queue.put(("PROMOTE_NEXT", None))
             best_model_elo = new_next_elo
