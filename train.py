@@ -91,19 +91,14 @@ class Worker:
 
     def self_play(self, black, white, allow_resign, v_resign):
         state = State(config.board)
-        common_mcts_args = (
-            config.C_PUCT,
-            config.DIRICHLET_ALPHA,
-            config.DIRICHLET_EPSILON,
-        )
-        mcts = MCTS(*common_mcts_args)
+        mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
 
         sgf_game = sgf.Sgf_game(size=config.board)
         sgf_game.get_root().set_raw("KM", b"7.5")
         sgf_node = sgf_game.get_root()
 
         root = Node()
-        game_history = []
+        history = []
         state_repr = state.get_state()
         resigned = False
 
@@ -131,16 +126,16 @@ class Worker:
                     resigned = True
                     break
                 else:
-                    if state.current_player() == 1 and len(black_resign) == 0:
+                    if state.current_player() == 1 and not black_resign:
                         black_resign += [root_val, max_val]
-                    elif state.current_player() == -1 and len(white_resign) == 0:
+                    elif state.current_player() == -1 and not white_resign:
                         white_resign += [root_val, max_val]
 
             policy_target = torch.zeros(config.board * config.board + 1)
             for act, prob in act_prob.items():
                 policy_target[act] = prob
 
-            game_history.append(
+            history.append(
                 (
                     state_repr,
                     policy_target,
@@ -162,7 +157,7 @@ class Worker:
             root = child_node
 
         data = []
-        for state_repr_hist, policy, player, r_val in game_history:
+        for state_repr_hist, policy, player, r_val in history:
             z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
             data.append((torch.from_numpy(state_repr_hist), policy, z))
 
@@ -512,10 +507,6 @@ def main(args):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-    )
-
-    logging.info(
-        f"Main orchestrator process started. Dispatching to device: {args.device}"
     )
 
     run = wandb.init(
