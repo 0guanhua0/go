@@ -110,7 +110,9 @@ class Worker:
                 break
 
             network = black if state.current_player() == 1 else white
-            mcts.simulate(network, root, state, config.NUM_SIMULATIONS)
+            mcts.simulate(
+                network.model_id, network, root, state, config.NUM_SIMULATIONS
+            )
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, state, temp)
@@ -153,8 +155,8 @@ class Worker:
             x, y = action_to_coords(act_to_play, config.board)
             state.apply_move(x, y, state.current_player())
             state_repr = state.get_state()
-            child_node = root.get_child(act_to_play)
-            root = child_node
+
+            root = root.get_child(act_to_play)
 
         data = []
         for state_repr_hist, policy, player, r_val in history:
@@ -461,7 +463,7 @@ def evaluate_game_task():
 def eval_game(black, white):
     state = State(config.board)
     mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    black_root, white_root = Node(), Node()
+    root = Node()
     while True:
         game_over, winner = state.check_terminate()
         if game_over:
@@ -469,27 +471,17 @@ def eval_game(black, white):
                 return 0
             next_won = winner == -1
             return 1 if next_won else -1
-        root = black_root if state.current_player() == 1 else white_root
 
-        mcts.simulate(
-            black if state.current_player() == 1 else white,
-            root,
-            state,
-            config.NUM_SIMULATIONS,
-        )
+        network = black if state.current_player() == 1 else white
+
+        mcts.simulate(network.model_id, network, root, state, config.NUM_SIMULATIONS)
 
         act_prob = mcts.get_act_prob(root, state, temp=0)
         act_to_play = max(act_prob, key=act_prob.get)
         x, y = action_to_coords(act_to_play, config.board)
         state.apply_move(x, y, state.current_player())
-        if state.current_player() == 1:
-            black_child = black_root.get_child(act_to_play)
-            black_root = black_child
-            white_root = Node()
-        else:
-            white_child = white_root.get_child(act_to_play)
-            white_root = white_child
-            black_root = Node()
+
+        root = root.get_child(act_to_play)
 
 
 def main(args):

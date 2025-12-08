@@ -476,7 +476,7 @@ struct MCTS {
     c_puct: f32,
     dirichlet_alpha: f32,
     epsilon: f32,
-    transposition_table: DashMap<u64, TTval>,
+    transposition_table: DashMap<(String, u64), TTval>,
 }
 
 #[pymethods]
@@ -494,6 +494,7 @@ impl MCTS {
     fn simulate(
         &self,
         py: Python,
+        model_id: String,
         network: PyObject,
         root: &Node,
         state: &State,
@@ -516,8 +517,9 @@ impl MCTS {
                 .ok_or_else(|| PyValueError::new_err("slice policy array err"))?;
 
             let stat = self.get_stat(state, policy_slice)?;
+            let key = (model_id.clone(), state.hash);
             self.transposition_table.insert(
-                state.hash,
+                key,
                 TTval {
                     policy: stat.clone(),
                     value: value_vec[0],
@@ -555,7 +557,10 @@ impl MCTS {
                 if is_over {
                     let value = (winner.unwrap() * state.current_player) as f32;
                     SimulationResult::Terminal { path, value }
-                } else if let Some(entry) = self.transposition_table.get(&state_curr.hash) {
+                } else if let Some(entry) = self
+                    .transposition_table
+                    .get(&(model_id.clone(), state_curr.hash))
+                {
                     SimulationResult::TTHit {
                         path,
                         node,
@@ -614,8 +619,9 @@ impl MCTS {
                 let stat = self.get_stat(&item.state, policy_slice)?;
                 let value = value_vec[i];
 
+                let key = (model_id.clone(), item.state.hash);
                 self.transposition_table.insert(
-                    item.state.hash,
+                    key,
                     TTval {
                         policy: stat.clone(),
                         value,
