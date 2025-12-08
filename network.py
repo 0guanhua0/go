@@ -24,7 +24,7 @@ class ResBlock(nn.Module):
         return x
 
 
-class AlphaGoZeroNet(nn.Module):
+class AlphaGoZero(nn.Module):
     def __init__(self, board, history, conv_filter, res_block):
         super().__init__()
         self.conv_block = nn.Sequential(

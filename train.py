@@ -23,7 +23,7 @@ import dihedral
 import wandb
 from elo import Rating, calculate_expected_score, update_ratings
 from mcts import MCTS, Node, State
-from network import AlphaGoZeroNet
+from network import AlphaGoZero
 from ring import Ring
 
 
@@ -67,21 +67,15 @@ class Worker:
         )
 
     def __init__(self):
-        identity = current_process()._identity
-        raw_worker_id = identity[0] - 1 if identity else 0
-        if self.result_pipes:
-            self.worker_id = raw_worker_id % len(self.result_pipes)
-        else:
-            self.worker_id = raw_worker_id
-
+        self.worker_id = current_process()._identity[0] % len(self.result_pipes)
         self.networks = {
-            "best": NetworkWrapper(
+            "best": ModelWrapper(
                 self.worker_id,
                 model_id="best",
                 request_queue=self.request_queue,
                 result_pipe=self.result_pipes[self.worker_id],
             ),
-            "next": NetworkWrapper(
+            "next": ModelWrapper(
                 self.worker_id,
                 model_id="next",
                 request_queue=self.request_queue,
@@ -216,52 +210,48 @@ class Worker:
 
 
 class GPU(Process):
-    def __init__(self, request_queue, result_pipes, main_pipe, device_str):
+    def __init__(self, request_queue, result_pipes, main_pipe, device):
         super().__init__()
         self.request_queue = request_queue
         self.result_pipes = result_pipes
         self.main_pipe = main_pipe
-        self.device_str = device_str
+        self.device = torch.device(device)
         self.stop_event = Event()
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
 
-        self.device = None
-
-    def _initialize_hardware_and_models(self):
-        self.device = torch.device(self.device_str)
-        logging.info(
-            f"Initializing for {self.device_str.upper()} on device: {self.device}"
-        )
-
-        common_args = (
+    def _init_model(self):
+        net = (
             config.board,
             config.history,
             config.conv_filter,
             config.res_block,
         )
-        self.models = {
-            "best": AlphaGoZeroNet(*common_args).to(self.device),
-            "next": AlphaGoZeroNet(*common_args).to(self.device),
+        self.model = {
+            "best": AlphaGoZero(*net).to(self.device),
+            "next": AlphaGoZero(*net).to(self.device),
         }
-        self.models["next"].load_state_dict(self.models["best"].state_dict())
-        for model in self.models.values():
-            model.eval()
+        self.model["next"].load_state_dict(self.model["best"].state_dict())
 
+        for m in self.model.values():
+            m.eval()
         self.optimizer = torch.optim.SGD(
-            self.models["next"].parameters(),
+            self.model["next"].parameters(),
             lr=config.INITIAL_LR,
             momentum=0.9,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
         )
-        logging.info("Initialization complete.")
 
     def run(self):
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
         )
-        self._initialize_hardware_and_models()
+
+        self._init_model()
 
         while not self.stop_event.is_set():
             try:
@@ -305,11 +295,11 @@ class GPU(Process):
             loss = self._train_step(*payload)
             self.main_pipe.send({"status": "TRAIN_DONE", "loss": loss})
         elif command == "PROMOTE_NEXT":
-            self.models["best"].load_state_dict(self.models["next"].state_dict())
-            self.models["best"].eval()
+            self.model["best"].load_state_dict(self.model["next"].state_dict())
+            self.model["best"].eval()
             logging.info("Promoted 'next' to 'best'.")
         elif command == "RESET_NEXT":
-            self.models["next"].load_state_dict(self.models["best"].state_dict())
+            self.model["next"].load_state_dict(self.model["best"].state_dict())
             logging.info("Reset 'next' weights to 'best'.")
         elif command == "STEP_SCHEDULER":
             self.scheduler.step()
@@ -320,22 +310,22 @@ class GPU(Process):
             logging.info("Gathering best model state for lightweight checkpoint...")
             states = {
                 "best_model_state_dict": {
-                    k: v.cpu() for k, v in self.models["best"].state_dict().items()
+                    k: v.cpu() for k, v in self.model["best"].state_dict().items()
                 }
             }
             self.main_pipe.send(states)
         elif command == "LOAD_CHECKPOINT_DATA":
             states = payload
             logging.info("Loading best model state from lightweight checkpoint...")
-            self.models["best"].load_state_dict(states["best_model_state_dict"])
-            self.models["best"].eval()
+            self.model["best"].load_state_dict(states["best_model_state_dict"])
+            self.model["best"].eval()
             logging.info(
                 "Resetting 'next' model, optimizer, and scheduler based on new 'best' model."
             )
-            self.models["next"].load_state_dict(self.models["best"].state_dict())
-            self.models["next"].eval()
+            self.model["next"].load_state_dict(self.model["best"].state_dict())
+            self.model["next"].eval()
             self.optimizer = torch.optim.SGD(
-                self.models["next"].parameters(),
+                self.model["next"].parameters(),
                 lr=config.INITIAL_LR,
                 momentum=0.9,
             )
@@ -384,7 +374,7 @@ class GPU(Process):
 
             batch = torch.cat(dihedral_batch, dim=0).to(self.device)
 
-            model = self.models[model_name]
+            model = self.model[model_name]
 
             with torch.no_grad():
                 policy_logits, value_preds = model(batch)
@@ -414,7 +404,7 @@ class GPU(Process):
                 start_index = end_index
 
     def _train_step(self, state, policy, value):
-        self.models["next"].train()
+        self.model["next"].train()
 
         state = state.to(self.device)
         policy = policy.to(self.device)
@@ -422,29 +412,28 @@ class GPU(Process):
 
         self.optimizer.zero_grad()
 
-        policy_next, value_next = self.models["next"](state)
+        policy_next, value_next = self.model["next"](state)
 
         policy_loss = F.cross_entropy(policy_next, policy)
         value_loss = F.mse_loss(value_next, value)
         l2_penalty = torch.tensor(0.0, device=self.device)
-        for p in self.models["next"].parameters():
+        for p in self.model["next"].parameters():
             if p.requires_grad and p.dim() > 1:
                 l2_penalty += torch.sum(p.pow(2))
         loss = policy_loss + value_loss + config.l2_regularization * l2_penalty
 
         loss.backward()
         self.optimizer.step()
-        self.models["next"].eval()
+        self.model["next"].eval()
         return loss.item()
 
 
-class NetworkWrapper:
+class ModelWrapper:
     def __init__(self, worker_id, model_id, request_queue, result_pipe):
         self.worker_id = worker_id
         self.model_id = model_id
         self.request_queue = request_queue
         self.result_pipe = result_pipe
-        assert self.model_id in ["best", "next"]
 
     def predict(self, state_batch):
         tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32).contiguous()
