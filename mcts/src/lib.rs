@@ -494,8 +494,8 @@ impl MCTS {
     fn simulate(
         &self,
         py: Python,
-        model_id: String,
         network: PyObject,
+        weight_hash: String,
         root: &Node,
         state: &State,
         num_simulations: usize,
@@ -505,7 +505,7 @@ impl MCTS {
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr, 0))?;
 
-            let result = network.call_method1(py, "predict", (batch_repr,))?;
+            let result = network.call_method1(py, "infer", (batch_repr,))?;
             let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result.extract(py)?;
 
@@ -517,7 +517,7 @@ impl MCTS {
                 .ok_or_else(|| PyValueError::new_err("slice policy array err"))?;
 
             let stat = self.get_stat(state, policy_slice)?;
-            let key = (model_id.clone(), state.hash);
+            let key = (weight_hash.clone(), state.hash);
             self.transposition_table.insert(
                 key,
                 TTval {
@@ -559,7 +559,7 @@ impl MCTS {
                     SimulationResult::Terminal { path, value }
                 } else if let Some(entry) = self
                     .transposition_table
-                    .get(&(model_id.clone(), state_curr.hash))
+                    .get(&(weight_hash.clone(), state_curr.hash))
                 {
                     SimulationResult::TTHit {
                         path,
@@ -599,7 +599,7 @@ impl MCTS {
             let np = PyModule::import(py, "numpy")?;
             let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
 
-            let result = network.call_method1(py, "predict", (batch_numpy_array,))?;
+            let result = network.call_method1(py, "infer", (batch_numpy_array,))?;
 
             let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result.extract(py)?;
@@ -619,7 +619,7 @@ impl MCTS {
                 let stat = self.get_stat(&item.state, policy_slice)?;
                 let value = value_vec[i];
 
-                let key = (model_id.clone(), item.state.hash);
+                let key = (weight_hash.clone(), item.state.hash);
                 self.transposition_table.insert(
                     key,
                     TTval {

@@ -1,5 +1,4 @@
 import argparse
-import collections
 import hashlib
 import logging
 import os
@@ -42,7 +41,7 @@ def to_sgf_coords(action, board):
     return (y, x)
 
 
-def model_hash(weight):
+def weight_hash(weight):
     hasher = hashlib.sha256()
     for w in weight:
         weight_bytes = w.detach().cpu().contiguous().numpy().tobytes()
@@ -68,22 +67,22 @@ class Worker:
 
     def __init__(self):
         self.worker_id = current_process()._identity[0] % len(self.result_pipes)
-        self.networks = {
-            "best": ModelWrapper(
+        self.net = {
+            "best": NetWrapper(
                 self.worker_id,
-                model_id="best",
+                model="best",
                 request_queue=self.request_queue,
                 result_pipe=self.result_pipes[self.worker_id],
             ),
-            "next": ModelWrapper(
+            "next": NetWrapper(
                 self.worker_id,
-                model_id="next",
+                model="next",
                 request_queue=self.request_queue,
                 result_pipe=self.result_pipes[self.worker_id],
             ),
         }
 
-    def self_play(self, black, white, allow_resign, v_resign):
+    def self_play(self, network, weight_hash, allow_resign, v_resign):
         state = State(config.board)
         mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
 
@@ -103,10 +102,7 @@ class Worker:
             if game_over:
                 break
 
-            network = black if state.current_player() == 1 else white
-            mcts.simulate(
-                network.model_id, network, root, state, config.NUM_SIMULATIONS
-            )
+            mcts.simulate(network, weight_hash, root, state, config.NUM_SIMULATIONS)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, state, temp)
@@ -194,19 +190,45 @@ class Worker:
         return {
             "moves": len(data),
             "v_resign_tune": v_resign_tune,
+            "weight_hash": weight_hash,
         }
 
-    def eval_game(self):
-        black_wrapper = self.networks["best"]
-        white_wrapper = self.networks["next"]
-        winner_result = eval_game(black_wrapper, white_wrapper)
-        return winner_result
+    def eval(self, best_hash, next_hash):
+        state = State(config.board)
+        mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+        root = Node()
 
-    def play_game_task(v_resign, allow_resign):
+        while True:
+            game_over, winner = state.check_terminate()
+            if game_over:
+                if winner == 0:
+                    return 0
+                next_won = winner == -1
+                return 1 if next_won else -1
+
+            if state.current_player() == 1:
+                network = self.net["best"]
+                weight_hash = best_hash
+            else:
+                network = self.net["next"]
+                weight_hash = next_hash
+
+            mcts.simulate(network, weight_hash, root, state, config.NUM_SIMULATIONS)
+
+            act_prob = mcts.get_act_prob(root, state, temp=0)
+            act_to_play = max(act_prob, key=act_prob.get)
+            x, y = action_to_coords(act_to_play, config.board)
+            state.apply_move(x, y, state.current_player())
+
+            root = root.get_child(act_to_play)
+
+    def self_play_task(weight_hash, allow_resign, v_resign):
         worker = Worker()
-        return worker.self_play(
-            worker.networks["best"], worker.networks["best"], allow_resign, v_resign
-        )
+        return worker.self_play(worker.net["best"], weight_hash, allow_resign, v_resign)
+
+    def eval_task(best_hash, next_hash):
+        worker = Worker()
+        return worker.eval(best_hash, next_hash)
 
 
 class GPU(Process):
@@ -306,6 +328,12 @@ class GPU(Process):
             logging.info(
                 f"Stepped LR scheduler. New LR: {self.scheduler.get_last_lr()[0]:.2e}"
             )
+        elif command == "GET_MODEL_HASHES":
+            hashes = {
+                "best": weight_hash(self.model["best"].state_dict().values()),
+                "next": weight_hash(self.model["next"].state_dict().values()),
+            }
+            self.main_pipe.send(hashes)
         elif command == "GET_CHECKPOINT_DATA":
             logging.info("Gathering best model state for lightweight checkpoint...")
             states = {
@@ -428,49 +456,20 @@ class GPU(Process):
         return loss.item()
 
 
-class ModelWrapper:
-    def __init__(self, worker_id, model_id, request_queue, result_pipe):
+class NetWrapper:
+    def __init__(self, worker_id, model, request_queue, result_pipe):
         self.worker_id = worker_id
-        self.model_id = model_id
+        self.model = model
         self.request_queue = request_queue
         self.result_pipe = result_pipe
 
-    def predict(self, state_batch):
+    def infer(self, state_batch):
         tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32).contiguous()
         self.request_queue.put(
-            ("INFER", (self.worker_id, self.model_id, tensor_batch.cpu()))
+            ("INFER", (self.worker_id, self.model, tensor_batch.cpu()))
         )
         policy, value = self.result_pipe.recv()
         return policy.cpu().numpy(), value.cpu().numpy()
-
-
-def evaluate_game_task():
-    worker = Worker()
-    return worker.eval_game()
-
-
-def eval_game(black, white):
-    state = State(config.board)
-    mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
-    root = Node()
-    while True:
-        game_over, winner = state.check_terminate()
-        if game_over:
-            if winner == 0:
-                return 0
-            next_won = winner == -1
-            return 1 if next_won else -1
-
-        network = black if state.current_player() == 1 else white
-
-        mcts.simulate(network.model_id, network, root, state, config.NUM_SIMULATIONS)
-
-        act_prob = mcts.get_act_prob(root, state, temp=0)
-        act_to_play = max(act_prob, key=act_prob.get)
-        x, y = action_to_coords(act_to_play, config.board)
-        state.apply_move(x, y, state.current_player())
-
-        root = root.get_child(act_to_play)
 
 
 def main(args):
@@ -495,22 +494,27 @@ def main(args):
     gpu_result_conns = [p[1] for p in all_pipes]
     main_gpu_pipe_recv, main_gpu_pipe_send = Pipe(duplex=False)
 
-    resign_dict = collections.defaultdict(list)
+    v_resign_dict = {}
     current_model_id = None
 
-    def add_resign_data(model_id, v_resign_tune):
-        resign_dict[model_id].extend(v_resign_tune)
-        resign_dict[model_id].sort()
+    def add_resign_data(weight, v_resign_tune):
+        lst = v_resign_dict.setdefault(weight, [])
+        lst.extend(v_resign_tune)
+        lst.sort()
 
     def get_current_model_id():
-        gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
-        gpu_state = main_gpu_pipe_recv.recv()
-        return model_hash(gpu_state["best_model_state_dict"].values())
+        hashes = get_model_hashes()
+        return hashes["best"]
+
+    def get_model_hashes():
+        gpu_request_queue.put(("GET_MODEL_HASHES", None))
+        gpu_hashes = main_gpu_pipe_recv.recv()
+        return gpu_hashes
 
     def save_checkpoint(generation, best_elo, run, cfg):
         gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = main_gpu_pipe_recv.recv()
-        model_id = model_hash(gpu_state["best_model_state_dict"].values())
+        model_id = weight_hash(gpu_state["best_model_state_dict"].values())
         checkpoint_data = {
             "generation": generation,
             "best_model_state_dict": gpu_state["best_model_state_dict"],
@@ -520,9 +524,6 @@ def main(args):
         }
         filename = f"checkpoint_gen_{generation}.pt"
         torch.save(checkpoint_data, filename)
-        logging.info(
-            f"Lightweight checkpoint data saved locally to {filename} (model id: {model_id})"
-        )
         artifact = wandb.Artifact(
             name=cfg.CHECKPOINT_NAME,
             type="model-checkpoint",
@@ -548,7 +549,7 @@ def main(args):
         if loaded_model_id:
             logging.info(f"Loaded checkpoint model id: {loaded_model_id}")
         else:
-            loaded_model_id = model_hash(checkpoint["best_model_state_dict"].values())
+            loaded_model_id = weight_hash(checkpoint["best_model_state_dict"].values())
             logging.info(f"Computed checkpoint model id: {loaded_model_id}")
         logging.info(f"Loaded ELO for 'best' model: {start_elo:.0f}")
         gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
@@ -585,16 +586,14 @@ def main(args):
     else:
         current_model_id = get_current_model_id()
 
-    logging.info(f"Tracking resignation tuning for model id: {current_model_id}")
-
     v_resign = config.RESIGNATION_THRESHOLD
 
     active_sp_tasks = {}
 
-    def dispatch_sp_task(v_resign, allow_resign):
+    def dispatch_sp_task(weight_hash, allow_resign, v_resign):
         return cpu_worker_pool.apply_async(
-            Worker.play_game_task,
-            args=(v_resign, allow_resign),
+            Worker.self_play_task,
+            args=(weight_hash, allow_resign, v_resign),
         )
 
     min_initial_data = config.BATCH_SIZE * 20
@@ -603,7 +602,9 @@ def main(args):
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks:
                 allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    current_model_id, allow_resign, v_resign
+                )
         while len(buffer) < min_initial_data:
             done_workers = [
                 worker_id
@@ -613,9 +614,12 @@ def main(args):
             for worker_id in done_workers:
                 game_result = active_sp_tasks[worker_id].get()
                 if game_result:
-                    add_resign_data(current_model_id, game_result.get("v_resign_tune"))
+                    result_hash = game_result.get("weight_hash", current_model_id)
+                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
                 allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    current_model_id, allow_resign, v_resign
+                )
             logging.info(f"Buffer size: {len(buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
@@ -625,11 +629,11 @@ def main(args):
         log_data = {"generation": generation}
         run.log(log_data, step=generation, commit=False)
 
-        model_resign_data = resign_dict.get(current_model_id, [])
+        model_resign_data = v_resign_dict.get(current_model_id)
         if model_resign_data:
             idx = max(0, int(0.05 * (len(model_resign_data) - 1)))
-            v_resign = model_resign_data[idx]
-            logging.info(f"model id {current_model_id}: v_resign {v_resign}")
+            v_resign = max(config.RESIGNATION_THRESHOLD, model_resign_data[idx])
+            logging.info(f"weight {current_model_id}: v_resign {v_resign}")
 
         logging.info("[1/3] Managing self-play pool and training...")
         done_workers = []
@@ -637,17 +641,22 @@ def main(args):
             if result.ready():
                 game_result = result.get()
                 if game_result:
-                    add_resign_data(current_model_id, game_result.get("v_resign_tune"))
+                    result_hash = game_result.get("weight_hash", current_model_id)
+                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
                 done_workers.append(worker_id)
 
         for worker_id in done_workers:
             allow_resign = worker_id % 10 != 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
+            active_sp_tasks[worker_id] = dispatch_sp_task(
+                current_model_id, allow_resign, v_resign
+            )
 
         for worker_id in range(num_cpu_workers):
             if worker_id not in active_sp_tasks or active_sp_tasks[worker_id].ready():
                 allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
+                active_sp_tasks[worker_id] = dispatch_sp_task(
+                    current_model_id, allow_resign, v_resign
+                )
 
         if len(buffer) < config.BATCH_SIZE:
             logging.info("Not enough data to train. Waiting for more games...")
@@ -670,10 +679,6 @@ def main(args):
                     logging.info(
                         f"Training batch {batches_done}: loss={response['loss']:.4f}"
                     )
-            if (i + 1) % 50 == 0:
-                logging.info(
-                    f"Training update {i + 1}/{config.TRAINING_UPDATES_PER_GENERATION}, Buffer: {len(buffer)}"
-                )
 
         gpu_request_queue.put(("STEP_SCHEDULER", None))
         avg_loss = total_loss / batches_done if batches_done > 0 else 0
@@ -681,11 +686,11 @@ def main(args):
         logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
         for res in active_sp_tasks.values():
             res.wait()
-        # Collect final results from the generation's games
         for worker_id, result in list(active_sp_tasks.items()):
             game_result = result.get()
             if game_result:
-                add_resign_data(current_model_id, game_result.get("v_resign_tune"))
+                result_hash = game_result.get("weight_hash", current_model_id)
+                add_resign_data(result_hash, game_result.get("v_resign_tune"))
         active_sp_tasks.clear()
 
         logging.info("Evaluating 'next' model (self-play is paused)...")
@@ -694,9 +699,16 @@ def main(args):
         logging.info(
             f"Current Best ELO: {best_model_elo:.0f}. Expected Win Rate for Next: {expected_win_rate:.2%}"
         )
+        model_hashes = get_model_hashes()
         eval_tasks = [
-            cpu_worker_pool.apply_async(evaluate_game_task)
-            for _ in range(config.EVAL_GAME)
+            cpu_worker_pool.apply_async(
+                Worker.eval_task,
+                args=(
+                    model_hashes["best"],
+                    model_hashes["next"],
+                ),
+            )
+            for _ in range(config.EVAL)
         ]
         eval_res = [res.get() for res in eval_tasks]
 
@@ -746,16 +758,19 @@ def main(args):
         logging.info(
             "Evaluation complete. Resuming self-play for the next generation..."
         )
+        current_model_id = get_current_model_id()
         for worker_id in range(num_cpu_workers):
             allow_resign = worker_id % 10 != 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(v_resign, allow_resign)
+            active_sp_tasks[worker_id] = dispatch_sp_task(
+                current_model_id, allow_resign, v_resign
+            )
 
     logging.info("\nTraining complete! Shutting down...")
     final_generation = locals().get("generation", config.MAX_GENERATIONS)
     gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
     gpu_state = main_gpu_pipe_recv.recv()
     best_model_state_dict = gpu_state.get("best_model_state_dict")
-    final_model_id = model_hash(best_model_state_dict.values())
+    final_model_id = weight_hash(best_model_state_dict.values())
     torch.save(best_model_state_dict, "alphago-zero.pt")
     final_model_artifact = wandb.Artifact(
         "final-model",
