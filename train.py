@@ -16,11 +16,11 @@ from torch.multiprocessing import (
     current_process,
     set_start_method,
 )
+from whr import whole_history_rating
 
 import config
 import dihedral
 import wandb
-from elo import Rating, calculate_expected_score, update_ratings
 from mcts import MCTS, Node, State
 from network import AlphaGoZero
 from ring import Ring
@@ -496,6 +496,20 @@ def main(args):
 
     v_resign_dict = {}
     current_model_id = None
+    whr = whole_history_rating.Base()
+
+    def update_whr_with_results(results, best_id, next_id, time_step):
+        for result in results:
+            winner = "W" if result > 0 else "B"
+            whr.create_game(
+                black=best_id,
+                white=next_id,
+                winner=winner,
+                time_step=time_step,
+                handicap=0,
+            )
+        whr.auto_iterate()
+        logging.info(whr.print_ordered_ratings())
 
     def add_resign_data(weight, v_resign_tune):
         lst = v_resign_dict.setdefault(weight, [])
@@ -511,14 +525,13 @@ def main(args):
         gpu_hashes = main_gpu_pipe_recv.recv()
         return gpu_hashes
 
-    def save_checkpoint(generation, best_elo, run, cfg):
+    def save_checkpoint(generation, run, cfg):
         gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = main_gpu_pipe_recv.recv()
         model_id = weight_hash(gpu_state["best_model_state_dict"].values())
         checkpoint_data = {
             "generation": generation,
             "best_model_state_dict": gpu_state["best_model_state_dict"],
-            "best_model_elo": best_elo,
             "model_id": model_id,
             "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
         }
@@ -527,8 +540,11 @@ def main(args):
         artifact = wandb.Artifact(
             name=cfg.CHECKPOINT_NAME,
             type="model-checkpoint",
-            description=f"Lightweight checkpoint after generation {generation}. Contains 'best' model weights and ELO.",
-            metadata={"generation": generation, "elo": best_elo, "model_id": model_id},
+            description=(
+                f"Lightweight checkpoint after generation {generation}. "
+                "Contains 'best' model weights."
+            ),
+            metadata={"generation": generation, "model_id": model_id},
         )
         artifact.add_file(filename)
         run.log_artifact(artifact, aliases=["latest", f"gen-{generation}", model_id])
@@ -544,19 +560,17 @@ def main(args):
         logging.info(f"Downloaded checkpoint to {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         start_generation = checkpoint["generation"] + 1
-        start_elo = checkpoint.get("best_model_elo", cfg.ELO_INITIAL)
         loaded_model_id = checkpoint.get("model_id")
         if loaded_model_id:
             logging.info(f"Loaded checkpoint model id: {loaded_model_id}")
         else:
             loaded_model_id = weight_hash(checkpoint["best_model_state_dict"].values())
             logging.info(f"Computed checkpoint model id: {loaded_model_id}")
-        logging.info(f"Loaded ELO for 'best' model: {start_elo:.0f}")
         gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
         gpu_request_queue.put(("LOAD_CHECKPOINT_DATA", gpu_states))
         main_gpu_pipe_recv.recv()
         logging.info(f"--- Resuming training from generation {start_generation} ---")
-        return start_generation, start_elo, loaded_model_id
+        return start_generation, loaded_model_id
 
     accelerator_worker = GPU(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
@@ -578,11 +592,8 @@ def main(args):
     )
 
     start_generation = 1
-    best_model_elo = config.ELO_INITIAL
     if run.resumed:
-        start_generation, best_model_elo, current_model_id = load_checkpoint(
-            run, config
-        )
+        start_generation, current_model_id = load_checkpoint(run, config)
     else:
         current_model_id = get_current_model_id()
 
@@ -620,7 +631,6 @@ def main(args):
                 active_sp_tasks[worker_id] = dispatch_sp_task(
                     current_model_id, allow_resign, v_resign
                 )
-            logging.info(f"Buffer size: {len(buffer)}/{min_initial_data}")
             time.sleep(60)
         logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
 
@@ -694,18 +704,15 @@ def main(args):
         active_sp_tasks.clear()
 
         logging.info("Evaluating 'next' model (self-play is paused)...")
-        next_model_elo = best_model_elo
-        expected_win_rate = calculate_expected_score(next_model_elo, best_model_elo)
-        logging.info(
-            f"Current Best ELO: {best_model_elo:.0f}. Expected Win Rate for Next: {expected_win_rate:.2%}"
-        )
         model_hashes = get_model_hashes()
+        best_model_id = model_hashes["best"]
+        next_model_id = model_hashes["next"]
         eval_tasks = [
             cpu_worker_pool.apply_async(
                 Worker.eval_task,
                 args=(
-                    model_hashes["best"],
-                    model_hashes["next"],
+                    best_model_id,
+                    next_model_id,
                 ),
             )
             for _ in range(config.EVAL)
@@ -715,45 +722,23 @@ def main(args):
         next_wins = sum(1 for r in eval_res if r is not None and r > 0)
         draws = sum(1 for r in eval_res if r is not None and r == 0)
         games_played = len(eval_res)
-        actual_score = (
-            (next_wins + 0.5 * draws) / games_played if games_played > 0 else 0.0
-        )
         win_rate = next_wins / games_played if games_played > 0 else 0.0
         logging.info(
             f"'Next' model win rate: {win_rate:.2%} ({next_wins}/{games_played}, {draws} draws)"
         )
-        log_data.update(
-            {"evaluation_win_rate": win_rate, "expected_win_rate": expected_win_rate}
-        )
-        challenger, champion = (
-            Rating(next_model_elo, config.ELO_K_FACTOR),
-            Rating(best_model_elo, config.ELO_K_FACTOR),
-        )
-        new_challenger, new_champion = update_ratings(
-            challenger, champion, actual_score
-        )
-        new_next_elo, new_best_elo = new_challenger.rating, new_champion.rating
-        elo_change = new_next_elo - next_model_elo
-        logging.info(
-            f"ELO Change: {elo_change:+.1f}. Next ELO: {new_next_elo:.0f}, Best ELO: {new_best_elo:.0f}"
-        )
-        log_data.update(
-            {"elo_challenger_new": new_next_elo, "elo_champion_new": new_best_elo}
-        )
+        log_data.update({"evaluation_win_rate": win_rate})
         logging.info("[3/3] Model promotion and checkpoint phase...")
         promoted = False
         if win_rate > config.EVAL_THRESHOLD:
             logging.info(">>> New best model found! Promoting 'next' model. <<<")
+            update_whr_with_results(eval_res, best_model_id, next_model_id, generation)
             gpu_request_queue.put(("PROMOTE_NEXT", None))
-            best_model_elo = new_next_elo
             promoted = True
         else:
             logging.info("'Next' model not strong enough. Discarding weights.")
             gpu_request_queue.put(("RESET_NEXT", None))
-        log_data.update({"best_model_elo": best_model_elo})
-        logging.info(f"New champion ELO for next generation: {best_model_elo:.0f}")
         if promoted or (generation % config.CHECKPOINT_FREQUENCY == 0):
-            save_checkpoint(generation, best_model_elo, run, config)
+            save_checkpoint(generation, run, config)
         run.log(log_data, step=generation)
         logging.info(
             "Evaluation complete. Resuming self-play for the next generation..."
@@ -776,17 +761,13 @@ def main(args):
         "final-model",
         type="model",
         description="Final 'best' model after all training generations.",
-        metadata={
-            "generation": final_generation,
-            "elo": best_model_elo,
-            "model_id": final_model_id,
-        },
+        metadata={"generation": final_generation, "model_id": final_model_id},
     )
     final_model_artifact.add_file("alphago-zero.pt")
     run.log_artifact(final_model_artifact, aliases=["final", final_model_id])
 
     if "generation" in locals():
-        save_checkpoint(final_generation, best_model_elo, run, config)
+        save_checkpoint(final_generation, run, config)
     cpu_worker_pool.terminate()
     cpu_worker_pool.join()
     accelerator_worker.terminate()

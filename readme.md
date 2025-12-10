@@ -20,6 +20,7 @@
 - [Gradient descent, how neural networks learn | Deep Learning Chapter 2](https://www.youtube.com/watch?v=IHZwWFHWa-w)
 
 [Elo rating system](https://en.wikipedia.org/wiki/Elo_rating_system)
+- [Whole-History Rating: A Bayesian Rating System for Players of Time-Varying Strength](https://www.remi-coulom.fr/WHR/)
 
 [Zobrist hashing](https://en.wikipedia.org/wiki/Zobrist_hashing)
 

@@ -5,6 +5,7 @@ dependencies = [
     "sgfmill",
     "torch",
     "wandb",
+    "whole-history-rating",
 ]
 
 [project.optional-dependencies]
