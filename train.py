@@ -43,10 +43,49 @@ def to_sgf_coords(action, board):
 def weight_hash(weight):
     hasher = hashlib.sha256()
     for w in weight:
-        weight_bytes = w.detach().cpu().contiguous().numpy().tobytes()
-        weight_hash = hashlib.sha256(weight_bytes).digest()
-        hasher.update(weight_hash)
+        b = w.detach().cpu().contiguous().numpy().tobytes()
+        hasher.update(b)
     return hasher.hexdigest()
+
+
+def init_sgf():
+    sgf_game = sgf.Sgf_game(size=config.board)
+    sgf_game.get_root().set_raw("KM", b"7.5")
+    return sgf_game, sgf_game.get_root()
+
+
+def set_sgf(sgf_node, player, action):
+    p = "b" if player == 1 else "w"
+    sgf_coords = to_sgf_coords(action, config.board)
+    sgf_node = sgf_node.new_child()
+    sgf_node.set_move(p, sgf_coords)
+    return sgf_node
+
+
+def sum_sgf(
+    sgf_game, state, winner, resigned, worker_id, black_hash, white_hash, prefix
+):
+    if resigned:
+        sgf_result = "B+R" if winner == 1 else "W+R"
+    else:
+        black_score, white_score = state.get_score()
+        if winner == 1:
+            margin = black_score - white_score
+            sgf_result = f"B+{margin:.1f}"
+        elif winner == -1:
+            margin = white_score - black_score
+            sgf_result = f"W+{margin:.1f}"
+        else:
+            sgf_result = "Jigo"
+
+    root = sgf_game.get_root()
+    root.set("RE", sgf_result)
+    root.set("PB", black_hash)
+    root.set("PW", white_hash)
+    filename = time.strftime("%Y%m%d-%H%M%S") + f"-{prefix}-worker-{worker_id}.sgf"
+    with open(filename, "wb") as f:
+        f.write(sgf_game.serialise())
+    return sgf_result
 
 
 class Worker:
@@ -85,9 +124,7 @@ class Worker:
         state = State(config.board)
         mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
 
-        sgf_game = sgf.Sgf_game(size=config.board)
-        sgf_game.get_root().set_raw("KM", b"7.5")
-        sgf_node = sgf_game.get_root()
+        sgf_game, sgf_node = init_sgf()
 
         root = Node()
         history = []
@@ -136,10 +173,7 @@ class Worker:
             )
             act_to_play = torch.multinomial(policy_target, 1).item()
 
-            player_color = "b" if state.current_player() == 1 else "w"
-            sgf_coords = to_sgf_coords(act_to_play, config.board)
-            sgf_node = sgf_node.new_child()
-            sgf_node.set_move(player_color, sgf_coords)
+            sgf_node = set_sgf(sgf_node, state.current_player(), act_to_play)
 
             x, y = action_to_coords(act_to_play, config.board)
             state.apply_move(x, y, state.current_player())
@@ -160,25 +194,16 @@ class Worker:
         elif winner == -1 and white_resign:
             v_resign_tune.extend(white_resign)
 
-        sgf_result = ""
-        if resigned:
-            sgf_result = "B+R" if winner == 1 else "W+R"
-        else:
-            black_score, white_score = state.get_score()
-            if winner == 1:
-                margin = black_score - white_score
-                sgf_result = f"B+{margin:.1f}"
-            elif winner == -1:
-                margin = white_score - black_score
-                sgf_result = f"W+{margin:.1f}"
-            else:
-                sgf_result = "Jigo"
-
-        sgf_game.get_root().set("RE", sgf_result)
-
-        filename = time.strftime("%Y%m%d-%H%M%S") + f"-worker-{self.worker_id}.sgf"
-        with open(filename, "wb") as f:
-            f.write(sgf_game.serialise())
+        sgf_result = sum_sgf(
+            sgf_game,
+            state,
+            winner,
+            resigned,
+            self.worker_id,
+            prefix="selfplay",
+            black_hash=weight_hash,
+            white_hash=weight_hash,
+        )
 
         log_message = (
             f"Game finished ({len(data)} moves). Result: {sgf_result}. "
@@ -196,10 +221,21 @@ class Worker:
         state = State(config.board)
         mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
         root = Node()
+        sgf_game, sgf_node = init_sgf()
 
         while True:
             game_over, winner = state.check_terminate()
             if game_over:
+                sum_sgf(
+                    sgf_game,
+                    state,
+                    winner,
+                    False,
+                    self.worker_id,
+                    prefix="eval",
+                    black_hash=best_hash,
+                    white_hash=next_hash,
+                )
                 if winner == 0:
                     return 0
                 next_won = winner == -1
@@ -216,6 +252,7 @@ class Worker:
 
             act_prob = mcts.get_act_prob(root, state, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
+            sgf_node = set_sgf(sgf_node, state.current_player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)
             state.apply_move(x, y, state.current_player())
 
