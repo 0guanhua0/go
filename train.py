@@ -1,7 +1,6 @@
 import argparse
 import hashlib
 import logging
-import os
 import queue
 import time
 
@@ -342,26 +341,6 @@ class GPU(Process):
                 }
             }
             self.main_pipe.send(states)
-        elif command == "LOAD_CHECKPOINT_DATA":
-            states = payload
-            logging.info("Loading best model state from lightweight checkpoint...")
-            self.model["best"].load_state_dict(states["best_model_state_dict"])
-            self.model["best"].eval()
-            logging.info(
-                "Resetting 'next' model, optimizer, and scheduler based on new 'best' model."
-            )
-            self.model["next"].load_state_dict(self.model["best"].state_dict())
-            self.model["next"].eval()
-            self.optimizer = torch.optim.SGD(
-                self.model["next"].parameters(),
-                lr=config.INITIAL_LR,
-                momentum=0.9,
-            )
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
-            )
-            self.main_pipe.send({"status": "LOAD_DONE"})
-            logging.info("Lightweight checkpoint loading complete.")
         elif command == "STOP":
             self.stop_event.set()
 
@@ -482,8 +461,6 @@ def main(args):
 
     run = wandb.init(
         project=config.WANDB_PROJECT_NAME,
-        id=config.WANDB_RUN_ID,
-        resume="allow",
         job_type="training",
     )
 
@@ -550,28 +527,6 @@ def main(args):
         run.log_artifact(artifact, aliases=["latest", f"gen-{generation}", model_id])
         logging.info("Checkpoint artifact uploaded to W&B.")
 
-    def load_checkpoint(run, cfg):
-        logging.info("\n--- Resuming from lightweight checkpoint ---")
-        artifact = run.use_artifact(f"{cfg.CHECKPOINT_NAME}:latest")
-        logging.info(f"Using artifact: {artifact.name}")
-        artifact_dir = artifact.download()
-        checkpoint_file = next(f for f in os.listdir(artifact_dir) if f.endswith(".pt"))
-        checkpoint_path = os.path.join(artifact_dir, checkpoint_file)
-        logging.info(f"Downloaded checkpoint to {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        start_generation = checkpoint["generation"] + 1
-        loaded_model_id = checkpoint.get("model_id")
-        if loaded_model_id:
-            logging.info(f"Loaded checkpoint model id: {loaded_model_id}")
-        else:
-            loaded_model_id = weight_hash(checkpoint["best_model_state_dict"].values())
-            logging.info(f"Computed checkpoint model id: {loaded_model_id}")
-        gpu_states = {"best_model_state_dict": checkpoint["best_model_state_dict"]}
-        gpu_request_queue.put(("LOAD_CHECKPOINT_DATA", gpu_states))
-        main_gpu_pipe_recv.recv()
-        logging.info(f"--- Resuming training from generation {start_generation} ---")
-        return start_generation, loaded_model_id
-
     accelerator_worker = GPU(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
     )
@@ -592,10 +547,7 @@ def main(args):
     )
 
     start_generation = 1
-    if run.resumed:
-        start_generation, current_model_id = load_checkpoint(run, config)
-    else:
-        current_model_id = get_current_model_id()
+    current_model_id = get_current_model_id()
 
     v_resign = config.RESIGNATION_THRESHOLD
 
