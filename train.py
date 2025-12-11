@@ -25,6 +25,12 @@ from network import AlphaGoZero
 from ring import Ring
 
 
+LOGGING_CONFIG = {
+    "level": logging.INFO,
+    "format": "%(asctime)s - %(processName)s - %(message)s",
+}
+
+
 def action_to_coords(action, board):
     if action == board * board:
         return board, board
@@ -98,10 +104,7 @@ class Worker:
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
         cls.buffer = buffer
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-        )
+        logging.basicConfig(**LOGGING_CONFIG)
 
     def __init__(self):
         self.worker_id = current_process()._identity[0] % len(self.result_pipes)
@@ -120,7 +123,7 @@ class Worker:
             ),
         }
 
-    def self_play(self, network, weight_hash, allow_resign, v_resign):
+    def selfplay(self, network, weight_hash, allow_resign, v_resign):
         state = State(config.board)
         mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
 
@@ -138,7 +141,7 @@ class Worker:
             if game_over:
                 break
 
-            mcts.simulate(network, weight_hash, root, state, config.NUM_SIMULATIONS)
+            mcts.simulate(network, weight_hash, root, state, config.mcts)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, state, temp)
@@ -248,7 +251,7 @@ class Worker:
                 network = self.net["next"]
                 weight_hash = next_hash
 
-            mcts.simulate(network, weight_hash, root, state, config.NUM_SIMULATIONS)
+            mcts.simulate(network, weight_hash, root, state, config.mcts)
 
             act_prob = mcts.get_act_prob(root, state, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
@@ -258,9 +261,9 @@ class Worker:
 
             root = root.get_child(act_to_play)
 
-    def self_play_task(weight_hash, allow_resign, v_resign):
+    def selfplay_task(weight_hash, allow_resign, v_resign):
         worker = Worker()
-        return worker.self_play(worker.net["best"], weight_hash, allow_resign, v_resign)
+        return worker.selfplay(worker.net["best"], weight_hash, allow_resign, v_resign)
 
     def eval_task(best_hash, next_hash):
         worker = Worker()
@@ -304,10 +307,7 @@ class GPU(Process):
         )
 
     def run(self):
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-        )
+        logging.basicConfig(**LOGGING_CONFIG)
 
         self._init_model()
 
@@ -371,7 +371,6 @@ class GPU(Process):
             }
             self.main_pipe.send(hashes)
         elif command == "GET_CHECKPOINT_DATA":
-            logging.info("Gathering best model state for lightweight checkpoint...")
             states = {
                 "best_model_state_dict": {
                     k: v.cpu() for k, v in self.model["best"].state_dict().items()
@@ -491,10 +490,7 @@ class NetWrapper:
 def main(args):
     set_start_method("spawn", force=True)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(processName)s - %(levelname)s - %(message)s",
-    )
+    logging.basicConfig(**LOGGING_CONFIG)
 
     run = wandb.init(
         project=config.WANDB_PROJECT_NAME,
@@ -511,6 +507,25 @@ def main(args):
     v_resign_dict = {}
     current_model_id = None
     whr = whole_history_rating.Base()
+
+    def save_checkpoint(cycle, run, cfg):
+        gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
+        gpu_state = main_gpu_pipe_recv.recv()
+        model_id = weight_hash(gpu_state["best_model_state_dict"].values())
+        checkpoint_data = {
+            "cycle": cycle,
+            "best_model_state_dict": gpu_state["best_model_state_dict"],
+            "model_id": model_id,
+            "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
+        }
+        filename = f"checkpoint_cycle_{cycle}.pt"
+        torch.save(checkpoint_data, filename)
+        artifact = wandb.Artifact(
+            name=model_id,
+            type="model-checkpoint",
+        )
+        artifact.add_file(filename)
+        run.log_artifact(artifact, aliases=["latest", f"cycle-{cycle}", model_id])
 
     def update_whr_with_results(results, best_id, next_id, time_step):
         for result in results:
@@ -539,31 +554,6 @@ def main(args):
         gpu_hashes = main_gpu_pipe_recv.recv()
         return gpu_hashes
 
-    def save_checkpoint(generation, run, cfg):
-        gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
-        gpu_state = main_gpu_pipe_recv.recv()
-        model_id = weight_hash(gpu_state["best_model_state_dict"].values())
-        checkpoint_data = {
-            "generation": generation,
-            "best_model_state_dict": gpu_state["best_model_state_dict"],
-            "model_id": model_id,
-            "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
-        }
-        filename = f"checkpoint_gen_{generation}.pt"
-        torch.save(checkpoint_data, filename)
-        artifact = wandb.Artifact(
-            name=cfg.CHECKPOINT_NAME,
-            type="model-checkpoint",
-            description=(
-                f"Lightweight checkpoint after generation {generation}. "
-                "Contains 'best' model weights."
-            ),
-            metadata={"generation": generation, "model_id": model_id},
-        )
-        artifact.add_file(filename)
-        run.log_artifact(artifact, aliases=["latest", f"gen-{generation}", model_id])
-        logging.info("Checkpoint artifact uploaded to W&B.")
-
     accelerator_worker = GPU(
         gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
     )
@@ -583,50 +573,47 @@ def main(args):
         f"Started a CPU worker pool with {num_cpu_workers} workers and 1 GPU process."
     )
 
-    start_generation = 1
     current_model_id = get_current_model_id()
 
     v_resign = config.RESIGNATION_THRESHOLD
 
-    active_sp_tasks = {}
-
     def dispatch_sp_task(weight_hash, allow_resign, v_resign):
         return cpu_worker_pool.apply_async(
-            Worker.self_play_task,
+            Worker.selfplay_task,
             args=(weight_hash, allow_resign, v_resign),
         )
 
-    min_initial_data = config.BATCH_SIZE * 20
-    if len(buffer) < min_initial_data:
-        logging.info(f"--- Starting initial buffer fill (current: {len(buffer)}) ---")
-        for worker_id in range(num_cpu_workers):
-            if worker_id not in active_sp_tasks:
-                allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    current_model_id, allow_resign, v_resign
-                )
-        while len(buffer) < min_initial_data:
-            done_workers = [
-                worker_id
-                for worker_id, result in active_sp_tasks.items()
-                if result.ready()
-            ]
-            for worker_id in done_workers:
-                game_result = active_sp_tasks[worker_id].get()
-                if game_result:
-                    result_hash = game_result.get("weight_hash", current_model_id)
-                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
-                allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    current_model_id, allow_resign, v_resign
-                )
-            time.sleep(60)
-        logging.info("\n--- Initial fill complete. Starting main training loop. ---\n")
+    def run_selfplay_games(num_games, weight_hash, v_resign):
+        games_dispatched = 0
+        games_completed = 0
+        active_tasks = []
 
-    for generation in range(start_generation, config.MAX_GENERATIONS + 1):
-        logging.info(f"--- Generation {generation}/{config.MAX_GENERATIONS} ---")
-        log_data = {"generation": generation}
-        run.log(log_data, step=generation, commit=False)
+        while games_completed < num_games:
+            while len(active_tasks) < num_cpu_workers and games_dispatched < num_games:
+                allow_resign = games_dispatched % 10 != 0
+                active_tasks.append(
+                    dispatch_sp_task(weight_hash, allow_resign, v_resign)
+                )
+                games_dispatched += 1
+
+            ready_tasks = [task for task in active_tasks if task.ready()]
+            if not ready_tasks:
+                time.sleep(1)
+                continue
+
+            for task in ready_tasks:
+                game_result = task.get()
+                if game_result:
+                    result_hash = game_result.get("weight_hash", weight_hash)
+                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
+                active_tasks.remove(task)
+                games_completed += 1
+
+    cycle = 1
+    while True:
+        logging.info(f"cycle {cycle}")
+        log_data = {"cycle": cycle}
+        run.log(log_data, step=cycle, commit=False)
 
         model_resign_data = v_resign_dict.get(current_model_id)
         if model_resign_data:
@@ -634,41 +621,13 @@ def main(args):
             v_resign = max(config.RESIGNATION_THRESHOLD, model_resign_data[idx])
             logging.info(f"weight {current_model_id}: v_resign {v_resign}")
 
-        logging.info("[1/3] Managing self-play pool and training...")
-        done_workers = []
-        for worker_id, result in list(active_sp_tasks.items()):
-            if result.ready():
-                game_result = result.get()
-                if game_result:
-                    result_hash = game_result.get("weight_hash", current_model_id)
-                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
-                done_workers.append(worker_id)
+        logging.info("selfplay")
+        run_selfplay_games(config.selfplay, current_model_id, v_resign)
 
-        for worker_id in done_workers:
-            allow_resign = worker_id % 10 != 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(
-                current_model_id, allow_resign, v_resign
-            )
-
-        for worker_id in range(num_cpu_workers):
-            if worker_id not in active_sp_tasks or active_sp_tasks[worker_id].ready():
-                allow_resign = worker_id % 10 != 0
-                active_sp_tasks[worker_id] = dispatch_sp_task(
-                    current_model_id, allow_resign, v_resign
-                )
-
-        if len(buffer) < config.BATCH_SIZE:
-            logging.info("Not enough data to train. Waiting for more games...")
-            time.sleep(10)
-            continue
+        logging.info("train")
         total_loss, batches_done = 0.0, 0
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
             batch = buffer.sample(config.BATCH_SIZE)
-            if batch is None:
-                logging.warning(
-                    "\nBuffer size fell below batch size. Pausing training."
-                )
-                break
             gpu_request_queue.put(("TRAIN_BATCH", batch))
             response = main_gpu_pipe_recv.recv()
             if response["status"] == "TRAIN_DONE":
@@ -682,17 +641,8 @@ def main(args):
         gpu_request_queue.put(("STEP_SCHEDULER", None))
         avg_loss = total_loss / batches_done if batches_done > 0 else 0
         log_data.update({"training_loss": avg_loss, "buffer_size": len(buffer)})
-        logging.info("[2/3] Pausing self-play tasks to prepare for evaluation...")
-        for res in active_sp_tasks.values():
-            res.wait()
-        for worker_id, result in list(active_sp_tasks.items()):
-            game_result = result.get()
-            if game_result:
-                result_hash = game_result.get("weight_hash", current_model_id)
-                add_resign_data(result_hash, game_result.get("v_resign_tune"))
-        active_sp_tasks.clear()
 
-        logging.info("Evaluating 'next' model (self-play is paused)...")
+        logging.info("eval")
         model_hashes = get_model_hashes()
         best_model_id = model_hashes["best"]
         next_model_id = model_hashes["next"]
@@ -720,56 +670,18 @@ def main(args):
         promoted = False
         if win_rate > config.EVAL_THRESHOLD:
             logging.info(">>> New best model found! Promoting 'next' model. <<<")
-            update_whr_with_results(eval_res, best_model_id, next_model_id, generation)
+            update_whr_with_results(eval_res, best_model_id, next_model_id, cycle)
             gpu_request_queue.put(("PROMOTE_NEXT", None))
             promoted = True
         else:
             logging.info("'Next' model not strong enough. Discarding weights.")
             gpu_request_queue.put(("RESET_NEXT", None))
-        if promoted or (generation % config.CHECKPOINT_FREQUENCY == 0):
-            save_checkpoint(generation, run, config)
-        run.log(log_data, step=generation)
-        logging.info(
-            "Evaluation complete. Resuming self-play for the next generation..."
-        )
+        if promoted:
+            save_checkpoint(cycle, run, config)
+        run.log(log_data, step=cycle)
+
         current_model_id = get_current_model_id()
-        for worker_id in range(num_cpu_workers):
-            allow_resign = worker_id % 10 != 0
-            active_sp_tasks[worker_id] = dispatch_sp_task(
-                current_model_id, allow_resign, v_resign
-            )
-
-    logging.info("\nTraining complete! Shutting down...")
-    final_generation = locals().get("generation", config.MAX_GENERATIONS)
-    gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
-    gpu_state = main_gpu_pipe_recv.recv()
-    best_model_state_dict = gpu_state.get("best_model_state_dict")
-    final_model_id = weight_hash(best_model_state_dict.values())
-    torch.save(best_model_state_dict, "alphago-zero.pt")
-    final_model_artifact = wandb.Artifact(
-        "final-model",
-        type="model",
-        description="Final 'best' model after all training generations.",
-        metadata={"generation": final_generation, "model_id": final_model_id},
-    )
-    final_model_artifact.add_file("alphago-zero.pt")
-    run.log_artifact(final_model_artifact, aliases=["final", final_model_id])
-
-    if "generation" in locals():
-        save_checkpoint(final_generation, run, config)
-    cpu_worker_pool.terminate()
-    cpu_worker_pool.join()
-    accelerator_worker.terminate()
-    accelerator_worker.join()
-    gpu_request_queue.close()
-    gpu_request_queue.join_thread()
-    for conn in worker_conns:
-        conn.close()
-    for conn in gpu_result_conns:
-        conn.close()
-    main_gpu_pipe_recv.close()
-    main_gpu_pipe_send.close()
-    run.finish()
+        cycle += 1
 
 
 if __name__ == "__main__":
