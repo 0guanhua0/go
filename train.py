@@ -144,7 +144,7 @@ class Worker:
             mcts.simulate(network, weight_hash, root, state, config.mcts)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
-            act_prob = mcts.get_act_prob(root, state, temp)
+            act_prob = mcts.get_act_prob(root, temp)
             root_val = sum(
                 prob * root.mean_act_val().get(act) for act, prob in act_prob.items()
             )
@@ -253,7 +253,7 @@ class Worker:
 
             mcts.simulate(network, weight_hash, root, state, config.mcts)
 
-            act_prob = mcts.get_act_prob(root, state, temp=0)
+            act_prob = mcts.get_act_prob(root, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
             sgf_node = set_sgf(sgf_node, state.current_player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)

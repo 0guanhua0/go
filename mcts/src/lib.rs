@@ -258,7 +258,7 @@ impl State {
         }
 
         let black_score: f32 = tmp.board.iter().filter(|&&s| s == 1).count() as f32;
-        let white_score: f32 = (self.board_size * self.board_size) as f32 - black_score + KOMI;
+        let white_score: f32 = tmp.board.iter().filter(|&&s| s == -1).count() as f32 + KOMI;
 
         (black_score, white_score)
     }
@@ -639,7 +639,6 @@ impl MCTS {
         &self,
         py: Python<'py>,
         root: &Node,
-        state: &State,
         temp: f32,
     ) -> PyResult<Bound<'py, PyDict>> {
         let act_prob = PyDict::new(py);
@@ -738,15 +737,56 @@ mod tests {
 
     #[test]
     fn superko() {
-        let size: usize = 19;
+        let size: usize = 4;
         let mut state = State::new(size);
-        let game = [(1, 0), (1, 1), (0, 1), (2, 1), (1, 2), (3, 1), (0, 3)];
-        for &(r, c) in &game {
-            state.apply_move(r, c, state.current_player());
+
+        #[rustfmt::skip]
+        let board = [" b b",
+                     "bwb ",
+                     " w  ",
+                     " w  "];
+
+        for (r, row) in board.iter().enumerate() {
+            for (c, ch) in row.chars().enumerate() {
+                match ch {
+                    'b' => state.set(r, c, 1),
+                    'w' => state.set(r, c, -1),
+                    ' ' => {}
+                    _ => {}
+                }
+            }
         }
 
-        assert!(!state.check(0, 0, state.current_player));
-        assert!(!state.check(0, 2, state.current_player));
+        assert!(!state.check(0, 0, -1));
+        assert!(!state.check(0, 2, -1));
+    }
+
+    #[test]
+    fn score() {
+        let size: usize = 5;
+        let mut state = State::new(size);
+
+        #[rustfmt::skip]
+        let board = ["bbbbb",
+                     "wwb b",
+                     " bbbb",
+                     "wwbbb",
+                     "bbbbb"];
+
+        for (r, row) in board.iter().enumerate() {
+            for (c, ch) in row.chars().enumerate() {
+                match ch {
+                    'b' => state.set(r, c, 1),
+                    'w' => state.set(r, c, -1),
+                    ' ' => {}
+                    _ => {}
+                }
+            }
+        }
+
+        let (black_score, white_score) = state.get_score();
+        assert_eq!(black_score, 20.0);
+        assert_eq!(white_score, 4.0 + KOMI);
     }
 }
 
