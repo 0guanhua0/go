@@ -21,6 +21,10 @@
 
 [Elo rating system](https://en.wikipedia.org/wiki/Elo_rating_system)
 - [Whole-History Rating: A Bayesian Rating System for Players of Time-Varying Strength](https://www.remi-coulom.fr/WHR/)
+- [How Deep Is Your Go?](https://forums.online-go.com/t/how-deep-is-your-go/53060)
+```
+curl -s -F "sgfs=@<.sgf>" -F "player=<player>" https://howdeepisyourgo.org | grep "rating"
+```
 
 [Zobrist hashing](https://en.wikipedia.org/wiki/Zobrist_hashing)
 

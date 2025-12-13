@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from sgfmill import sgf
 from torch.multiprocessing import (
-    Event,
     Pipe,
     Pool,
     Process,
@@ -23,7 +22,6 @@ import wandb
 from mcts import MCTS, Node, State
 from network import AlphaGoZero
 from ring import Ring
-
 
 LOGGING_CONFIG = {
     "level": logging.INFO,
@@ -277,7 +275,6 @@ class GPU(Process):
         self.result_pipes = result_pipes
         self.main_pipe = main_pipe
         self.device = torch.device(device)
-        self.stop_event = Event()
         self.model = None
         self.optimizer = None
         self.scheduler = None
@@ -311,7 +308,7 @@ class GPU(Process):
 
         self._init_model()
 
-        while not self.stop_event.is_set():
+        while True:
             try:
                 command, payload = self.request_queue.get(timeout=1.0)
             except queue.Empty:
@@ -355,10 +352,8 @@ class GPU(Process):
         elif command == "PROMOTE_NEXT":
             self.model["best"].load_state_dict(self.model["next"].state_dict())
             self.model["best"].eval()
-            logging.info("Promoted 'next' to 'best'.")
         elif command == "RESET_NEXT":
             self.model["next"].load_state_dict(self.model["best"].state_dict())
-            logging.info("Reset 'next' weights to 'best'.")
         elif command == "STEP_SCHEDULER":
             self.scheduler.step()
             logging.info(
@@ -377,8 +372,6 @@ class GPU(Process):
                 }
             }
             self.main_pipe.send(states)
-        elif command == "STOP":
-            self.stop_event.set()
 
     def _process_inference_batch(self, requests_by_model):
         for model_name, model_requests in requests_by_model.items():
@@ -497,9 +490,9 @@ def main(args):
         job_type="training",
     )
 
-    num_cpu_workers = torch.multiprocessing.cpu_count()
+    cpu_count = torch.multiprocessing.cpu_count()
     gpu_request_queue = torch.multiprocessing.Queue()
-    all_pipes = [Pipe(duplex=False) for _ in range(num_cpu_workers)]
+    all_pipes = [Pipe(duplex=False) for _ in range(cpu_count)]
     worker_conns = [p[0] for p in all_pipes]
     gpu_result_conns = [p[1] for p in all_pipes]
     main_gpu_pipe_recv, main_gpu_pipe_send = Pipe(duplex=False)
@@ -538,7 +531,6 @@ def main(args):
                 handicap=0,
             )
         whr.auto_iterate()
-        logging.info(whr.print_ordered_ratings())
 
     def add_resign_data(weight, v_resign_tune):
         lst = v_resign_dict.setdefault(weight, [])
@@ -567,11 +559,9 @@ def main(args):
     )
     pool_init_args = (gpu_request_queue, worker_conns, buffer)
     cpu_worker_pool = Pool(
-        processes=num_cpu_workers, initializer=Worker.init, initargs=pool_init_args
+        processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
     )
-    logging.info(
-        f"Started a CPU worker pool with {num_cpu_workers} workers and 1 GPU process."
-    )
+    logging.info(f"{cpu_count} worker and 1 GPU")
 
     current_model_id = get_current_model_id()
 
@@ -589,7 +579,7 @@ def main(args):
         active_tasks = []
 
         while games_completed < num_games:
-            while len(active_tasks) < num_cpu_workers and games_dispatched < num_games:
+            while len(active_tasks) < cpu_count and games_dispatched < num_games:
                 allow_resign = games_dispatched % 10 != 0
                 active_tasks.append(
                     dispatch_sp_task(weight_hash, allow_resign, v_resign)
@@ -634,13 +624,9 @@ def main(args):
                 total_loss += response["loss"]
                 batches_done += 1
                 if batches_done % 100 == 0:
-                    logging.info(
-                        f"Training batch {batches_done}: loss={response['loss']:.4f}"
-                    )
+                    logging.info(f"step {batches_done}: loss={response['loss']:.4f}")
 
         gpu_request_queue.put(("STEP_SCHEDULER", None))
-        avg_loss = total_loss / batches_done if batches_done > 0 else 0
-        log_data.update({"training_loss": avg_loss, "buffer_size": len(buffer)})
 
         logging.info("eval")
         model_hashes = get_model_hashes()
@@ -659,22 +645,14 @@ def main(args):
         eval_res = [res.get() for res in eval_tasks]
 
         next_wins = sum(1 for r in eval_res if r is not None and r > 0)
-        draws = sum(1 for r in eval_res if r is not None and r == 0)
-        games_played = len(eval_res)
-        win_rate = next_wins / games_played if games_played > 0 else 0.0
-        logging.info(
-            f"'Next' model win rate: {win_rate:.2%} ({next_wins}/{games_played}, {draws} draws)"
-        )
-        log_data.update({"evaluation_win_rate": win_rate})
-        logging.info("[3/3] Model promotion and checkpoint phase...")
+        win_rate = next_wins / len(eval_res)
         promoted = False
         if win_rate > config.EVAL_THRESHOLD:
-            logging.info(">>> New best model found! Promoting 'next' model. <<<")
             update_whr_with_results(eval_res, best_model_id, next_model_id, cycle)
+            logging.info(whr.print_ordered_ratings(current=True))
             gpu_request_queue.put(("PROMOTE_NEXT", None))
             promoted = True
         else:
-            logging.info("'Next' model not strong enough. Discarding weights.")
             gpu_request_queue.put(("RESET_NEXT", None))
         if promoted:
             save_checkpoint(cycle, run, config)
