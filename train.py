@@ -86,7 +86,10 @@ def sum_sgf(
     root.set("RE", sgf_result)
     root.set("PB", black_hash)
     root.set("PW", white_hash)
-    filename = time.strftime("%Y%m%d-%H%M%S") + f"-{prefix}-worker-{worker_id}.sgf"
+    filename = (
+        time.strftime("%Y%m%d-%H%M%S")
+        + f"-{black_hash[:6]}vs{white_hash[:6]}-{worker_id}.sgf"
+    )
     with open(filename, "wb") as f:
         f.write(sgf_game.serialise())
     return sgf_result
@@ -237,10 +240,7 @@ class Worker:
                     black_hash=best_hash,
                     white_hash=next_hash,
                 )
-                if winner == 0:
-                    return 0
-                next_won = winner == -1
-                return 1 if next_won else -1
+                return winner
 
             if state.current_player() == 1:
                 network = self.net["best"]
@@ -349,16 +349,14 @@ class GPU(Process):
         if command == "TRAIN_BATCH":
             loss = self._train_step(*payload)
             self.main_pipe.send({"status": "TRAIN_DONE", "loss": loss})
-        elif command == "PROMOTE_NEXT":
+        elif command == "PROMOTE":
             self.model["best"].load_state_dict(self.model["next"].state_dict())
             self.model["best"].eval()
-        elif command == "RESET_NEXT":
+        elif command == "RESET":
             self.model["next"].load_state_dict(self.model["best"].state_dict())
         elif command == "STEP_SCHEDULER":
             self.scheduler.step()
-            logging.info(
-                f"Stepped LR scheduler. New LR: {self.scheduler.get_last_lr()[0]:.2e}"
-            )
+            logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
         elif command == "GET_MODEL_HASHES":
             hashes = {
                 "best": weight_hash(self.model["best"].state_dict().values()),
@@ -522,7 +520,7 @@ def main(args):
 
     def update_whr_with_results(results, best_id, next_id, time_step):
         for result in results:
-            winner = "W" if result > 0 else "B"
+            winner = "B" if result > 0 else "W"
             whr.create_game(
                 black=best_id,
                 white=next_id,
@@ -644,16 +642,18 @@ def main(args):
         ]
         eval_res = [res.get() for res in eval_tasks]
 
-        next_wins = sum(1 for r in eval_res if r is not None and r > 0)
-        win_rate = next_wins / len(eval_res)
+        best_win = eval_res.count(1) / len(eval_res)
+        next_win = eval_res.count(-1) / len(eval_res)
         promoted = False
-        if win_rate > config.EVAL_THRESHOLD:
+        if next_win > config.EVAL_THRESHOLD:
             update_whr_with_results(eval_res, best_model_id, next_model_id, cycle)
             logging.info(whr.print_ordered_ratings(current=True))
-            gpu_request_queue.put(("PROMOTE_NEXT", None))
+            logging.info(f"{best_model_id} win rate: {best_win}")
+            logging.info(f"{next_model_id} win rate: {next_win}")
+            gpu_request_queue.put(("PROMOTE", None))
             promoted = True
         else:
-            gpu_request_queue.put(("RESET_NEXT", None))
+            gpu_request_queue.put(("RESET", None))
         if promoted:
             save_checkpoint(cycle, run, config)
         run.log(log_data, step=cycle)
@@ -664,6 +664,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", required=True, help="device to run neural network")
+    parser.add_argument("--device", required=True, help="network device")
     args = parser.parse_args()
     main(args)
