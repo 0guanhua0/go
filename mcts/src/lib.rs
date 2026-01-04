@@ -280,9 +280,11 @@ impl State {
             self.rm_if_dead(r, c);
         }
 
-        self.board_history.push_front(self.board.clone());
-        if self.board_history.len() > HISTORY {
-            self.board_history.pop_back();
+        if self.board_history.len() == HISTORY {
+            self.board_history.rotate_left(1);
+            self.board_history[HISTORY - 1].clone_from(&self.board);
+        } else {
+            self.board_history.push_back(self.board.clone());
         }
         self.hash_history.insert(self.hash);
         self.move_cnt += 1;
@@ -328,14 +330,14 @@ impl State {
         let plane_size = self.board_size * self.board_size;
         let mut state_vec = vec![0.0f32; num_planes * plane_size];
 
-        for (idx, past_board) in self.board_history.iter().take(HISTORY).enumerate() {
-            let p1_idx = idx * 2 * plane_size;
-            let p2_idx = p1_idx + plane_size;
-            for i in 0..past_board.len() {
-                if past_board[i] == self.current_player {
-                    state_vec[p1_idx + i] = 1.0;
-                } else if past_board[i] == -self.current_player {
-                    state_vec[p2_idx + i] = 1.0;
+        for (idx, board) in self.board_history.iter().take(HISTORY).enumerate() {
+            let p1 = idx * 2 * plane_size;
+            let p2 = p1 + plane_size;
+            for i in 0..board.len() {
+                if board[i] == self.current_player {
+                    state_vec[p1 + i] = 1.0;
+                } else if board[i] == -self.current_player {
+                    state_vec[p2 + i] = 1.0;
                 }
             }
         }

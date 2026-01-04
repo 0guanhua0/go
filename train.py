@@ -88,7 +88,7 @@ def sum_sgf(
     root.set("PW", white_hash)
     filename = (
         time.strftime("%Y%m%d-%H%M%S")
-        + f"-{black_hash[:6]}vs{white_hash[:6]}-{worker_id}.sgf"
+        + f"-{black_hash[:6]}-{white_hash[:6]}-{worker_id}.sgf"
     )
     with open(filename, "wb") as f:
         f.write(sgf_game.serialise())
@@ -134,8 +134,7 @@ class Worker:
         history = []
         state_repr = state.get_state()
         resigned = False
-
-        black_resign, white_resign = [], []
+        v_resign_tune = {1: [], -1: []}
 
         while True:
             game_over, winner = state.check_terminate()
@@ -157,11 +156,8 @@ class Worker:
                     game_over, winner = True, -state.current_player()
                     resigned = True
                     break
-                else:
-                    if state.current_player() == 1 and not black_resign:
-                        black_resign += [root_val, max_val]
-                    elif state.current_player() == -1 and not white_resign:
-                        white_resign += [root_val, max_val]
+                elif not v_resign_tune[state.current_player()]:
+                    v_resign_tune[state.current_player()] += [root_val, max_val]
 
             policy_target = torch.zeros(config.board * config.board + 1)
             for act, prob in act_prob.items():
@@ -192,12 +188,6 @@ class Worker:
 
         self.buffer.add(data)
 
-        v_resign_tune = []
-        if winner == 1 and black_resign:
-            v_resign_tune.extend(black_resign)
-        elif winner == -1 and white_resign:
-            v_resign_tune.extend(white_resign)
-
         sgf_result = sum_sgf(
             sgf_game,
             state,
@@ -217,7 +207,7 @@ class Worker:
 
         return {
             "moves": len(data),
-            "v_resign_tune": v_resign_tune,
+            "v_resign_tune": v_resign_tune.get(winner),
             "weight_hash": weight_hash,
         }
 
