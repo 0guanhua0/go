@@ -281,10 +281,10 @@ impl State {
         }
 
         if self.board_history.len() == HISTORY {
-            self.board_history.rotate_left(1);
-            self.board_history[HISTORY - 1].clone_from(&self.board);
+            self.board_history.rotate_right(1);
+            self.board_history[0].clone_from(&self.board);
         } else {
-            self.board_history.push_back(self.board.clone());
+            self.board_history.push_front(self.board.clone());
         }
         self.hash_history.insert(self.hash);
         self.move_cnt += 1;
@@ -325,31 +325,36 @@ impl State {
         }
     }
 
-    fn get_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
-        let num_planes = 2 * HISTORY + 1;
+    fn _get_feature(&self) -> Vec<f32> {
+        let plane_cnt = 2 * HISTORY + 1;
         let plane_size = self.board_size * self.board_size;
-        let mut state_vec = vec![0.0f32; num_planes * plane_size];
+        let mut feature = vec![0.0f32; plane_cnt * plane_size];
 
         for (idx, board) in self.board_history.iter().take(HISTORY).enumerate() {
             let p1 = idx * 2 * plane_size;
             let p2 = p1 + plane_size;
             for i in 0..board.len() {
                 if board[i] == self.current_player {
-                    state_vec[p1 + i] = 1.0;
+                    feature[p1 + i] = 1.0;
                 } else if board[i] == -self.current_player {
-                    state_vec[p2 + i] = 1.0;
+                    feature[p2 + i] = 1.0;
                 }
             }
         }
 
         if self.current_player == 1 {
             let idx = 2 * HISTORY * plane_size;
-            state_vec[idx..idx + plane_size].fill(1.0);
+            feature[idx..idx + plane_size].fill(1.0);
         }
+        feature
+    }
 
-        let dims = IxDyn(&[num_planes, self.board_size, self.board_size]);
+    fn get_feature<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray<f32, IxDyn>>> {
+        let plane_cnt = 2 * HISTORY + 1;
+        let feature = self._get_feature();
+        let dims = IxDyn(&[plane_cnt, self.board_size, self.board_size]);
 
-        Ok(state_vec.to_pyarray(py).reshape(dims)?.to_owned())
+        Ok(feature.to_pyarray(py).reshape(dims)?.to_owned())
     }
 }
 
@@ -503,7 +508,7 @@ impl MCTS {
         num_simulations: usize,
     ) -> PyResult<()> {
         if root.children.is_empty() {
-            let state_repr = state.get_state(py)?;
+            let state_repr = state.get_feature(py)?;
             let np = PyModule::import(py, "numpy")?;
             let batch_repr = np.call_method1("expand_dims", (state_repr, 0))?;
 
@@ -596,7 +601,7 @@ impl MCTS {
         if !leaves_to_evaluate.is_empty() {
             let mut state_reps = Vec::with_capacity(leaves_to_evaluate.len());
             for leaf in &leaves_to_evaluate {
-                state_reps.push(leaf.state.get_state(py)?);
+                state_reps.push(leaf.state.get_feature(py)?);
             }
             let np = PyModule::import(py, "numpy")?;
             let batch_numpy_array = np.call_method1("stack", (state_reps,))?;

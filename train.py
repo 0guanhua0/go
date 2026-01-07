@@ -132,7 +132,7 @@ class Worker:
 
         root = Node()
         history = []
-        state_repr = state.get_state()
+        state_repr = state.get_feature()
         resigned = False
         v_resign_tune = {1: [], -1: []}
 
@@ -177,7 +177,7 @@ class Worker:
 
             x, y = action_to_coords(act_to_play, config.board)
             state.apply_move(x, y, state.current_player())
-            state_repr = state.get_state()
+            state_repr = state.get_feature()
 
             root = root.get_child(act_to_play)
 
