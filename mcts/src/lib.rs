@@ -46,7 +46,6 @@ fn zobrist_idx(player: i8) -> usize {
 pub struct State {
     board_size: usize,
     board: Vec<i8>,
-    current_player: i8,
     board_history: VecDeque<Vec<i8>>,
     pass_consecutive: usize,
     move_cnt: usize,
@@ -192,7 +191,6 @@ impl State {
         State {
             board_size,
             board,
-            current_player: 1,
             board_history,
             pass_consecutive: 0,
             move_cnt: 0,
@@ -205,8 +203,8 @@ impl State {
         self.move_cnt
     }
 
-    fn current_player(&self) -> i8 {
-        self.current_player
+    fn player(&self) -> i8 {
+        if self.move_cnt % 2 == 0 { 1 } else { -1 }
     }
 
     fn get_score(&self) -> (f32, f32) {
@@ -288,7 +286,6 @@ impl State {
         }
         self.hash_history.insert(self.hash);
         self.move_cnt += 1;
-        self.current_player = -player;
     }
 
     fn get_act(&self) -> Vec<usize> {
@@ -296,7 +293,7 @@ impl State {
 
         for r in 0..self.board_size {
             for c in 0..self.board_size {
-                if self.check(r, c, self.current_player) {
+                if self.check(r, c, self.player()) {
                     act.push(r * self.board_size + c);
                 }
             }
@@ -334,15 +331,15 @@ impl State {
             let p1 = idx * 2 * plane_size;
             let p2 = p1 + plane_size;
             for i in 0..board.len() {
-                if board[i] == self.current_player {
+                if board[i] == self.player() {
                     feature[p1 + i] = 1.0;
-                } else if board[i] == -self.current_player {
+                } else if board[i] == -self.player() {
                     feature[p2 + i] = 1.0;
                 }
             }
         }
 
-        if self.current_player == 1 {
+        if self.player() == 1 {
             let idx = 2 * HISTORY * plane_size;
             feature[idx..idx + plane_size].fill(1.0);
         }
@@ -548,7 +545,7 @@ impl MCTS {
                     let act = node.select(self.c_puct).unwrap();
                     path.push((node, act));
                     let board_size = state_curr.board_size;
-                    let player = state_curr.current_player;
+                    let player = state_curr.player();
                     let (row, col) = if act == board_size * board_size {
                         (board_size, board_size)
                     } else {
@@ -562,7 +559,7 @@ impl MCTS {
 
                 let (is_over, winner) = state_curr.check_terminate();
                 if is_over {
-                    let value = (winner.unwrap() * state.current_player) as f32;
+                    let value = (winner.unwrap() * state.player()) as f32;
                     SimulationResult::Terminal { path, value }
                 } else if let Some(entry) = self
                     .transposition_table

@@ -153,11 +153,11 @@ class Worker:
             max_val = root.mean_act_val().get(max_act)
             if root_val < v_resign and max_val < v_resign:
                 if allow_resign:
-                    game_over, winner = True, -state.current_player()
+                    game_over, winner = True, -state.player()
                     resigned = True
                     break
-                elif not v_resign_tune[state.current_player()]:
-                    v_resign_tune[state.current_player()] += [root_val, max_val]
+                elif not v_resign_tune[state.player()]:
+                    v_resign_tune[state.player()] += [root_val, max_val]
 
             policy_target = torch.zeros(config.board * config.board + 1)
             for act, prob in act_prob.items():
@@ -167,16 +167,16 @@ class Worker:
                 (
                     state_repr,
                     policy_target,
-                    state.current_player(),
+                    state.player(),
                     root_val,
                 )
             )
             act_to_play = torch.multinomial(policy_target, 1).item()
 
-            sgf_node = set_sgf(sgf_node, state.current_player(), act_to_play)
+            sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
 
             x, y = action_to_coords(act_to_play, config.board)
-            state.apply_move(x, y, state.current_player())
+            state.apply_move(x, y, state.player())
             state_repr = state.get_feature()
 
             root = root.get_child(act_to_play)
@@ -232,7 +232,7 @@ class Worker:
                 )
                 return winner
 
-            if state.current_player() == 1:
+            if state.player() == 1:
                 network = self.net["best"]
                 weight_hash = best_hash
             else:
@@ -243,9 +243,9 @@ class Worker:
 
             act_prob = mcts.get_act_prob(root, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
-            sgf_node = set_sgf(sgf_node, state.current_player(), act_to_play)
+            sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)
-            state.apply_move(x, y, state.current_player())
+            state.apply_move(x, y, state.player())
 
             root = root.get_child(act_to_play)
 
