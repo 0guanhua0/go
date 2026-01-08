@@ -43,9 +43,9 @@ fn zobrist_idx(player: i8) -> usize {
 
 #[pyclass]
 #[derive(Clone)]
-pub struct State {
-    pub board_size: usize,
-    pub board: Vec<i8>,
+struct State {
+    board_size: usize,
+    board: Vec<i8>,
     board_history: VecDeque<Vec<i8>>,
     pass_consecutive: usize,
     move_cnt: usize,
@@ -749,8 +749,8 @@ mod tests {
         for (r, row) in board.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
                 match ch {
-                    'b' => state.board[r * state.board_size + c] = 1,
-                    'w' => state.board[r * state.board_size + c] = -1,
+                    'b' => state.set(r, c, 1),
+                    'w' => state.set(r, c, -1),
                     ' ' => {}
                     _ => {}
                 }
@@ -776,8 +776,8 @@ mod tests {
         for (r, row) in board.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
                 match ch {
-                    'b' => state.board[r * state.board_size + c] = 1,
-                    'w' => state.board[r * state.board_size + c] = -1,
+                    'b' => state.set(r, c, 1),
+                    'w' => state.set(r, c, -1),
                     ' ' => {}
                     _ => {}
                 }
