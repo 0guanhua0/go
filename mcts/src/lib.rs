@@ -501,11 +501,11 @@ impl MCTS {
         num_simulations: usize,
     ) -> PyResult<()> {
         if root.children.is_empty() {
-            let state_repr = state.get_feature(py)?;
+            let feature = state.get_feature(py)?;
             let np = PyModule::import(py, "numpy")?;
-            let batch_repr = np.call_method1("expand_dims", (state_repr, 0))?;
+            let batch = np.call_method1("expand_dims", (feature, 0))?;
 
-            let result = network.call_method1(py, "infer", (batch_repr,))?;
+            let result = network.call_method1(py, "infer", (batch,))?;
             let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
                 result.extract(py)?;
 

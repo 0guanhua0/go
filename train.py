@@ -300,132 +300,100 @@ class GPU(Process):
 
         while True:
             try:
-                command, payload = self.request_queue.get(timeout=1.0)
+                command, payload = self.request_queue.get()
             except queue.Empty:
                 continue
 
-            other_commands, requests_by_model = self._drain_queue(command, payload)
-
-            if requests_by_model:
-                self._process_inference_batch(requests_by_model)
-
-            for cmd, pld in other_commands:
-                self._handle_command(cmd, pld)
-
-    def _drain_queue(self, first_cmd, first_payload):
-        other_commands = []
-        requests_by_model = {"best": [], "next": []}
-
-        if first_cmd == "INFER":
-            worker_id, model_name, state_batch = first_payload
-            requests_by_model[model_name].append((worker_id, state_batch))
-        else:
-            other_commands.append((first_cmd, first_payload))
-
-        while True:
-            try:
-                command, payload = self.request_queue.get_nowait()
-                if command == "INFER":
-                    worker_id, model_name, state_batch = payload
-                    requests_by_model[model_name].append((worker_id, state_batch))
-                else:
-                    other_commands.append((command, payload))
-            except queue.Empty:
-                break
-
-        return other_commands, requests_by_model
-
-    def _handle_command(self, command, payload):
-        if command == "TRAIN_BATCH":
-            loss = self._train_step(*payload)
-            self.main_pipe.send({"status": "TRAIN_DONE", "loss": loss})
-        elif command == "PROMOTE":
-            self.model["best"].load_state_dict(self.model["next"].state_dict())
-            self.model["best"].eval()
-        elif command == "RESET":
-            self.model["next"].load_state_dict(self.model["best"].state_dict())
-        elif command == "STEP_SCHEDULER":
-            self.scheduler.step()
-            logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
-        elif command == "GET_MODEL_HASHES":
-            hashes = {
-                "best": weight_hash(self.model["best"].state_dict().values()),
-                "next": weight_hash(self.model["next"].state_dict().values()),
-            }
-            self.main_pipe.send(hashes)
-        elif command == "GET_CHECKPOINT_DATA":
-            states = {
-                "best_model_state_dict": {
-                    k: v.cpu() for k, v in self.model["best"].state_dict().items()
+            if command == "INFER":
+                worker_id, model_name, state_batch = payload
+                self._infer(model_name, [(worker_id, state_batch)])
+            elif command == "TRAIN_BATCH":
+                loss = self._train_step(*payload)
+                self.main_pipe.send({"status": "TRAIN_DONE", "loss": loss})
+            elif command == "PROMOTE":
+                self.model["best"].load_state_dict(self.model["next"].state_dict())
+                self.model["best"].eval()
+            elif command == "RESET":
+                self.model["next"].load_state_dict(self.model["best"].state_dict())
+            elif command == "STEP_SCHEDULER":
+                self.scheduler.step()
+                logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
+            elif command == "GET_MODEL_HASHES":
+                hashes = {
+                    "best": weight_hash(self.model["best"].state_dict().values()),
+                    "next": weight_hash(self.model["next"].state_dict().values()),
                 }
-            }
-            self.main_pipe.send(states)
+                self.main_pipe.send(hashes)
+            elif command == "GET_CHECKPOINT_DATA":
+                states = {
+                    "best_model_state_dict": {
+                        k: v.cpu() for k, v in self.model["best"].state_dict().items()
+                    }
+                }
+                self.main_pipe.send(states)
 
-    def _process_inference_batch(self, requests_by_model):
-        for model_name, model_requests in requests_by_model.items():
-            if not model_requests:
-                continue
+    def _infer(self, model_name, model_requests):
+        if not model_requests:
+            return
 
-            worker_ids, state_batches = zip(*model_requests)
+        worker_ids, state_batches = zip(*model_requests)
 
-            tensor_batches = []
-            dihedral_batch = []
-            transform = []
-            for state_batch in state_batches:
-                if isinstance(state_batch, torch.Tensor):
-                    tensor_batch = state_batch.to(dtype=torch.float32)
-                else:
-                    tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
+        tensor_batches = []
+        dihedral_batch = []
+        transform = []
+        for state_batch in state_batches:
+            if isinstance(state_batch, torch.Tensor):
+                tensor_batch = state_batch.to(dtype=torch.float32)
+            else:
+                tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
 
-                tensor_batches.append(tensor_batch.contiguous())
+            tensor_batches.append(tensor_batch.contiguous())
 
-                idx = torch.randint(
-                    low=0,
-                    high=len(dihedral.apply),
-                    size=(tensor_batch.shape[0],),
+            idx = torch.randint(
+                low=0,
+                high=len(dihedral.apply),
+                size=(tensor_batch.shape[0],),
+            )
+
+            transform_id_tensor = [
+                dihedral.apply[int(idx.item())](sample)
+                for sample, idx in zip(tensor_batch, idx)
+            ]
+            transform_id_batch = torch.stack(transform_id_tensor, dim=0).contiguous()
+
+            dihedral_batch.append(transform_id_batch)
+            transform.append(idx.tolist())
+
+        batch = torch.cat(dihedral_batch, dim=0).to(self.device)
+
+        model = self.model[model_name]
+
+        with torch.no_grad():
+            policy_logits, value_preds = model(batch)
+            policy_batch = F.softmax(policy_logits, dim=1).cpu()
+            value_preds_batch = value_preds.cpu()
+
+        start_index = 0
+        for i, worker_id in enumerate(worker_ids):
+            num_samples = tensor_batches[i].shape[0]
+            end_index = start_index + num_samples
+            policy_result = policy_batch[start_index:end_index].contiguous()
+            value_result = (
+                value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
+            )
+
+            for sample, transform_id in enumerate(transform[i]):
+                policy_plane = policy_result[sample, :-1].view(
+                    config.board, config.board
                 )
+                reverse_id = dihedral.reverse[int(transform_id)]
+                restored_policy = dihedral.apply[reverse_id](policy_plane)
+                policy_result[sample, :-1] = restored_policy.reshape(-1)
 
-                transform_id_tensor = [
-                    dihedral.apply[int(idx.item())](sample)
-                    for sample, idx in zip(tensor_batch, idx)
-                ]
-                transform_id_batch = torch.stack(
-                    transform_id_tensor, dim=0
-                ).contiguous()
-
-                dihedral_batch.append(transform_id_batch)
-                transform.append(idx.tolist())
-
-            batch = torch.cat(dihedral_batch, dim=0).to(self.device)
-
-            model = self.model[model_name]
-
-            with torch.no_grad():
-                policy_logits, value_preds = model(batch)
-                policy_batch = F.softmax(policy_logits, dim=1).cpu()
-                value_preds_batch = value_preds.cpu()
-
-            start_index = 0
-            for i, worker_id in enumerate(worker_ids):
-                num_samples = tensor_batches[i].shape[0]
-                end_index = start_index + num_samples
-                policy_result = policy_batch[start_index:end_index].contiguous()
-                value_result = (
-                    value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
-                )
-
-                for sample, transform_id in enumerate(transform[i]):
-                    policy_plane = policy_result[sample, :-1].view(
-                        config.board, config.board
-                    )
-                    reverse_id = dihedral.reverse[int(transform_id)]
-                    restored_policy = dihedral.apply[reverse_id](policy_plane)
-                    policy_result[sample, :-1] = restored_policy.reshape(-1)
-
-                self.result_pipes[worker_id].send(
-                    (policy_result.clone(), value_result.clone())
-                )
-                start_index = end_index
+            self.result_pipes[worker_id].send(
+                (policy_result.clone(), value_result.clone())
+            )
+            start_index = end_index
 
     def _train_step(self, state, policy, value):
         self.model["next"].train()
