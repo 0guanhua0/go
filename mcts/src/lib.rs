@@ -44,8 +44,8 @@ fn zobrist_idx(player: i8) -> usize {
 #[pyclass]
 #[derive(Clone)]
 pub struct State {
-    board_size: usize,
-    board: Vec<i8>,
+    pub board_size: usize,
+    pub board: Vec<i8>,
     board_history: VecDeque<Vec<i8>>,
     pass_consecutive: usize,
     move_cnt: usize,
@@ -56,10 +56,6 @@ pub struct State {
 impl State {
     fn get(&self, r: usize, c: usize) -> i8 {
         self.board[r * self.board_size + c]
-    }
-
-    fn set(&mut self, r: usize, c: usize, val: i8) {
-        self.board[r * self.board_size + c] = val;
     }
 
     fn neighbors(&self, r: usize, c: usize) -> Vec<(usize, usize)> {
@@ -116,7 +112,7 @@ impl State {
         if liberty.is_empty() {
             for (gr, gc) in group {
                 self.hash ^= ZOBRIST_TABLE.key[gr][gc][zobrist_idx(color)];
-                self.set(gr, gc, 0);
+                self.board[gr * self.board_size + gc] = 0;
             }
         }
     }
@@ -249,7 +245,7 @@ impl State {
 
                 if owner != 0 {
                     for (rr, rc) in region {
-                        tmp.set(rr, rc, owner);
+                        tmp.board[rr * tmp.board_size + rc] = owner;
                     }
                 }
             }
@@ -260,14 +256,14 @@ impl State {
 
         (black_score, white_score)
     }
-    fn apply_move(&mut self, r: usize, c: usize, player: i8) {
+    fn set(&mut self, r: usize, c: usize, player: i8) {
         if r == self.board_size && c == self.board_size {
             self.pass_consecutive += 1;
         } else {
             self.pass_consecutive = 0;
 
             self.hash ^= ZOBRIST_TABLE.key[r][c][zobrist_idx(player)];
-            self.set(r, c, player);
+            self.board[r * self.board_size + c] = player;
 
             for (nr, nc) in self.neighbors(r, c) {
                 if self.get(nr, nc) == -player {
@@ -551,7 +547,7 @@ impl MCTS {
                     } else {
                         (act / board_size, act % board_size)
                     };
-                    state_curr.apply_move(row, col, player);
+                    state_curr.set(row, col, player);
 
                     let child_ref = node.children.get(&act).unwrap();
                     node = unsafe { &*(child_ref.value() as *const Node) };
@@ -753,8 +749,8 @@ mod tests {
         for (r, row) in board.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
                 match ch {
-                    'b' => state.set(r, c, 1),
-                    'w' => state.set(r, c, -1),
+                    'b' => state.board[r * state.board_size + c] = 1,
+                    'w' => state.board[r * state.board_size + c] = -1,
                     ' ' => {}
                     _ => {}
                 }
@@ -780,8 +776,8 @@ mod tests {
         for (r, row) in board.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
                 match ch {
-                    'b' => state.set(r, c, 1),
-                    'w' => state.set(r, c, -1),
+                    'b' => state.board[r * state.board_size + c] = 1,
+                    'w' => state.board[r * state.board_size + c] = -1,
                     ' ' => {}
                     _ => {}
                 }

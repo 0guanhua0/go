@@ -176,7 +176,7 @@ class Worker:
             sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
 
             x, y = action_to_coords(act_to_play, config.board)
-            state.apply_move(x, y, state.player())
+            state.set(x, y, state.player())
             state_repr = state.get_feature()
 
             root = root.get_child(act_to_play)
@@ -245,7 +245,7 @@ class Worker:
             act_to_play = max(act_prob, key=act_prob.get)
             sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)
-            state.apply_move(x, y, state.player())
+            state.set(x, y, state.player())
 
             root = root.get_child(act_to_play)
 
