@@ -1,7 +1,6 @@
 import argparse
 import hashlib
 import logging
-import queue
 import time
 
 import torch
@@ -299,10 +298,7 @@ class GPU(Process):
         self._init_model()
 
         while True:
-            try:
-                command, payload = self.request_queue.get()
-            except queue.Empty:
-                continue
+            command, payload = self.request_queue.get()
 
             if command == "INFER":
                 worker_id, model_name, state_batch = payload
@@ -447,7 +443,7 @@ def main(args):
     )
 
     cpu_count = torch.multiprocessing.cpu_count()
-    gpu_request_queue = torch.multiprocessing.Queue()
+    queue = torch.multiprocessing.Queue()
     all_pipes = [Pipe(duplex=False) for _ in range(cpu_count)]
     worker_conns = [p[0] for p in all_pipes]
     gpu_result_conns = [p[1] for p in all_pipes]
@@ -458,7 +454,7 @@ def main(args):
     whr = whole_history_rating.Base()
 
     def save_checkpoint(cycle, run, cfg):
-        gpu_request_queue.put(("GET_CHECKPOINT_DATA", None))
+        queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = main_gpu_pipe_recv.recv()
         model_id = weight_hash(gpu_state["best_model_state_dict"].values())
         checkpoint_data = {
@@ -498,13 +494,11 @@ def main(args):
         return hashes["best"]
 
     def get_model_hashes():
-        gpu_request_queue.put(("GET_MODEL_HASHES", None))
+        queue.put(("GET_MODEL_HASHES", None))
         gpu_hashes = main_gpu_pipe_recv.recv()
         return gpu_hashes
 
-    accelerator_worker = GPU(
-        gpu_request_queue, gpu_result_conns, main_gpu_pipe_send, args.device
-    )
+    accelerator_worker = GPU(queue, gpu_result_conns, main_gpu_pipe_send, args.device)
     accelerator_worker.daemon = True
     accelerator_worker.start()
 
@@ -513,7 +507,7 @@ def main(args):
         feature=config.history * 2 + 1,
         board=config.board,
     )
-    pool_init_args = (gpu_request_queue, worker_conns, buffer)
+    pool_init_args = (queue, worker_conns, buffer)
     cpu_worker_pool = Pool(
         processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
     )
@@ -574,7 +568,7 @@ def main(args):
         total_loss, batches_done = 0.0, 0
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
             batch = buffer.sample(config.BATCH_SIZE)
-            gpu_request_queue.put(("TRAIN_BATCH", batch))
+            queue.put(("TRAIN_BATCH", batch))
             response = main_gpu_pipe_recv.recv()
             if response["status"] == "TRAIN_DONE":
                 total_loss += response["loss"]
@@ -582,7 +576,7 @@ def main(args):
                 if batches_done % 100 == 0:
                     logging.info(f"step {batches_done}: loss={response['loss']:.4f}")
 
-        gpu_request_queue.put(("STEP_SCHEDULER", None))
+        queue.put(("STEP_SCHEDULER", None))
 
         logging.info("eval")
         model_hashes = get_model_hashes()
@@ -608,10 +602,10 @@ def main(args):
             logging.info(whr.print_ordered_ratings(current=True))
             logging.info(f"{best_model_id} win rate: {best_win}")
             logging.info(f"{next_model_id} win rate: {next_win}")
-            gpu_request_queue.put(("PROMOTE", None))
+            queue.put(("PROMOTE", None))
             promoted = True
         else:
-            gpu_request_queue.put(("RESET", None))
+            queue.put(("RESET", None))
         if promoted:
             save_checkpoint(cycle, run, config)
         run.log(log_data, step=cycle)
