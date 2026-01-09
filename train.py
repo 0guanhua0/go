@@ -248,21 +248,23 @@ class Worker:
 
             root = root.get_child(act_to_play)
 
-    def selfplay_task(weight_hash, allow_resign, v_resign):
-        worker = Worker()
-        return worker.selfplay(worker.net["best"], weight_hash, allow_resign, v_resign)
 
-    def eval_task(best_hash, next_hash):
-        worker = Worker()
-        return worker.eval(best_hash, next_hash)
+def selfplay_task(weight_hash, allow_resign, v_resign):
+    worker = Worker()
+    return worker.selfplay(worker.net["best"], weight_hash, allow_resign, v_resign)
+
+
+def eval_task(best_hash, next_hash):
+    worker = Worker()
+    return worker.eval(best_hash, next_hash)
 
 
 class GPU(Process):
-    def __init__(self, request_queue, result_pipes, main_pipe, device):
+    def __init__(self, queue, pipe_gpu, pipe_main, device):
         super().__init__()
-        self.request_queue = request_queue
-        self.result_pipes = result_pipes
-        self.main_pipe = main_pipe
+        self.queue = queue
+        self.pipe_gpu = pipe_gpu
+        self.pipe_main = pipe_main
         self.device = torch.device(device)
         self.model = None
         self.optimizer = None
@@ -298,14 +300,14 @@ class GPU(Process):
         self._init_model()
 
         while True:
-            command, payload = self.request_queue.get()
+            command, payload = self.queue.get()
 
             if command == "INFER":
                 worker_id, model_name, state_batch = payload
                 self._infer(model_name, [(worker_id, state_batch)])
             elif command == "TRAIN_BATCH":
                 loss = self._train_step(*payload)
-                self.main_pipe.send({"status": "TRAIN_DONE", "loss": loss})
+                self.pipe_main.send({"status": "TRAIN_DONE", "loss": loss})
             elif command == "PROMOTE":
                 self.model["best"].load_state_dict(self.model["next"].state_dict())
                 self.model["best"].eval()
@@ -319,14 +321,14 @@ class GPU(Process):
                     "best": weight_hash(self.model["best"].state_dict().values()),
                     "next": weight_hash(self.model["next"].state_dict().values()),
                 }
-                self.main_pipe.send(hashes)
+                self.pipe_main.send(hashes)
             elif command == "GET_CHECKPOINT_DATA":
                 states = {
                     "best_model_state_dict": {
                         k: v.cpu() for k, v in self.model["best"].state_dict().items()
                     }
                 }
-                self.main_pipe.send(states)
+                self.pipe_main.send(states)
 
     def _infer(self, model_name, model_requests):
         if not model_requests:
@@ -386,9 +388,7 @@ class GPU(Process):
                 restored_policy = dihedral.apply[reverse_id](policy_plane)
                 policy_result[sample, :-1] = restored_policy.reshape(-1)
 
-            self.result_pipes[worker_id].send(
-                (policy_result.clone(), value_result.clone())
-            )
+            self.pipe_gpu[worker_id].send((policy_result.clone(), value_result.clone()))
             start_index = end_index
 
     def _train_step(self, state, policy, value):
@@ -432,6 +432,14 @@ class NetWrapper:
         return policy.cpu().numpy(), value.cpu().numpy()
 
 
+def selfplay_job(args):
+    return selfplay_task(*args)
+
+
+def eval_job(args):
+    return eval_task(*args)
+
+
 def main(args):
     set_start_method("spawn", force=True)
 
@@ -444,10 +452,10 @@ def main(args):
 
     cpu_count = torch.multiprocessing.cpu_count()
     queue = torch.multiprocessing.Queue()
-    all_pipes = [Pipe(duplex=False) for _ in range(cpu_count)]
-    worker_conns = [p[0] for p in all_pipes]
-    gpu_result_conns = [p[1] for p in all_pipes]
-    main_gpu_pipe_recv, main_gpu_pipe_send = Pipe(duplex=False)
+    pipe = [Pipe() for _ in range(cpu_count)]
+    pipe_cpu = [p[0] for p in pipe]
+    pipe_gpu = [p[1] for p in pipe]
+    pipe_main = Pipe()
 
     v_resign_dict = {}
     current_model_id = None
@@ -455,7 +463,7 @@ def main(args):
 
     def save_checkpoint(cycle, run, cfg):
         queue.put(("GET_CHECKPOINT_DATA", None))
-        gpu_state = main_gpu_pipe_recv.recv()
+        gpu_state = pipe_main[0].recv()
         model_id = weight_hash(gpu_state["best_model_state_dict"].values())
         checkpoint_data = {
             "cycle": cycle,
@@ -495,19 +503,19 @@ def main(args):
 
     def get_model_hashes():
         queue.put(("GET_MODEL_HASHES", None))
-        gpu_hashes = main_gpu_pipe_recv.recv()
+        gpu_hashes = pipe_main[0].recv()
         return gpu_hashes
 
-    accelerator_worker = GPU(queue, gpu_result_conns, main_gpu_pipe_send, args.device)
-    accelerator_worker.daemon = True
-    accelerator_worker.start()
+    gpu = GPU(queue, pipe_gpu, pipe_main[1], args.device)
+    gpu.daemon = True
+    gpu.start()
 
     buffer = Ring(
         data=config.data,
         feature=config.history * 2 + 1,
         board=config.board,
     )
-    pool_init_args = (queue, worker_conns, buffer)
+    pool_init_args = (queue, pipe_cpu, buffer)
     cpu_worker_pool = Pool(
         processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
     )
@@ -517,37 +525,10 @@ def main(args):
 
     v_resign = config.RESIGNATION_THRESHOLD
 
-    def dispatch_sp_task(weight_hash, allow_resign, v_resign):
-        return cpu_worker_pool.apply_async(
-            Worker.selfplay_task,
-            args=(weight_hash, allow_resign, v_resign),
-        )
-
     def run_selfplay_games(num_games, weight_hash, v_resign):
-        games_dispatched = 0
-        games_completed = 0
-        active_tasks = []
-
-        while games_completed < num_games:
-            while len(active_tasks) < cpu_count and games_dispatched < num_games:
-                allow_resign = games_dispatched % 10 != 0
-                active_tasks.append(
-                    dispatch_sp_task(weight_hash, allow_resign, v_resign)
-                )
-                games_dispatched += 1
-
-            ready_tasks = [task for task in active_tasks if task.ready()]
-            if not ready_tasks:
-                time.sleep(1)
-                continue
-
-            for task in ready_tasks:
-                game_result = task.get()
-                if game_result:
-                    result_hash = game_result.get("weight_hash", weight_hash)
-                    add_resign_data(result_hash, game_result.get("v_resign_tune"))
-                active_tasks.remove(task)
-                games_completed += 1
+        game_args = ((weight_hash, i % 10 != 0, v_resign) for i in range(num_games))
+        for game_result in cpu_worker_pool.imap_unordered(selfplay_job, game_args):
+            add_resign_data(weight_hash, game_result.get("v_resign_tune"))
 
     cycle = 1
     while True:
@@ -569,7 +550,7 @@ def main(args):
         for i in range(config.TRAINING_UPDATES_PER_GENERATION):
             batch = buffer.sample(config.BATCH_SIZE)
             queue.put(("TRAIN_BATCH", batch))
-            response = main_gpu_pipe_recv.recv()
+            response = pipe_main[0].recv()
             if response["status"] == "TRAIN_DONE":
                 total_loss += response["loss"]
                 batches_done += 1
@@ -582,17 +563,8 @@ def main(args):
         model_hashes = get_model_hashes()
         best_model_id = model_hashes["best"]
         next_model_id = model_hashes["next"]
-        eval_tasks = [
-            cpu_worker_pool.apply_async(
-                Worker.eval_task,
-                args=(
-                    best_model_id,
-                    next_model_id,
-                ),
-            )
-            for _ in range(config.EVAL)
-        ]
-        eval_res = [res.get() for res in eval_tasks]
+        eval_args = ((best_model_id, next_model_id) for _ in range(config.EVAL))
+        eval_res = list(cpu_worker_pool.imap_unordered(eval_job, eval_args))
 
         best_win = eval_res.count(1) / len(eval_res)
         next_win = eval_res.count(-1) / len(eval_res)
