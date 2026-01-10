@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import logging
+import random
 import time
 
 import torch
@@ -303,8 +304,7 @@ class GPU(Process):
             command, payload = self.queue.get()
 
             if command == "INFER":
-                worker_id, model_name, state_batch = payload
-                self._infer(model_name, [(worker_id, state_batch)])
+                self._infer(*payload)
             elif command == "TRAIN_BATCH":
                 loss = self._train_step(*payload)
                 self.pipe_main.send({"status": "TRAIN_DONE", "loss": loss})
@@ -330,66 +330,22 @@ class GPU(Process):
                 }
                 self.pipe_main.send(states)
 
-    def _infer(self, model_name, model_requests):
-        if not model_requests:
-            return
-
-        worker_ids, state_batches = zip(*model_requests)
-
-        tensor_batches = []
-        dihedral_batch = []
-        transform = []
-        for state_batch in state_batches:
-            if isinstance(state_batch, torch.Tensor):
-                tensor_batch = state_batch.to(dtype=torch.float32)
-            else:
-                tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
-
-            tensor_batches.append(tensor_batch.contiguous())
-
-            idx = torch.randint(
-                low=0,
-                high=len(dihedral.apply),
-                size=(tensor_batch.shape[0],),
-            )
-
-            transform_id_tensor = [
-                dihedral.apply[int(idx.item())](sample)
-                for sample, idx in zip(tensor_batch, idx)
-            ]
-            transform_id_batch = torch.stack(transform_id_tensor, dim=0).contiguous()
-
-            dihedral_batch.append(transform_id_batch)
-            transform.append(idx.tolist())
-
-        batch = torch.cat(dihedral_batch, dim=0).to(self.device)
-
-        model = self.model[model_name]
+    def _infer(self, worker_id, model_name, feature):
+        dihedral_id = random.randrange(len(dihedral.to))
+        feature = dihedral.to[dihedral_id](feature).contiguous().to(self.device)
 
         with torch.no_grad():
-            policy_logits, value_preds = model(batch)
-            policy_batch = F.softmax(policy_logits, dim=1).cpu()
-            value_preds_batch = value_preds.cpu()
+            policy, value = self.model[model_name](feature)
+            policy = F.softmax(policy, dim=1).cpu().contiguous()
+            value = value.cpu().squeeze(-1).contiguous()
 
-        start_index = 0
-        for i, worker_id in enumerate(worker_ids):
-            num_samples = tensor_batches[i].shape[0]
-            end_index = start_index + num_samples
-            policy_result = policy_batch[start_index:end_index].contiguous()
-            value_result = (
-                value_preds_batch[start_index:end_index].squeeze(-1).contiguous()
-            )
+        reverse_id = dihedral.reverse[dihedral_id]
+        policy_board = policy[:, :-1].reshape(-1, config.board, config.board).clone()
+        policy[:, :-1] = dihedral.to[reverse_id](policy_board).reshape(
+            policy.shape[0], -1
+        )
 
-            for sample, transform_id in enumerate(transform[i]):
-                policy_plane = policy_result[sample, :-1].view(
-                    config.board, config.board
-                )
-                reverse_id = dihedral.reverse[int(transform_id)]
-                restored_policy = dihedral.apply[reverse_id](policy_plane)
-                policy_result[sample, :-1] = restored_policy.reshape(-1)
-
-            self.pipe_gpu[worker_id].send((policy_result.clone(), value_result.clone()))
-            start_index = end_index
+        self.pipe_gpu[worker_id].send((policy.clone(), value.clone()))
 
     def _train_step(self, state, policy, value):
         self.model["next"].train()

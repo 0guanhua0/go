@@ -42,15 +42,15 @@ class Ring:
             policy = self.policy[idx].clone()
             value = self.value[idx].clone()
 
-        transform = torch.randint(0, len(dihedral.apply), (batch_size,))
+        transform = torch.randint(0, len(dihedral.to), (batch_size,))
 
         state_dihedral = []
         policy_dihedral = []
         for s, p, t in zip(state, policy, transform):
-            s = dihedral.apply[int(t.item())](s)
+            s = dihedral.to[int(t.item())](s)
 
             policy_2d = p[:-1].view(self.board, self.board)
-            policy_2d = dihedral.apply[int(t.item())](policy_2d)
+            policy_2d = dihedral.to[int(t.item())](policy_2d)
             p = torch.cat(
                 (
                     policy_2d.reshape(-1),

@@ -1,6 +1,6 @@
 import torch
 
-apply = {
+to = {
     0: lambda ts: ts,
     1: lambda ts: torch.rot90(ts, 1, (-2, -1)),
     2: lambda ts: torch.rot90(ts, 2, (-2, -1)),
