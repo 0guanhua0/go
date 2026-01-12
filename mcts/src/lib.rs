@@ -413,7 +413,7 @@ impl Node {
             .iter()
             .map(|count| *count.value() as f32)
             .sum();
-        let scale = total_visits.max(1.0).sqrt();
+        let scale = total_visits.sqrt();
 
         let mut best = (f32::NEG_INFINITY, None);
 
@@ -423,17 +423,17 @@ impl Node {
                 .visit_cnt
                 .get(&act)
                 .map(|count| *count.value() as f32)
-                .unwrap_or(0.0);
+                .unwrap();
             let q = self
                 .mean_act_val
                 .get(&act)
                 .map(|value| *value.value())
-                .unwrap_or(0.0);
+                .unwrap();
             let p = self
                 .prior_prob
                 .get(&act)
                 .map(|value| *value.value())
-                .unwrap_or(0.0);
+                .unwrap();
 
             let u = c_puct * p * scale / (1.0 + n);
             let score = q + u;
@@ -491,7 +491,7 @@ impl MCTS {
         }
     }
 
-    fn simulate(
+    fn sim(
         &self,
         py: Python,
         network: PyObject,
@@ -506,15 +506,15 @@ impl MCTS {
             let batch = np.call_method1("expand_dims", (feature, 0))?;
 
             let result = network.call_method1(py, "infer", (batch,))?;
-            let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
+            let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
                 result.extract(py)?;
 
-            let value_vec = value.to_vec()?;
+            let value_view = unsafe { value.as_array() };
             let policy_view = unsafe { policy.as_array() };
             let policy_slice = policy_view
                 .slice(s![0, ..])
                 .to_slice()
-                .ok_or_else(|| PyValueError::new_err("slice policy array err"))?;
+                .ok_or_else(|| PyValueError::new_err("policy fail"))?;
 
             let stat = self.get_stat(state, policy_slice)?;
             let key = (weight_hash.clone(), state.hash);
@@ -522,7 +522,7 @@ impl MCTS {
                 key,
                 TTval {
                     policy: stat.clone(),
-                    value: value_vec[0],
+                    value: value_view[[0, 0]],
                 },
             );
 
@@ -601,9 +601,9 @@ impl MCTS {
 
             let result = network.call_method1(py, "infer", (batch_numpy_array,))?;
 
-            let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray1<f32>>) =
+            let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
                 result.extract(py)?;
-            let value_vec = value.to_vec()?;
+            let value_view = unsafe { value.as_array() };
 
             for (i, item) in leaves_to_evaluate.iter().enumerate() {
                 let leaf_node = item.path.last().map_or(root, |(parent, act)| unsafe {
@@ -617,7 +617,7 @@ impl MCTS {
                     .expect("policy slice fail");
 
                 let stat = self.get_stat(&item.state, policy_slice)?;
-                let value = value_vec[i];
+                let value = value_view[[i, 0]];
 
                 let key = (weight_hash.clone(), item.state.hash);
                 self.transposition_table.insert(
@@ -699,15 +699,15 @@ impl MCTS {
     }
 
     fn get_stat(&self, state: &State, policy_raw: &[f32]) -> PyResult<HashMap<usize, f32>> {
-        let acts = state.get_act();
+        let act = state.get_act();
         let mut stat = HashMap::new();
-        let prob: f32 = acts.iter().map(|&a| policy_raw[a]).sum();
+        let prob: f32 = act.iter().map(|&a| policy_raw[a]).sum();
 
         if prob < f32::EPSILON {
-            panic!("invalid policy sum for acts {:?}", acts);
+            panic!("invalid policy sum for acts {:?}", act);
         }
 
-        for &a in &acts {
+        for &a in &act {
             stat.insert(a, policy_raw[a] / prob);
         }
 

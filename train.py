@@ -141,7 +141,7 @@ class Worker:
             if game_over:
                 break
 
-            mcts.simulate(network, weight_hash, root, state, config.mcts)
+            mcts.sim(network, weight_hash, root, state, config.mcts)
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, temp)
@@ -239,7 +239,7 @@ class Worker:
                 network = self.net["next"]
                 weight_hash = next_hash
 
-            mcts.simulate(network, weight_hash, root, state, config.mcts)
+            mcts.sim(network, weight_hash, root, state, config.mcts)
 
             act_prob = mcts.get_act_prob(root, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
@@ -337,7 +337,7 @@ class GPU(Process):
         with torch.no_grad():
             policy, value = self.model[model_name](feature)
             policy = F.softmax(policy, dim=1).cpu().contiguous()
-            value = value.cpu().squeeze(-1).contiguous()
+            value = value.cpu().contiguous()
 
         reverse_id = dihedral.reverse[dihedral_id]
         policy_board = policy[:, :-1].reshape(-1, config.board, config.board).clone()
