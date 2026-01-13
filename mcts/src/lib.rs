@@ -1,14 +1,13 @@
 use dashmap::DashMap;
 use numpy::ToPyArray;
 use numpy::ndarray::{IxDyn, s};
-use numpy::{PyArray, PyArray1, PyArray2, PyArrayMethods};
+use numpy::{PyArray, PyArray2, PyArrayMethods};
 use once_cell::sync::Lazy;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use rand::Rng;
 use rand_distr::{Distribution, Gamma};
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BOARD_SIZE: usize = 19;
@@ -453,30 +452,12 @@ struct TTval {
     value: f32,
 }
 
-struct LeafToEvaluate<'a> {
-    path: Vec<(&'a Node, usize)>,
-    state: State,
-}
-
-enum SimulationResult<'a> {
-    Terminal {
-        path: Vec<(&'a Node, usize)>,
-        value: f32,
-    },
-    TTHit {
-        path: Vec<(&'a Node, usize)>,
-        node: &'a Node,
-        entry: TTval,
-    },
-    NeedsEvaluation(LeafToEvaluate<'a>),
-}
-
 #[pyclass]
 struct MCTS {
     c_puct: f32,
     dirichlet_alpha: f32,
     epsilon: f32,
-    transposition_table: DashMap<(String, u64), TTval>,
+    transposition_table: DashMap<(String, u64, i8), TTval>,
 }
 
 #[pymethods]
@@ -490,8 +471,77 @@ impl MCTS {
             transposition_table: DashMap::new(),
         }
     }
-
     fn sim(
+        &self,
+        py: Python,
+        network: PyObject,
+        weight_hash: &str,
+        node: &Node,
+        mut state: State,
+    ) -> PyResult<f32> {
+        let mut path = Vec::new();
+        let mut curr_node = node;
+
+        while !curr_node.children.is_empty() {
+            let act = curr_node.select(self.c_puct).unwrap();
+            path.push((curr_node, act));
+
+            let board_size = state.board_size;
+            let (row, col) = if act == board_size * board_size {
+                (board_size, board_size)
+            } else {
+                (act / board_size, act % board_size)
+            };
+            state.set(row, col, state.player());
+
+            let child_ref = curr_node.children.get(&act).unwrap();
+            curr_node = unsafe { &*(child_ref.value() as *const Node) };
+        }
+
+        let (is_over, winner) = state.check_terminate();
+        let value = if is_over {
+            (winner.unwrap() * state.player()) as f32
+        } else {
+            let key = (weight_hash.to_string(), state.hash, state.player());
+            let (policy_stat, v) = if let Some(entry) = self.transposition_table.get(&key) {
+                (entry.policy.clone(), entry.value)
+            } else {
+                let feature = state.get_feature(py)?;
+                let np = PyModule::import(py, "numpy")?;
+                let batch = np.call_method1("expand_dims", (feature, 0))?;
+
+                let result = network.call_method1(py, "infer", (batch,))?;
+                let (policy, value_arr): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
+                    result.extract(py)?;
+
+                let value_view = unsafe { value_arr.as_array() };
+                let policy_view = unsafe { policy.as_array() };
+                let policy_slice = policy_view
+                    .slice(s![0, ..])
+                    .to_slice()
+                    .ok_or_else(|| PyValueError::new_err("policy fail"))?;
+
+                let stat = self.get_stat(&state, policy_slice)?;
+                let v = value_view[[0, 0]];
+
+                self.transposition_table.insert(
+                    key,
+                    TTval {
+                        policy: stat.clone(),
+                        value: v,
+                    },
+                );
+                (stat, v)
+            };
+            curr_node.expand(&policy_stat);
+            v
+        };
+
+        self.backup(&path, value);
+        Ok(value)
+    }
+
+    fn search(
         &self,
         py: Python,
         network: PyObject,
@@ -501,136 +551,12 @@ impl MCTS {
         num_simulations: usize,
     ) -> PyResult<()> {
         if root.children.is_empty() {
-            let feature = state.get_feature(py)?;
-            let np = PyModule::import(py, "numpy")?;
-            let batch = np.call_method1("expand_dims", (feature, 0))?;
-
-            let result = network.call_method1(py, "infer", (batch,))?;
-            let (policy, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
-                result.extract(py)?;
-
-            let value_view = unsafe { value.as_array() };
-            let policy_view = unsafe { policy.as_array() };
-            let policy_slice = policy_view
-                .slice(s![0, ..])
-                .to_slice()
-                .ok_or_else(|| PyValueError::new_err("policy fail"))?;
-
-            let stat = self.get_stat(state, policy_slice)?;
-            let key = (weight_hash.clone(), state.hash);
-            self.transposition_table.insert(
-                key,
-                TTval {
-                    policy: stat.clone(),
-                    value: value_view[[0, 0]],
-                },
-            );
-
-            root.expand(&stat);
+            self.sim(py, network.clone_ref(py), &weight_hash, root, state.clone())?;
             self._add_dirichlet_noise(root);
         }
 
-        let simulation_results: Vec<SimulationResult> = (0..num_simulations)
-            .into_par_iter()
-            .map(|_| {
-                let mut path: Vec<(&Node, usize)> = Vec::new();
-                let mut node = root;
-                let mut state_curr = state.clone();
-
-                while !node.children.is_empty() {
-                    let act = node.select(self.c_puct).unwrap();
-                    path.push((node, act));
-                    let board_size = state_curr.board_size;
-                    let player = state_curr.player();
-                    let (row, col) = if act == board_size * board_size {
-                        (board_size, board_size)
-                    } else {
-                        (act / board_size, act % board_size)
-                    };
-                    state_curr.set(row, col, player);
-
-                    let child_ref = node.children.get(&act).unwrap();
-                    node = unsafe { &*(child_ref.value() as *const Node) };
-                }
-
-                let (is_over, winner) = state_curr.check_terminate();
-                if is_over {
-                    let value = (winner.unwrap() * state.player()) as f32;
-                    SimulationResult::Terminal { path, value }
-                } else if let Some(entry) = self
-                    .transposition_table
-                    .get(&(weight_hash.clone(), state_curr.hash))
-                {
-                    SimulationResult::TTHit {
-                        path,
-                        node,
-                        entry: entry.value().clone(),
-                    }
-                } else {
-                    SimulationResult::NeedsEvaluation(LeafToEvaluate {
-                        path,
-                        state: state_curr,
-                    })
-                }
-            })
-            .collect();
-
-        let mut leaves_to_evaluate: Vec<LeafToEvaluate> = Vec::with_capacity(num_simulations);
-        for result in simulation_results {
-            match result {
-                SimulationResult::Terminal { path, value } => {
-                    self.backup(&path, value);
-                }
-                SimulationResult::TTHit { path, node, entry } => {
-                    node.expand(&entry.policy);
-                    self.backup(&path, entry.value);
-                }
-                SimulationResult::NeedsEvaluation(leaf) => {
-                    leaves_to_evaluate.push(leaf);
-                }
-            }
-        }
-
-        if !leaves_to_evaluate.is_empty() {
-            let mut state_reps = Vec::with_capacity(leaves_to_evaluate.len());
-            for leaf in &leaves_to_evaluate {
-                state_reps.push(leaf.state.get_feature(py)?);
-            }
-            let np = PyModule::import(py, "numpy")?;
-            let batch_numpy_array = np.call_method1("stack", (state_reps,))?;
-
-            let result = network.call_method1(py, "infer", (batch_numpy_array,))?;
-
-            let (policies, value): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
-                result.extract(py)?;
-            let value_view = unsafe { value.as_array() };
-
-            for (i, item) in leaves_to_evaluate.iter().enumerate() {
-                let leaf_node = item.path.last().map_or(root, |(parent, act)| unsafe {
-                    &*(parent.children.get(act).unwrap().value() as *const Node)
-                });
-
-                let policies_view = unsafe { policies.as_array() };
-                let policy_slice = policies_view
-                    .slice(s![i, ..])
-                    .to_slice()
-                    .expect("policy slice fail");
-
-                let stat = self.get_stat(&item.state, policy_slice)?;
-                let value = value_view[[i, 0]];
-
-                let key = (weight_hash.clone(), item.state.hash);
-                self.transposition_table.insert(
-                    key,
-                    TTval {
-                        policy: stat.clone(),
-                        value,
-                    },
-                );
-
-                leaf_node.expand(&stat);
-                self.backup(&item.path, value);
-            }
+        for _ in 0..num_simulations {
+            self.sim(py, network.clone_ref(py), &weight_hash, root, state.clone())?;
         }
         Ok(())
     }
