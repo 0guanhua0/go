@@ -99,12 +99,14 @@ class Worker:
     request_queue = None
     result_pipes = None
     buffer = None
+    mempool = None
 
     @classmethod
-    def init(cls, request_queue, result_pipes, buffer):
+    def init(cls, request_queue, result_pipes, buffer, mempool):
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
         cls.buffer = buffer
+        cls.mempool = mempool
         logging.basicConfig(**LOGGING_CONFIG)
 
     def __init__(self):
@@ -115,12 +117,14 @@ class Worker:
                 model="best",
                 request_queue=self.request_queue,
                 result_pipe=self.result_pipes[self.worker_id],
+                mempool=self.mempool,
             ),
             "next": NetWrapper(
                 self.worker_id,
                 model="next",
                 request_queue=self.request_queue,
                 result_pipe=self.result_pipes[self.worker_id],
+                mempool=self.mempool,
             ),
         }
 
@@ -261,11 +265,12 @@ def eval_task(best_hash, next_hash):
 
 
 class GPU(Process):
-    def __init__(self, queue, pipe_gpu, pipe_main, device):
+    def __init__(self, queue, pipe_gpu, pipe_main, mempool, device):
         super().__init__()
         self.queue = queue
         self.pipe_gpu = pipe_gpu
         self.pipe_main = pipe_main
+        self.mempool = mempool
         self.device = torch.device(device)
         self.model = None
         self.optimizer = None
@@ -301,51 +306,85 @@ class GPU(Process):
         self._init_model()
 
         while True:
-            command, payload = self.queue.get()
+            requests = [self.queue.get()]
 
-            if command == "INFER":
-                self._infer(*payload)
-            elif command == "TRAIN_BATCH":
-                loss = self._train_step(*payload)
-                self.pipe_main.send({"status": "TRAIN_DONE", "loss": loss})
-            elif command == "PROMOTE":
-                self.model["best"].load_state_dict(self.model["next"].state_dict())
-                self.model["best"].eval()
-            elif command == "RESET":
-                self.model["next"].load_state_dict(self.model["best"].state_dict())
-            elif command == "STEP_SCHEDULER":
-                self.scheduler.step()
-                logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
-            elif command == "GET_MODEL_HASHES":
-                hashes = {
-                    "best": weight_hash(self.model["best"].state_dict().values()),
-                    "next": weight_hash(self.model["next"].state_dict().values()),
-                }
-                self.pipe_main.send(hashes)
-            elif command == "GET_CHECKPOINT_DATA":
-                states = {
-                    "best_model_state_dict": {
-                        k: v.cpu() for k, v in self.model["best"].state_dict().items()
+            while not self.queue.empty():
+                requests.append(self.queue.get())
+
+            infer_reqs = []
+            for req in requests:
+                command, payload = req
+                if command == "INFER":
+                    infer_reqs.append(payload)
+                elif command == "TRAIN_BATCH":
+                    loss = self._train_step(*payload)
+                    self.pipe_main.send({"status": "TRAIN_DONE", "loss": loss})
+                elif command == "PROMOTE":
+                    self.model["best"].load_state_dict(self.model["next"].state_dict())
+                    self.model["best"].eval()
+                elif command == "RESET":
+                    self.model["next"].load_state_dict(self.model["best"].state_dict())
+                elif command == "STEP_SCHEDULER":
+                    self.scheduler.step()
+                    logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
+                elif command == "GET_MODEL_HASHES":
+                    hashes = {
+                        "best": weight_hash(self.model["best"].state_dict().values()),
+                        "next": weight_hash(self.model["next"].state_dict().values()),
                     }
-                }
-                self.pipe_main.send(states)
+                    self.pipe_main.send(hashes)
+                elif command == "GET_CHECKPOINT_DATA":
+                    states = {
+                        "best_model_state_dict": {
+                            k: v.cpu()
+                            for k, v in self.model["best"].state_dict().items()
+                        }
+                    }
+                    self.pipe_main.send(states)
 
-    def _infer(self, worker_id, model_name, feature):
-        dihedral_id = random.randrange(len(dihedral.to))
-        feature = dihedral.to[dihedral_id](feature).contiguous().to(self.device)
+            if infer_reqs:
+                self._infer(infer_reqs)
 
-        with torch.no_grad():
-            policy, value = self.model[model_name](feature)
-            policy = F.softmax(policy, dim=1).cpu().contiguous()
-            value = value.cpu().contiguous()
+    def _infer(self, reqs):
+        batches = {}
+        for worker_id, model_name, batch_size in reqs:
+            batches.setdefault(model_name, []).append((worker_id, batch_size))
 
-        reverse_id = dihedral.reverse[dihedral_id]
-        policy_board = policy[:, :-1].reshape(-1, config.board, config.board).clone()
-        policy[:, :-1] = dihedral.to[reverse_id](policy_board).reshape(
-            policy.shape[0], -1
-        )
+        for model_name, items in batches.items():
+            features = []
+            for worker_id, batch_size in items:
+                features.append(self.mempool.input[worker_id, :batch_size])
 
-        self.pipe_gpu[worker_id].send((policy.clone(), value.clone()))
+            feature_batch = torch.cat(features, dim=0)
+
+            dihedral_id = random.randrange(len(dihedral.to))
+            feature = (
+                dihedral.to[dihedral_id](feature_batch).contiguous().to(self.device)
+            )
+
+            with torch.no_grad():
+                policy, value = self.model[model_name](feature)
+                policy = F.softmax(policy, dim=1).cpu().contiguous()
+                value = value.cpu().contiguous()
+
+            reverse_id = dihedral.reverse[dihedral_id]
+            policy_board = (
+                policy[:, :-1].reshape(-1, config.board, config.board).clone()
+            )
+            policy[:, :-1] = dihedral.to[reverse_id](policy_board).reshape(
+                policy.shape[0], -1
+            )
+
+            cursor = 0
+            for worker_id, batch_size in items:
+                self.mempool.policy[worker_id, :batch_size] = policy[
+                    cursor : cursor + batch_size
+                ]
+                self.mempool.value[worker_id, :batch_size] = value[
+                    cursor : cursor + batch_size
+                ]
+                cursor += batch_size
+                self.pipe_gpu[worker_id].send(None)
 
     def _train_step(self, state, policy, value):
         self.model["next"].train()
@@ -372,19 +411,55 @@ class GPU(Process):
         return loss.item()
 
 
+class MemPool:
+    def __init__(self, num_workers, board_size, history_length):
+        self.num_workers = num_workers
+        plane_cnt = 2 * history_length + 1
+        self.max_batch = 8
+
+        self.input = torch.zeros(
+            num_workers,
+            self.max_batch,
+            plane_cnt,
+            board_size,
+            board_size,
+            dtype=torch.float32,
+        ).share_memory_()
+
+        self.policy = torch.zeros(
+            num_workers,
+            self.max_batch,
+            board_size * board_size + 1,
+            dtype=torch.float32,
+        ).share_memory_()
+
+        self.value = torch.zeros(
+            num_workers, self.max_batch, 1, dtype=torch.float32
+        ).share_memory_()
+
+
 class NetWrapper:
-    def __init__(self, worker_id, model, request_queue, result_pipe):
+    def __init__(self, worker_id, model, request_queue, result_pipe, mempool):
         self.worker_id = worker_id
         self.model = model
         self.request_queue = request_queue
         self.result_pipe = result_pipe
+        self.mempool = mempool
 
     def infer(self, state_batch):
-        tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32).contiguous()
-        self.request_queue.put(
-            ("INFER", (self.worker_id, self.model, tensor_batch.cpu()))
-        )
-        policy, value = self.result_pipe.recv()
+        batch_size = len(state_batch)
+
+        tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
+
+        self.mempool.input[self.worker_id, :batch_size] = tensor_batch
+
+        self.request_queue.put(("INFER", (self.worker_id, self.model, batch_size)))
+
+        self.result_pipe.recv()
+
+        policy = self.mempool.policy[self.worker_id, :batch_size]
+        value = self.mempool.value[self.worker_id, :batch_size]
+
         return policy.cpu().numpy(), value.cpu().numpy()
 
 
@@ -412,6 +487,8 @@ def main(args):
     pipe_cpu = [p[0] for p in pipe]
     pipe_gpu = [p[1] for p in pipe]
     pipe_main = Pipe()
+
+    mempool = MemPool(cpu_count, config.board, config.history)
 
     v_resign_dict = {}
     current_model_id = None
@@ -462,7 +539,7 @@ def main(args):
         gpu_hashes = pipe_main[0].recv()
         return gpu_hashes
 
-    gpu = GPU(queue, pipe_gpu, pipe_main[1], args.device)
+    gpu = GPU(queue, pipe_gpu, pipe_main[1], mempool, args.device)
     gpu.daemon = True
     gpu.start()
 
@@ -471,7 +548,7 @@ def main(args):
         feature=config.history * 2 + 1,
         board=config.board,
     )
-    pool_init_args = (queue, pipe_cpu, buffer)
+    pool_init_args = (queue, pipe_cpu, buffer, mempool)
     cpu_worker_pool = Pool(
         processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
     )

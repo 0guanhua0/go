@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const BOARD_SIZE: usize = 19;
 const KOMI: f32 = 7.5;
 const HISTORY: usize = 8;
+const SEARCH_BATCH_SIZE: usize = 8;
+const VIRTUAL_LOSS: f32 = 1.0;
 
 struct ZobristTable {
     pub key: [[[u64; 2]; BOARD_SIZE]; BOARD_SIZE],
@@ -471,75 +473,6 @@ impl MCTS {
             transposition_table: DashMap::new(),
         }
     }
-    fn sim(
-        &self,
-        py: Python,
-        network: PyObject,
-        weight_hash: &str,
-        node: &Node,
-        mut state: State,
-    ) -> PyResult<f32> {
-        let mut path = Vec::new();
-        let mut curr_node = node;
-
-        while !curr_node.children.is_empty() {
-            let act = curr_node.select(self.c_puct).unwrap();
-            path.push((curr_node, act));
-
-            let board_size = state.board_size;
-            let (row, col) = if act == board_size * board_size {
-                (board_size, board_size)
-            } else {
-                (act / board_size, act % board_size)
-            };
-            state.set(row, col, state.player());
-
-            let child_ref = curr_node.children.get(&act).unwrap();
-            curr_node = unsafe { &*(child_ref.value() as *const Node) };
-        }
-
-        let (is_over, winner) = state.check_terminate();
-        let value = if is_over {
-            (winner.unwrap() * state.player()) as f32
-        } else {
-            let key = (weight_hash.to_string(), state.hash, state.player());
-            let (policy_stat, v) = if let Some(entry) = self.transposition_table.get(&key) {
-                (entry.policy.clone(), entry.value)
-            } else {
-                let feature = state.get_feature(py)?;
-                let np = PyModule::import(py, "numpy")?;
-                let batch = np.call_method1("expand_dims", (feature, 0))?;
-
-                let result = network.call_method1(py, "infer", (batch,))?;
-                let (policy, value_arr): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
-                    result.extract(py)?;
-
-                let value_view = unsafe { value_arr.as_array() };
-                let policy_view = unsafe { policy.as_array() };
-                let policy_slice = policy_view
-                    .slice(s![0, ..])
-                    .to_slice()
-                    .ok_or_else(|| PyValueError::new_err("policy fail"))?;
-
-                let stat = self.get_stat(&state, policy_slice)?;
-                let v = value_view[[0, 0]];
-
-                self.transposition_table.insert(
-                    key,
-                    TTval {
-                        policy: stat.clone(),
-                        value: v,
-                    },
-                );
-                (stat, v)
-            };
-            curr_node.expand(&policy_stat);
-            v
-        };
-
-        self.backup(&path, value);
-        Ok(value)
-    }
 
     fn search(
         &self,
@@ -550,13 +483,18 @@ impl MCTS {
         state: &State,
         num_simulations: usize,
     ) -> PyResult<()> {
-        if root.children.is_empty() {
-            self.sim(py, network.clone_ref(py), &weight_hash, root, state.clone())?;
+        let mut cnt = 0;
+        while cnt < num_simulations {
+            self.process_batch(
+                py,
+                network.clone_ref(py),
+                &weight_hash,
+                root,
+                state,
+                SEARCH_BATCH_SIZE,
+            )?;
+            cnt += SEARCH_BATCH_SIZE;
             self._add_dirichlet_noise(root);
-        }
-
-        for _ in 0..num_simulations {
-            self.sim(py, network.clone_ref(py), &weight_hash, root, state.clone())?;
         }
         Ok(())
     }
@@ -595,6 +533,135 @@ impl MCTS {
 }
 
 impl MCTS {
+    fn process_batch(
+        &self,
+        py: Python,
+        network: PyObject,
+        weight_hash: &str,
+        root: &Node,
+        root_state: &State,
+        batch_size: usize,
+    ) -> PyResult<()> {
+        let mut paths = Vec::with_capacity(batch_size);
+        let mut states = Vec::with_capacity(batch_size);
+        let mut is_terminal = Vec::with_capacity(batch_size);
+        let mut values = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            let mut path = Vec::new();
+            let mut curr_node = root;
+            let mut state = root_state.clone();
+
+            while !curr_node.children.is_empty() {
+                let act = curr_node.select(self.c_puct).unwrap();
+                path.push((curr_node, act));
+
+                if let (Some(mut count), Some(mut total_val)) = (
+                    curr_node.visit_cnt.get_mut(&act),
+                    curr_node.total_act_val.get_mut(&act),
+                ) {
+                    *count += 1;
+                    *total_val -= VIRTUAL_LOSS;
+                    let mean_val = *total_val / (*count as f32);
+                    curr_node.mean_act_val.insert(act, mean_val);
+                }
+
+                let board_size = state.board_size;
+                let (row, col) = if act == board_size * board_size {
+                    (board_size, board_size)
+                } else {
+                    (act / board_size, act % board_size)
+                };
+                state.set(row, col, state.player());
+
+                let child_ref = curr_node.children.get(&act).unwrap();
+                curr_node = unsafe { &*(child_ref.value() as *const Node) };
+            }
+
+            paths.push(path);
+
+            let (over, winner) = state.check_terminate();
+            if over {
+                is_terminal.push(true);
+                values.push((winner.unwrap() * state.player()) as f32);
+            } else {
+                is_terminal.push(false);
+                let key = (weight_hash.to_string(), state.hash, state.player());
+                if let Some(entry) = self.transposition_table.get(&key) {
+                    curr_node.expand(&entry.policy);
+                    values.push(entry.value);
+                } else {
+                    values.push(0.0);
+                }
+            }
+            states.push(state);
+        }
+
+        let mut eval_indices = Vec::new();
+        let mut features = Vec::new();
+
+        for i in 0..batch_size {
+            if !is_terminal[i] {
+                let leaf_node = if let Some((parent, act)) = paths[i].last() {
+                    unsafe { &*(parent.children.get(act).unwrap().value() as *const Node) }
+                } else {
+                    root
+                };
+
+                if leaf_node.children.is_empty() {
+                    eval_indices.push(i);
+                    features.push(states[i].get_feature(py)?);
+                }
+            }
+        }
+
+        if !eval_indices.is_empty() {
+            let np = PyModule::import(py, "numpy")?;
+            let batch_numpy_array = np.call_method1("stack", (features,))?;
+
+            let result = network.call_method1(py, "infer", (batch_numpy_array,))?;
+            let (policies, value_arr): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
+                result.extract(py)?;
+
+            let value_view = unsafe { value_arr.as_array() };
+            let policy_view = unsafe { policies.as_array() };
+
+            for (idx, &i) in eval_indices.iter().enumerate() {
+                let leaf_node = if let Some((parent, act)) = paths[i].last() {
+                    unsafe { &*(parent.children.get(act).unwrap().value() as *const Node) }
+                } else {
+                    root
+                };
+
+                let policy_slice = policy_view
+                    .slice(s![idx, ..])
+                    .to_slice()
+                    .ok_or_else(|| PyValueError::new_err("policy fail"))?;
+
+                let v = value_view[[idx, 0]];
+                let stat = self.get_stat(&states[i], policy_slice)?;
+
+                let key = (weight_hash.to_string(), states[i].hash, states[i].player());
+                self.transposition_table.insert(
+                    key,
+                    TTval {
+                        policy: stat.clone(),
+                        value: v,
+                    },
+                );
+
+                leaf_node.expand(&stat);
+                values[i] = v;
+            }
+        }
+
+        for i in 0..batch_size {
+            self.backup(&paths[i], values[i]);
+        }
+
+        Ok(())
+    }
+
     fn _add_dirichlet_noise(&self, node: &Node) {
         let acts: Vec<usize> = node.prior_prob.iter().map(|e| *e.key()).collect();
         if acts.is_empty() {
@@ -630,7 +697,7 @@ impl MCTS {
         let prob: f32 = act.iter().map(|&a| policy_raw[a]).sum();
 
         if prob < f32::EPSILON {
-            panic!("invalid policy sum for acts {:?}", act);
+            panic!("0 policy sum {:?}", act);
         }
 
         for &a in &act {
@@ -647,8 +714,7 @@ impl MCTS {
                 parent.visit_cnt.get_mut(&act),
                 parent.total_act_val.get_mut(&act),
             ) {
-                *count += 1;
-                *total_val += current_value;
+                *total_val += VIRTUAL_LOSS + current_value;
                 let mean_val = *total_val / (*count as f32);
                 parent.mean_act_val.insert(act, mean_val);
             }
