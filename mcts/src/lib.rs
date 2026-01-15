@@ -759,11 +759,11 @@ mod tests {
         let mut state = State::new(size);
 
         #[rustfmt::skip]
-        let board = ["bbbbb",
-                     "wwb b",
-                     " bbbb",
-                     "wwbbb",
-                     "bbbbb"];
+        let board = ["wwwww",
+                     "wwwww",
+                     "w www",
+                     "wbbbb",
+                     "wb b "];
 
         for (r, row) in board.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
@@ -777,8 +777,8 @@ mod tests {
         }
 
         let (black_score, white_score) = state.get_score();
-        assert_eq!(black_score, 20.0);
-        assert_eq!(white_score, 4.0 + KOMI);
+        assert_eq!(black_score, 8.0);
+        assert_eq!(white_score, 16.0 + KOMI);
     }
 }
 
