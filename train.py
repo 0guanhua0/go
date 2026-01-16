@@ -54,6 +54,7 @@ def weight_hash(weight):
 
 def init_sgf():
     sgf_game = sgf.Sgf_game(size=config.board)
+    sgf_game.get_root().set_raw("RU", b"Tromp-Taylor")
     sgf_game.get_root().set_raw("KM", b"7.5")
     return sgf_game, sgf_game.get_root()
 
