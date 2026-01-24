@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const BOARD_SIZE: usize = 19;
 const KOMI: f32 = 7.5;
 const HISTORY: usize = 8;
-const SEARCH_BATCH_SIZE: usize = 8;
 const VIRTUAL_LOSS: f32 = 1.0;
 
 struct ZobristTable {
@@ -55,10 +54,6 @@ struct State {
 }
 
 impl State {
-    fn get(&self, r: usize, c: usize) -> i8 {
-        self.board[r * self.board_size + c]
-    }
-
     fn neighbors(&self, r: usize, c: usize) -> Vec<(usize, usize)> {
         [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
             .into_iter()
@@ -350,6 +345,10 @@ impl State {
 
         Ok(feature.to_pyarray(py).reshape(dims)?.to_owned())
     }
+
+    fn get(&self, r: usize, c: usize) -> i8 {
+        self.board[r * self.board_size + c]
+    }
 }
 
 #[pyclass]
@@ -459,17 +458,19 @@ struct MCTS {
     c_puct: f32,
     dirichlet_alpha: f32,
     epsilon: f32,
+    batch_size: usize,
     transposition_table: DashMap<(String, u64, i8), TTval>,
 }
 
 #[pymethods]
 impl MCTS {
     #[new]
-    fn new(c_puct: f32, dirichlet_alpha: f32, epsilon: f32) -> Self {
+    fn new(c_puct: f32, dirichlet_alpha: f32, epsilon: f32, batch_size: usize) -> Self {
         MCTS {
             c_puct,
             dirichlet_alpha,
             epsilon,
+            batch_size,
             transposition_table: DashMap::new(),
         }
     }
@@ -491,9 +492,9 @@ impl MCTS {
                 &weight_hash,
                 root,
                 state,
-                SEARCH_BATCH_SIZE,
+                self.batch_size,
             )?;
-            cnt += SEARCH_BATCH_SIZE;
+            cnt += self.batch_size;
             self._add_dirichlet_noise(root);
         }
         Ok(())
@@ -710,7 +711,7 @@ impl MCTS {
     fn backup(&self, path: &[(&Node, usize)], value: f32) {
         let mut current_value = -value;
         for &(parent, act) in path.iter().rev() {
-            if let (Some(mut count), Some(mut total_val)) = (
+            if let (Some(count), Some(mut total_val)) = (
                 parent.visit_cnt.get_mut(&act),
                 parent.total_act_val.get_mut(&act),
             ) {

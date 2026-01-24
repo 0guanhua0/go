@@ -29,6 +29,23 @@ LOGGING_CONFIG = {
 }
 
 
+def state_repr(self):
+    from sgfmill import ascii_boards, boards
+
+    b = boards.Board(config.board)
+    for r in range(config.board):
+        for c in range(config.board):
+            p = self.get(r, c)
+            if p == 1:
+                b.play(r, c, "b")
+            elif p == -1:
+                b.play(r, c, "w")
+    return ascii_boards.render_board(b)
+
+
+State.__repr__ = state_repr
+
+
 def action_to_coords(action, board):
     if action == board * board:
         return board, board
@@ -101,13 +118,15 @@ class Worker:
     result_pipes = None
     buffer = None
     mempool = None
+    debug = False
 
     @classmethod
-    def init(cls, request_queue, result_pipes, buffer, mempool):
+    def init(cls, request_queue, result_pipes, buffer, mempool, debug):
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
         cls.buffer = buffer
         cls.mempool = mempool
+        cls.debug = debug
         logging.basicConfig(**LOGGING_CONFIG)
 
     def __init__(self):
@@ -131,7 +150,12 @@ class Worker:
 
     def selfplay(self, network, weight_hash, allow_resign, v_resign):
         state = State(config.board)
-        mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, config.DIRICHLET_EPSILON)
+        mcts = MCTS(
+            config.C_PUCT,
+            config.DIRICHLET_ALPHA,
+            config.DIRICHLET_EPSILON,
+            config.SEARCH_BATCH_SIZE,
+        )
 
         sgf_game, sgf_node = init_sgf()
 
@@ -182,6 +206,9 @@ class Worker:
 
             x, y = action_to_coords(act_to_play, config.board)
             state.set(x, y, state.player())
+            if self.debug:
+                logging.info(f"\n{state}")
+                logging.info(f"{act_prob}")
             state_repr = state.get_feature()
 
             root = root.get_child(act_to_play)
@@ -218,7 +245,9 @@ class Worker:
 
     def eval(self, best_hash, next_hash):
         state = State(config.board)
-        mcts = MCTS(config.C_PUCT, config.DIRICHLET_ALPHA, 0.0)
+        mcts = MCTS(
+            config.C_PUCT, config.DIRICHLET_ALPHA, 0.0, config.SEARCH_BATCH_SIZE
+        )
         root = Node()
         sgf_game, sgf_node = init_sgf()
 
@@ -251,6 +280,9 @@ class Worker:
             sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)
             state.set(x, y, state.player())
+            if self.debug:
+                logging.info(f"\n{state}")
+                logging.info(f"{act_prob}")
 
             root = root.get_child(act_to_play)
 
@@ -416,7 +448,7 @@ class MemPool:
     def __init__(self, num_workers, board_size, history_length):
         self.num_workers = num_workers
         plane_cnt = 2 * history_length + 1
-        self.max_batch = 8
+        self.max_batch = config.SEARCH_BATCH_SIZE
 
         self.input = torch.zeros(
             num_workers,
@@ -482,7 +514,7 @@ def main(args):
         job_type="training",
     )
 
-    cpu_count = torch.multiprocessing.cpu_count()
+    cpu_count = args.cpu_count
     queue = torch.multiprocessing.Queue()
     pipe = [Pipe() for _ in range(cpu_count)]
     pipe_cpu = [p[0] for p in pipe]
@@ -549,7 +581,7 @@ def main(args):
         feature=config.history * 2 + 1,
         board=config.board,
     )
-    pool_init_args = (queue, pipe_cpu, buffer, mempool)
+    pool_init_args = (queue, pipe_cpu, buffer, mempool, args.debug)
     cpu_worker_pool = Pool(
         processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
     )
@@ -622,6 +654,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", required=True, help="network device")
+    parser.add_argument("--device", required=True)
+    parser.add_argument(
+        "--cpu_count",
+        type=int,
+        default=torch.multiprocessing.cpu_count(),
+    )
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     main(args)

@@ -9,9 +9,10 @@ selfplay = 10  # 25_000
 EVAL = 50  # 400
 EVAL_THRESHOLD = 0.55
 
-mcts = 100  # 1600
+mcts = 1600
 game = 20_000  # 500_000
 data = game * 300
+SEARCH_BATCH_SIZE = 8
 BATCH_SIZE = 2048
 INITIAL_LR = 1e-2
 LR_MILESTONES = [400_000, 600_000]
