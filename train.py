@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import logging
+import os
 import random
 import time
 
@@ -29,23 +30,6 @@ LOGGING_CONFIG = {
 }
 
 
-def state_repr(self):
-    from sgfmill import ascii_boards, boards
-
-    b = boards.Board(config.board)
-    for r in range(config.board):
-        for c in range(config.board):
-            p = self.get(r, c)
-            if p == 1:
-                b.play(r, c, "b")
-            elif p == -1:
-                b.play(r, c, "w")
-    return ascii_boards.render_board(b)
-
-
-State.__repr__ = state_repr
-
-
 def action_to_coords(action, board):
     if action == board * board:
         return board, board
@@ -54,11 +38,12 @@ def action_to_coords(action, board):
     return x, y
 
 
-def to_sgf_coords(action, board):
-    if action == board * board:
-        return None
-    x, y = action_to_coords(action, board)
-    return (y, x)
+def set_sgf(sgf_node, player, x, y):
+    p = "b" if player == 1 else "w"
+    sgf_coords = None if x == config.board else (x, y)
+    sgf_node = sgf_node.new_child()
+    sgf_node.set_move(p, sgf_coords)
+    return sgf_node
 
 
 def weight_hash(weight):
@@ -74,14 +59,6 @@ def init_sgf():
     sgf_game.get_root().set_raw("RU", b"Tromp-Taylor")
     sgf_game.get_root().set_raw("KM", b"7.5")
     return sgf_game, sgf_game.get_root()
-
-
-def set_sgf(sgf_node, player, action):
-    p = "b" if player == 1 else "w"
-    sgf_coords = to_sgf_coords(action, config.board)
-    sgf_node = sgf_node.new_child()
-    sgf_node.set_move(p, sgf_coords)
-    return sgf_node
 
 
 def sum_sgf(
@@ -118,15 +95,13 @@ class Worker:
     result_pipes = None
     buffer = None
     mempool = None
-    debug = False
 
     @classmethod
-    def init(cls, request_queue, result_pipes, buffer, mempool, debug):
+    def init(cls, request_queue, result_pipes, buffer, mempool):
         cls.request_queue = request_queue
         cls.result_pipes = result_pipes
         cls.buffer = buffer
         cls.mempool = mempool
-        cls.debug = debug
         logging.basicConfig(**LOGGING_CONFIG)
 
     def __init__(self):
@@ -161,7 +136,7 @@ class Worker:
 
         root = Node()
         history = []
-        state_repr = state.get_feature()
+        feature = state.get_feature()
         resigned = False
         v_resign_tune = {1: [], -1: []}
 
@@ -170,7 +145,11 @@ class Worker:
             if game_over:
                 break
 
+            t0 = time.time()
             mcts.search(network, weight_hash, root, state, config.mcts)
+            if os.getenv("DEBUG") >= "2":
+                dt = time.time() - t0
+                logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
 
             temp = 1.0 if state.move_cnt() < 30 else 0.0
             act_prob = mcts.get_act_prob(root, temp)
@@ -194,29 +173,31 @@ class Worker:
 
             history.append(
                 (
-                    state_repr,
+                    feature,
                     policy_target,
                     state.player(),
                     root_val,
                 )
             )
+
             act_to_play = torch.multinomial(policy_target, 1).item()
-
-            sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
-
             x, y = action_to_coords(act_to_play, config.board)
-            state.set(x, y, state.player())
-            if self.debug:
-                logging.info(f"\n{state}")
+            player = state.player()
+            state.set(x, y, player)
+            sgf_node = set_sgf(sgf_node, player, x, y)
+
+            if os.getenv("DEBUG") >= "1":
                 logging.info(f"{act_prob}")
-            state_repr = state.get_feature()
+                logging.info(f"move {state.move_cnt()}: player {player} {act_to_play}")
+                logging.info(f"\n{state}")
+            feature = state.get_feature()
 
             root = root.get_child(act_to_play)
 
         data = []
-        for state_repr_hist, policy, player, r_val in history:
+        for feature, policy, player, r_val in history:
             z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
-            data.append((torch.from_numpy(state_repr_hist), policy, z))
+            data.append((torch.from_numpy(feature), policy, z))
 
         self.buffer.add(data)
 
@@ -273,16 +254,23 @@ class Worker:
                 network = self.net["next"]
                 weight_hash = next_hash
 
+            t0 = time.time()
             mcts.search(network, weight_hash, root, state, config.mcts)
+            if os.getenv("DEBUG") >= "2":
+                dt = time.time() - t0
+                logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
 
+            player = state.player()
             act_prob = mcts.get_act_prob(root, temp=0)
             act_to_play = max(act_prob, key=act_prob.get)
-            sgf_node = set_sgf(sgf_node, state.player(), act_to_play)
             x, y = action_to_coords(act_to_play, config.board)
-            state.set(x, y, state.player())
-            if self.debug:
-                logging.info(f"\n{state}")
+            state.set(x, y, player)
+            sgf_node = set_sgf(sgf_node, player, x, y)
+
+            if os.getenv("DEBUG") >= "1":
                 logging.info(f"{act_prob}")
+                logging.info(f"move {state.move_cnt()}: player {player} {act_to_play}")
+                logging.info(f"\n{state}")
 
             root = root.get_child(act_to_play)
 
@@ -480,6 +468,7 @@ class NetWrapper:
         self.mempool = mempool
 
     def infer(self, state_batch):
+        t0 = time.time()
         batch_size = len(state_batch)
 
         tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
@@ -492,6 +481,9 @@ class NetWrapper:
 
         policy = self.mempool.policy[self.worker_id, :batch_size]
         value = self.mempool.value[self.worker_id, :batch_size]
+        if os.getenv("DEBUG") >= "2":
+            dt = time.time() - t0
+            logging.info(f"infer {dt:.2f}s ({batch_size / dt:.2f} batch/s)")
 
         return policy.cpu().numpy(), value.cpu().numpy()
 
@@ -581,9 +573,11 @@ def main(args):
         feature=config.history * 2 + 1,
         board=config.board,
     )
-    pool_init_args = (queue, pipe_cpu, buffer, mempool, args.debug)
+
     cpu_worker_pool = Pool(
-        processes=cpu_count, initializer=Worker.init, initargs=pool_init_args
+        processes=cpu_count,
+        initializer=Worker.init,
+        initargs=(queue, pipe_cpu, buffer, mempool),
     )
     logging.info(f"{cpu_count} worker and 1 GPU")
 
@@ -660,6 +654,5 @@ if __name__ == "__main__":
         type=int,
         default=torch.multiprocessing.cpu_count(),
     )
-    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     main(args)

@@ -349,6 +349,23 @@ impl State {
     fn get(&self, r: usize, c: usize) -> i8 {
         self.board[r * self.board_size + c]
     }
+
+    fn __repr__(&self) -> String {
+        let mut res = String::new();
+        for r in (0..self.board_size).rev() {
+            for c in 0..self.board_size {
+                let val = self.get(r, c);
+                let char = match val {
+                    1 => "b ",
+                    -1 => "w ",
+                    _ => ". ",
+                };
+                res.push_str(char);
+            }
+            res.push('\n');
+        }
+        res
+    }
 }
 
 #[pyclass]
