@@ -146,7 +146,7 @@ class Worker:
                 break
 
             t0 = time.time()
-            mcts.search(network, weight_hash, root, state, config.mcts)
+            mcts.search(network, bytes.fromhex(weight_hash), root, state, config.mcts)
             if os.getenv("DEBUG") >= "2":
                 dt = time.time() - t0
                 logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
@@ -255,7 +255,7 @@ class Worker:
                 weight_hash = next_hash
 
             t0 = time.time()
-            mcts.search(network, weight_hash, root, state, config.mcts)
+            mcts.search(network, bytes.fromhex(weight_hash), root, state, config.mcts)
             if os.getenv("DEBUG") >= "2":
                 dt = time.time() - t0
                 logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
@@ -481,7 +481,7 @@ class NetWrapper:
 
         policy = self.mempool.policy[self.worker_id, :batch_size]
         value = self.mempool.value[self.worker_id, :batch_size]
-        if os.getenv("DEBUG") >= "2":
+        if os.getenv("DEBUG") >= "3":
             dt = time.time() - t0
             logging.info(f"infer {dt:.2f}s ({batch_size / dt:.2f} batch/s)")
 
@@ -529,7 +529,7 @@ def main(args):
             "model_id": model_id,
             "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
         }
-        filename = f"checkpoint_cycle_{cycle}.pt"
+        filename = f"checkpoint_cycle_{cycle}_{model_id}.pt"
         torch.save(checkpoint_data, filename)
         artifact = wandb.Artifact(
             name=model_id,

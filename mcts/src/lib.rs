@@ -476,7 +476,7 @@ struct MCTS {
     dirichlet_alpha: f32,
     epsilon: f32,
     batch_size: usize,
-    transposition_table: DashMap<(String, u64, i8), TTval>,
+    transposition_table: DashMap<([u8; 32], u64, i8), TTval>,
 }
 
 #[pymethods]
@@ -496,7 +496,7 @@ impl MCTS {
         &self,
         py: Python,
         network: PyObject,
-        weight_hash: String,
+        weight_hash: [u8; 32],
         root: &Node,
         state: &State,
         num_simulations: usize,
@@ -506,7 +506,7 @@ impl MCTS {
             self.process_batch(
                 py,
                 network.clone_ref(py),
-                &weight_hash,
+                weight_hash,
                 root,
                 state,
                 self.batch_size,
@@ -555,7 +555,7 @@ impl MCTS {
         &self,
         py: Python,
         network: PyObject,
-        weight_hash: &str,
+        weight_hash: [u8; 32],
         root: &Node,
         root_state: &State,
         batch_size: usize,
@@ -604,7 +604,7 @@ impl MCTS {
                 values.push((winner.unwrap() * state.player()) as f32);
             } else {
                 is_terminal.push(false);
-                let key = (weight_hash.to_string(), state.hash, state.player());
+                let key = (weight_hash, state.hash, state.player());
                 if let Some(entry) = self.transposition_table.get(&key) {
                     curr_node.expand(&entry.policy);
                     values.push(entry.value);
@@ -659,7 +659,7 @@ impl MCTS {
                 let v = value_view[[idx, 0]];
                 let stat = self.get_stat(&states[i], policy_slice)?;
 
-                let key = (weight_hash.to_string(), states[i].hash, states[i].player());
+                let key = (weight_hash, states[i].hash, states[i].player());
                 self.transposition_table.insert(
                     key,
                     TTval {
