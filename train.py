@@ -17,7 +17,13 @@ from torch.multiprocessing import (
 )
 from whr import whole_history_rating
 
-import config
+import json
+from types import SimpleNamespace
+
+with open("config.json") as f:
+    config = SimpleNamespace(**json.load(f))
+
+
 import dihedral
 import wandb
 from mcts import MCTS, Node, State
@@ -126,10 +132,10 @@ class Worker:
     def selfplay(self, network, weight_hash, allow_resign, v_resign):
         state = State(config.board)
         mcts = MCTS(
-            config.C_PUCT,
-            config.DIRICHLET_ALPHA,
-            config.DIRICHLET_EPSILON,
-            config.SEARCH_BATCH_SIZE,
+            config.c_puct,
+            config.dirichlet_alpha,
+            config.dirichlet_epsilon,
+            config.search_batch_size,
         )
 
         sgf_game, sgf_node = init_sgf()
@@ -227,7 +233,7 @@ class Worker:
     def eval(self, best_hash, next_hash):
         state = State(config.board)
         mcts = MCTS(
-            config.C_PUCT, config.DIRICHLET_ALPHA, 0.0, config.SEARCH_BATCH_SIZE
+            config.c_puct, config.dirichlet_alpha, 0.0, config.search_batch_size
         )
         root = Node()
         sgf_game, sgf_node = init_sgf()
@@ -314,11 +320,11 @@ class GPU(Process):
             m.eval()
         self.optimizer = torch.optim.SGD(
             self.model["next"].parameters(),
-            lr=config.INITIAL_LR,
+            lr=config.initial_lr,
             momentum=0.9,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer, milestones=config.LR_MILESTONES, gamma=0.1
+            self.optimizer, milestones=config.lr_milestones, gamma=0.1
         )
 
     def run(self):
@@ -436,7 +442,7 @@ class MemPool:
     def __init__(self, num_workers, board_size, history_length):
         self.num_workers = num_workers
         plane_cnt = 2 * history_length + 1
-        self.max_batch = config.SEARCH_BATCH_SIZE
+        self.max_batch = config.search_batch_size
 
         self.input = torch.zeros(
             num_workers,
@@ -502,7 +508,7 @@ def main(args):
     logging.basicConfig(**LOGGING_CONFIG)
 
     run = wandb.init(
-        project=config.WANDB_PROJECT_NAME,
+        project=config.wandb_project_name,
         job_type="training",
     )
 
@@ -583,7 +589,7 @@ def main(args):
 
     current_model_id = get_current_model_id()
 
-    v_resign = config.RESIGNATION_THRESHOLD
+    v_resign = config.resignation_threshold
 
     def run_selfplay_games(num_games, weight_hash, v_resign):
         game_args = ((weight_hash, i % 10 != 0, v_resign) for i in range(num_games))
@@ -599,7 +605,7 @@ def main(args):
         model_resign_data = v_resign_dict.get(current_model_id)
         if model_resign_data:
             idx = max(0, int(0.05 * (len(model_resign_data) - 1)))
-            v_resign = max(config.RESIGNATION_THRESHOLD, model_resign_data[idx])
+            v_resign = max(config.resignation_threshold, model_resign_data[idx])
             logging.info(f"weight {current_model_id}: v_resign {v_resign}")
 
         logging.info("selfplay")
@@ -607,8 +613,8 @@ def main(args):
 
         logging.info("train")
         total_loss, batches_done = 0.0, 0
-        for i in range(config.TRAINING_UPDATES_PER_GENERATION):
-            batch = buffer.sample(config.BATCH_SIZE)
+        for i in range(config.training_updates_per_generation):
+            batch = buffer.sample(config.batch_size)
             queue.put(("TRAIN_BATCH", batch))
             response = pipe_main[0].recv()
             if response["status"] == "TRAIN_DONE":
@@ -623,13 +629,13 @@ def main(args):
         model_hashes = get_model_hashes()
         best_model_id = model_hashes["best"]
         next_model_id = model_hashes["next"]
-        eval_args = ((best_model_id, next_model_id) for _ in range(config.EVAL))
+        eval_args = ((best_model_id, next_model_id) for _ in range(config.eval))
         eval_res = list(cpu_worker_pool.imap_unordered(eval_job, eval_args))
 
         best_win = eval_res.count(1) / len(eval_res)
         next_win = eval_res.count(-1) / len(eval_res)
         promoted = False
-        if next_win > config.EVAL_THRESHOLD:
+        if next_win > config.eval_threshold:
             update_whr_with_results(eval_res, best_model_id, next_model_id, cycle)
             logging.info(whr.print_ordered_ratings(current=True))
             logging.info(f"{best_model_id} win rate: {best_win}")

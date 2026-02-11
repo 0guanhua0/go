@@ -1,11 +1,13 @@
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  # Ruff version.
-  rev: v0.13.0
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
   hooks:
-    # Run the linter.
+    - id: pretty-format-json
+      args: [--autofix]
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.15.0
+  hooks:
     - id: ruff-check
-    # Run the formatter.
     - id: ruff-format
 - repo: https://github.com/scop/pre-commit-shfmt
   rev: v3.12.0-2
@@ -15,17 +17,17 @@ repos:
   hooks:
     - id: cargo-fmt
       name: cargo fmt
-      entry: cargo fmt --manifest-path mcts/Cargo.toml
+      entry: cargo fmt --manifest-path Cargo.toml
       language: system
       pass_filenames: false
     - id: cargo-check
       name: cargo check
-      entry: cargo check --manifest-path mcts/Cargo.toml
+      entry: cargo check --manifest-path Cargo.toml
       language: system
       pass_filenames: false
     - id: cargo-test
       name: cargo test
-      entry: cargo test --manifest-path mcts/Cargo.toml
+      entry: cargo test --manifest-path Cargo.toml
       language: system
       pass_filenames: false
     - id: maturin-develop

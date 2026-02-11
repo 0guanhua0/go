@@ -1,0 +1,26 @@
+{
+  "batch_size": 2048,
+  "board": 19,
+  "c_puct": 1.0,
+  "conv_filter": 256,
+  "data": 6000000,
+  "dirichlet_alpha": 0.03,
+  "dirichlet_epsilon": 0.25,
+  "eval": 50,
+  "eval_threshold": 0.55,
+  "game": 20000,
+  "history": 8,
+  "initial_lr": 0.01,
+  "l2_regularization": 0.0001,
+  "lr_milestones": [
+    400000,
+    600000
+  ],
+  "mcts": 1600,
+  "res_block": 19,
+  "resignation_threshold": -0.95,
+  "search_batch_size": 8,
+  "selfplay": 10,
+  "training_updates_per_generation": 1000,
+  "wandb_project_name": "go-zero"
+}
