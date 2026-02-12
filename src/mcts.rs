@@ -37,21 +37,34 @@ pub struct MCTS {
     simulations: usize,
     batcher: Arc<Batcher>,
     device: Device,
+    input_planes: usize,
 }
 
 impl MCTS {
-    pub fn new(batcher: Arc<Batcher>, simulations: usize, device: Device) -> Self {
+    pub fn new(
+        batcher: Arc<Batcher>,
+        simulations: usize,
+        device: Device,
+        input_planes: usize,
+    ) -> Self {
         Self {
             root: Node::new(1.0),
             simulations,
             batcher,
             device,
+            input_planes,
         }
     }
 
     pub fn run(&mut self, state: &GameState) -> Move {
         if !self.root.is_expanded {
-            Self::expand_node(&mut self.root, state, &self.batcher, self.device);
+            Self::expand_node(
+                &mut self.root,
+                state,
+                &self.batcher,
+                self.device,
+                self.input_planes,
+            );
         }
 
         for _ in 0..self.simulations {
@@ -73,7 +86,13 @@ impl MCTS {
                 }
 
                 if !curr.is_expanded {
-                    Self::expand_node(curr, &scratch_state, &self.batcher, self.device)
+                    Self::expand_node(
+                        curr,
+                        &scratch_state,
+                        &self.batcher,
+                        self.device,
+                        self.input_planes,
+                    )
                 } else {
                     0.0
                 }
@@ -116,23 +135,48 @@ impl MCTS {
         best_idx
     }
 
-    fn expand_node(node: &mut Node, state: &GameState, batcher: &Batcher, device: Device) -> f32 {
-        let mut tensor_data = vec![0.0f32; 5 * state.size * state.size];
-        for i in 0..state.size * state.size {
+    fn expand_node(
+        node: &mut Node,
+        state: &GameState,
+        batcher: &Batcher,
+        device: Device,
+        input_planes: usize,
+    ) -> f32 {
+        let mut tensor_data = vec![0.0f32; input_planes * state.size * state.size];
+        let plane_size = state.size * state.size;
+        let history_steps = (input_planes - 1) / 2;
+
+        for i in 0..plane_size {
             if let Some(c) = state.board[i] {
                 if c == state.current_player {
                     tensor_data[i] = 1.0;
                 } else {
-                    tensor_data[state.size * state.size + i] = 1.0;
+                    tensor_data[history_steps * plane_size + i] = 1.0;
                 }
-            } else {
-                tensor_data[2 * state.size * state.size + i] = 1.0;
             }
-            tensor_data[3 * state.size * state.size + i] = 1.0;
+        }
+
+        for (step, hist_board) in state.history.iter().take(history_steps - 1).enumerate() {
+            let p_idx = step + 1;
+            for i in 0..plane_size {
+                if let Some(c) = hist_board[i] {
+                    if c == state.current_player {
+                        tensor_data[p_idx * plane_size + i] = 1.0;
+                    } else {
+                        tensor_data[(history_steps + p_idx) * plane_size + i] = 1.0;
+                    }
+                }
+            }
+        }
+
+        if state.current_player == crate::game::Color::Black {
+            for i in 0..plane_size {
+                tensor_data[(input_planes - 1) * plane_size + i] = 1.0;
+            }
         }
 
         let input = Tensor::from_slice(&tensor_data)
-            .view([1, 5, state.size as i64, state.size as i64])
+            .view([1, input_planes as i64, state.size as i64, state.size as i64])
             .to(device);
 
         let (policy, value) = batcher.evaluate(input);

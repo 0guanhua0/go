@@ -17,9 +17,7 @@ fn main() -> Result<()> {
     let num_threads = 128;
     let simulations = config["mcts"].as_u64().unwrap_or(1600) as usize;
     let board_size = config["board"].as_u64().unwrap_or(19) as usize;
-    let conv_filter = config["conv_filter"].as_u64().unwrap_or(256) as i64;
-    let res_block = config["res_block"].as_u64().unwrap_or(19) as i64;
-    let input_planes = 5;
+    let input_planes = config["history"].as_u64().unwrap_or(8) * 2 + 1;
 
     let device = if tch::Cuda::is_available() {
         Device::Cuda(0)
@@ -29,14 +27,7 @@ fn main() -> Result<()> {
         Device::Cpu
     };
 
-    let batcher = Arc::new(Batcher::new(
-        device,
-        batch_size,
-        board_size as i64,
-        input_planes,
-        conv_filter,
-        res_block,
-    ));
+    let batcher = Arc::new(Batcher::new(device, batch_size));
 
     let mut handles = vec![];
 
@@ -44,7 +35,7 @@ fn main() -> Result<()> {
         let batcher_clone = batcher.clone();
         let handle = thread::spawn(move || {
             let mut state = GameState::new(board_size);
-            let mut mcts = MCTS::new(batcher_clone, simulations, device);
+            let mut mcts = MCTS::new(batcher_clone, simulations, device, input_planes as usize);
 
             for _ in 0..722 {
                 let mv = mcts.run(&state);

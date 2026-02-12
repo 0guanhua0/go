@@ -526,23 +526,27 @@ def main(args):
     whr = whole_history_rating.Base()
 
     def save_checkpoint(cycle, run, cfg):
+        model_hashes = get_model_hashes()
+        model_id = model_hashes["best"]
+
         queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = pipe_main[0].recv()
-        model_id = weight_hash(gpu_state["best_model_state_dict"].values())
-        checkpoint_data = {
-            "cycle": cycle,
-            "best_model_state_dict": gpu_state["best_model_state_dict"],
-            "model_id": model_id,
-            "run_config": {k: v for k, v in cfg.__dict__.items() if k.isupper()},
-        }
-        filename = f"checkpoint_cycle_{cycle}_{model_id}.pt"
-        torch.save(checkpoint_data, filename)
-        artifact = wandb.Artifact(
-            name=model_id,
-            type="model-checkpoint",
+
+        model = AlphaGoZero(
+            config.board,
+            config.history,
+            config.conv_filter,
+            config.res_block,
         )
-        artifact.add_file(filename)
-        run.log_artifact(artifact, aliases=["latest", f"cycle-{cycle}", model_id])
+        model.load_state_dict(gpu_state["best_model_state_dict"])
+        model.eval()
+
+        filename = f"models/{model_id}.pt"
+        example_input = torch.zeros(
+            1, config.history * 2 + 1, config.board, config.board
+        )
+        traced_model = torch.jit.trace(model, example_input)
+        traced_model.save(filename)
 
     def update_whr_with_results(results, best_id, next_id, time_step):
         for result in results:
