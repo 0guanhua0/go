@@ -349,6 +349,13 @@ class GPU(Process):
                 elif command == "PROMOTE":
                     self.model["best"].load_state_dict(self.model["next"].state_dict())
                     self.model["best"].eval()
+                elif command == "LOAD_MODEL":
+                    path = payload
+                    loaded_model = torch.jit.load(path, map_location=self.device)
+                    self.model["best"].load_state_dict(loaded_model.state_dict())
+                    self.model["next"].load_state_dict(loaded_model.state_dict())
+                    self.model["best"].eval()
+                    self.model["next"].eval()
                 elif command == "RESET":
                     self.model["next"].load_state_dict(self.model["best"].state_dict())
                 elif command == "STEP_SCHEDULER":
@@ -525,7 +532,7 @@ def main(args):
     current_model_id = None
     whr = whole_history_rating.Base()
 
-    def save_checkpoint(cycle, run, cfg):
+    def save_checkpoint():
         model_hashes = get_model_hashes()
         model_id = model_hashes["best"]
 
@@ -574,6 +581,9 @@ def main(args):
         gpu_hashes = pipe_main[0].recv()
         return gpu_hashes
 
+    def load_model(path):
+        queue.put(("LOAD_MODEL", path))
+
     gpu = GPU(queue, pipe_gpu, pipe_main[1], mempool, args.device)
     gpu.daemon = True
     gpu.start()
@@ -590,6 +600,15 @@ def main(args):
         initargs=(queue, pipe_cpu, buffer, mempool),
     )
     logging.info(f"{cpu_count} worker and 1 GPU")
+
+    os.makedirs("models", exist_ok=True)
+    models = os.listdir("models")
+    if not models:
+        save_checkpoint()
+        models = os.listdir("models")
+
+    path = max([os.path.join("models", f) for f in models], key=os.path.getmtime)
+    load_model(path)
 
     current_model_id = get_current_model_id()
 
@@ -649,7 +668,7 @@ def main(args):
         else:
             queue.put(("RESET", None))
         if promoted:
-            save_checkpoint(cycle, run, config)
+            save_checkpoint()
         run.log(log_data, step=cycle)
 
         current_model_id = get_current_model_id()
