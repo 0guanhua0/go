@@ -21,6 +21,5 @@
   "resignation_threshold": -0.95,
   "search_batch_size": 8,
   "selfplay": 10,
-  "training_updates_per_generation": 1000,
-  "wandb_project_name": "go-zero"
+  "training_updates_per_generation": 1000
 }

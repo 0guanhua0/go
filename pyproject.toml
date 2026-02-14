@@ -4,7 +4,6 @@ dynamic = ["version"]
 dependencies = [
     "sgfmill",
     "torch==2.7.0",
-    "wandb",
     "whole-history-rating",
 ]
 

@@ -25,7 +25,6 @@ with open("config.json") as f:
 
 
 import dihedral
-import wandb
 from mcts import MCTS, Node, State
 from network import AlphaGoZero
 from ring import Ring
@@ -514,11 +513,6 @@ def main(args):
 
     logging.basicConfig(**LOGGING_CONFIG)
 
-    run = wandb.init(
-        project=config.wandb_project_name,
-        job_type="training",
-    )
-
     cpu_count = args.cpu_count
     queue = torch.multiprocessing.Queue()
     pipe = [Pipe() for _ in range(cpu_count)]
@@ -622,8 +616,6 @@ def main(args):
     cycle = 1
     while True:
         logging.info(f"cycle {cycle}")
-        log_data = {"cycle": cycle}
-        run.log(log_data, step=cycle, commit=False)
 
         model_resign_data = v_resign_dict.get(current_model_id)
         if model_resign_data:
@@ -669,7 +661,6 @@ def main(args):
             queue.put(("RESET", None))
         if promoted:
             save_checkpoint()
-        run.log(log_data, step=cycle)
 
         current_model_id = get_current_model_id()
         cycle += 1
