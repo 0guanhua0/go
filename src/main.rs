@@ -13,11 +13,11 @@ use tch::Device;
 
 fn main() -> Result<()> {
     let config = config::Config::load()?;
-    let batch_size = config["batch_size"].as_u64().unwrap_or(1024) as usize;
-    let num_threads = 128;
-    let simulations = config["mcts"].as_u64().unwrap_or(1600) as usize;
-    let board_size = config["board"].as_u64().unwrap_or(19) as usize;
-    let input_planes = config["history"].as_u64().unwrap_or(8) * 2 + 1;
+    let batch_size = config["batch_size"].as_u64().unwrap() as usize;
+    let game_thread = config["game_thread"].as_u64().unwrap() as usize;
+    let simulations = config["mcts"].as_u64().unwrap() as usize;
+    let board_size = config["board"].as_u64().unwrap() as usize;
+    let input_planes = config["history"].as_u64().unwrap() * 2 + 1;
 
     let device = if tch::Cuda::is_available() {
         Device::Cuda(0)
@@ -31,16 +31,23 @@ fn main() -> Result<()> {
 
     let mut handles = vec![];
 
-    for _ in 0..num_threads {
+    for _ in 0..game_thread {
         let batcher_clone = batcher.clone();
         let handle = thread::spawn(move || {
-            let mut state = GameState::new(board_size);
-            let mut mcts = MCTS::new(batcher_clone, simulations, device, input_planes as usize);
+            loop {
+                let mut state = GameState::new(board_size);
+                let mut mcts = MCTS::new(
+                    batcher_clone.clone(),
+                    simulations,
+                    device,
+                    input_planes as usize,
+                );
 
-            for _ in 0..722 {
-                let mv = mcts.run(&state);
-                if !state.play(mv) {
-                    break;
+                for _ in 0..722 {
+                    let mv = mcts.run(&state);
+                    if !state.play(mv) {
+                        break;
+                    }
                 }
             }
         });
