@@ -384,11 +384,11 @@ class GPU(Process):
             batches.setdefault(model_name, []).append((worker_id, batch_size))
 
         for model_name, items in batches.items():
-            features = []
+            feature = []
             for worker_id, batch_size in items:
-                features.append(self.mempool.input[worker_id, :batch_size])
+                feature.append(self.mempool.input[worker_id, :batch_size])
 
-            feature_batch = torch.cat(features, dim=0)
+            feature_batch = torch.cat(feature, dim=0)
 
             dihedral_id = random.randrange(len(dihedral.to))
             feature = (

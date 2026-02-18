@@ -29,18 +29,18 @@ fn save_game(
     let path = format!("{}/{}.npz", dir, game_id);
 
     let n = history.len();
-    let mut features = Vec::with_capacity(n * input_planes * board_size * board_size);
+    let mut feature = Vec::with_capacity(n * input_planes * board_size * board_size);
     let mut policies = Vec::with_capacity(n * (board_size * board_size + 1));
     let mut values = Vec::with_capacity(n);
 
     for (f, p, player) in history {
-        features.extend_from_slice(f);
+        feature.extend_from_slice(f);
         policies.extend_from_slice(p);
         let v = if *player == winner { 1.0f32 } else { -1.0f32 };
         values.push(v);
     }
 
-    let features_arr = Array::from_shape_vec((n, input_planes, board_size, board_size), features)?;
+    let feature_arr = Array::from_shape_vec((n, input_planes, board_size, board_size), feature)?;
     let policies_arr = Array::from_shape_vec((n, board_size * board_size + 1), policies)?;
     let values_arr = Array::from_shape_vec((n, 1), values)?;
 
@@ -50,14 +50,14 @@ fn save_game(
         .array("features", zip::write::FileOptions::default())?
         .default_dtype()
         .shape(
-            &features_arr
+            &feature_arr
                 .shape()
                 .iter()
                 .map(|&x| x as u64)
                 .collect::<Vec<_>>(),
         )
         .begin_nd()?
-        .extend(features_arr.iter())?;
+        .extend(feature_arr.iter())?;
 
     writer
         .array("policies", zip::write::FileOptions::default())?
@@ -124,10 +124,10 @@ fn main() -> Result<()> {
 
                 let mut history = Vec::new();
                 for _ in 0..722 {
-                    let features = MCTS::get_features(&state, input_planes as usize);
+                    let feature = MCTS::get_feature(&state);
                     let mv = mcts.run(&state);
                     let policy = mcts.get_policy(&state);
-                    history.push((features, policy, state.current_player));
+                    history.push((feature, policy, state.player()));
 
                     if !state.play(mv) {
                         break;

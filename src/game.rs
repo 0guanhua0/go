@@ -35,7 +35,7 @@ pub struct Game {
     pub board: Vec<i8>,
     pub history: VecDeque<Vec<i8>>,
     pub size: usize,
-    pub current_player: i8,
+    pub player: i8,
     pub move_cnt: usize,
     pub last_move: Option<usize>,
     pub hash: u64,
@@ -46,8 +46,9 @@ impl Game {
     pub fn new(size: usize) -> Self {
         let config = Config::load().unwrap();
         let board = vec![0; size * size];
-        let mut history = VecDeque::with_capacity(config["history"].as_u64().unwrap() as usize);
-        for _ in 0..history.capacity() {
+        let cap = config["history"].as_u64().unwrap() as usize;
+        let mut history = VecDeque::with_capacity(cap);
+        for _ in 0..cap {
             history.push_front(board.clone());
         }
 
@@ -58,7 +59,7 @@ impl Game {
             board,
             history,
             size,
-            current_player: 1,
+            player: 1,
             move_cnt: 0,
             last_move: None,
             hash: 0,
@@ -68,6 +69,10 @@ impl Game {
 
     pub fn get_index(&self, x: usize, y: usize) -> usize {
         y * self.size + x
+    }
+
+    pub fn player(&self) -> i8 {
+        self.player
     }
 
     pub fn is_on_board(&self, x: isize, y: isize) -> bool {
@@ -88,10 +93,10 @@ impl Game {
                 return false;
             }
 
-            next_board[idx] = self.current_player;
-            next_hash ^= ZOBRIST_TABLE.key[x][y][zobrist_idx(self.current_player)];
+            next_board[idx] = self.player;
+            next_hash ^= ZOBRIST_TABLE.key[x][y][zobrist_idx(self.player)];
 
-            let opponent = -self.current_player;
+            let opponent = -self.player;
             let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0)];
             let mut captured_indices = Vec::new();
 
@@ -131,6 +136,7 @@ impl Game {
             return false;
         }
 
+        self.board = next_board;
         if self.history.len() == self.history.capacity() {
             self.history.rotate_right(1);
             self.history[0].clone_from(&self.board);
@@ -138,10 +144,9 @@ impl Game {
             self.history.push_front(self.board.clone());
         }
 
-        self.board = next_board;
         self.hash = next_hash;
         self.hash_history.insert(self.hash);
-        self.current_player = -self.current_player;
+        self.player = -self.player;
         self.last_move = Some(mv);
         self.move_cnt += 1;
         true

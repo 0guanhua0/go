@@ -143,42 +143,28 @@ impl MCTS {
         policy
     }
 
-    pub fn get_features(game: &Game, input_planes: usize) -> Vec<f32> {
-        let mut tensor_data = vec![0.0f32; input_planes * game.size * game.size];
+    pub fn get_feature(game: &Game) -> Vec<f32> {
+        let cap = game.history.capacity();
+        let input_planes = 2 * cap + 1;
         let plane_size = game.size * game.size;
-        let history_steps = (input_planes - 1) / 2;
+        let mut feature = vec![0.0f32; input_planes * plane_size];
 
-        for i in 0..plane_size {
-            let c = game.board[i];
-            if c != 0 {
-                if c == game.current_player {
-                    tensor_data[i] = 1.0;
-                } else {
-                    tensor_data[history_steps * plane_size + i] = 1.0;
+        for (idx, board) in game.history.iter().enumerate() {
+            let p1 = idx * 2 * plane_size;
+            let p2 = p1 + plane_size;
+            for i in 0..plane_size {
+                if board[i] == game.player() {
+                    feature[p1 + i] = 1.0;
+                } else if board[i] == -game.player() {
+                    feature[p2 + i] = 1.0;
                 }
             }
         }
 
-        for (step, hist_board) in game.history.iter().take(history_steps - 1).enumerate() {
-            let p_idx = step + 1;
-            for i in 0..plane_size {
-                let c = hist_board[i];
-                if c != 0 {
-                    if c == game.current_player {
-                        tensor_data[p_idx * plane_size + i] = 1.0;
-                    } else {
-                        tensor_data[(history_steps + p_idx) * plane_size + i] = 1.0;
-                    }
-                }
-            }
+        if game.player() == 1 {
+            feature[2 * cap * plane_size..].fill(1.0);
         }
-
-        if game.current_player == 1 {
-            for i in 0..plane_size {
-                tensor_data[(input_planes - 1) * plane_size + i] = 1.0;
-            }
-        }
-        tensor_data
+        feature
     }
 
     fn select(node: &Node, c_puct: f32) -> usize {
@@ -204,10 +190,11 @@ impl MCTS {
         game: &Game,
         batcher: &Batcher,
         device: Device,
-        input_planes: usize,
+        _input_planes: usize,
     ) -> f32 {
-        let tensor_data = Self::get_features(game, input_planes);
-        let input = Tensor::from_slice(&tensor_data)
+        let feature = Self::get_feature(game);
+        let input_planes = game.history.len() * 2 + 1;
+        let input = Tensor::from_slice(&feature)
             .view([1, input_planes as i64, game.size as i64, game.size as i64])
             .to(device);
 

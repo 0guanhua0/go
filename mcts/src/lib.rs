@@ -616,7 +616,7 @@ impl MCTS {
         }
 
         let mut eval_indices = Vec::new();
-        let mut features = Vec::new();
+        let mut feature = Vec::new();
 
         for i in 0..batch_size {
             if !is_terminal[i] {
@@ -628,14 +628,14 @@ impl MCTS {
 
                 if leaf_node.children.is_empty() {
                     eval_indices.push(i);
-                    features.push(states[i].get_feature(py)?);
+                    feature.push(states[i].get_feature(py)?);
                 }
             }
         }
 
         if !eval_indices.is_empty() {
             let np = PyModule::import(py, "numpy")?;
-            let batch_numpy_array = np.call_method1("stack", (features,))?;
+            let batch_numpy_array = np.call_method1("stack", (feature,))?;
 
             let result = network.call_method1(py, "infer", (batch_numpy_array,))?;
             let (policies, value_arr): (Bound<'_, PyArray2<f32>>, Bound<'_, PyArray2<f32>>) =
