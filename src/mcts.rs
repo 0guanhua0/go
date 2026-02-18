@@ -125,19 +125,11 @@ impl MCTS {
 
     pub fn get_policy(&self, game: &Game) -> Vec<f32> {
         let mut policy = vec![0.0; game.size * game.size + 1];
-        let total_visits: usize = self.root.next.values().map(|c| c.visit_count).sum();
+        let sum: usize = self.root.next.values().map(|c| c.visit_count).sum();
 
-        if total_visits > 0 {
+        if sum > 0 {
             for (&idx, n) in self.root.next.iter() {
-                policy[idx] = n.visit_count as f32 / total_visits as f32;
-            }
-        } else {
-            let valid_moves: Vec<_> = self.root.next.keys().collect();
-            if !valid_moves.is_empty() {
-                let p = 1.0 / valid_moves.len() as f32;
-                for &&idx in &valid_moves {
-                    policy[idx] = p;
-                }
+                policy[idx] = n.visit_count as f32 / sum as f32;
             }
         }
         policy
