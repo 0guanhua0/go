@@ -26,8 +26,8 @@ impl ZobristTable {
 
 static ZOBRIST_TABLE: LazyLock<ZobristTable> = LazyLock::new(ZobristTable::new);
 
-fn zobrist_idx(color: i8) -> usize {
-    if color == 1 { 0 } else { 1 }
+fn zobrist_idx(player: i8) -> usize {
+    if player == 1 { 1 } else { 0 }
 }
 
 #[derive(Clone)]
@@ -35,9 +35,7 @@ pub struct Game {
     pub board: Vec<i8>,
     pub history: VecDeque<Vec<i8>>,
     pub size: usize,
-    pub player: i8,
     pub move_cnt: usize,
-    pub last_move: Option<usize>,
     pub hash: u64,
     pub hash_history: HashSet<u64>,
 }
@@ -59,9 +57,7 @@ impl Game {
             board,
             history,
             size,
-            player: 1,
             move_cnt: 0,
-            last_move: None,
             hash: 0,
             hash_history,
         }
@@ -72,7 +68,7 @@ impl Game {
     }
 
     pub fn player(&self) -> i8 {
-        self.player
+        if self.move_cnt % 2 == 0 { 1 } else { -1 }
     }
 
     pub fn is_on_board(&self, x: isize, y: isize) -> bool {
@@ -80,6 +76,7 @@ impl Game {
     }
 
     pub fn play(&mut self, mv: usize) -> bool {
+        let player = self.player();
         let mut next_hash = self.hash;
         let mut next_board = self.board.clone();
 
@@ -93,10 +90,10 @@ impl Game {
                 return false;
             }
 
-            next_board[idx] = self.player;
-            next_hash ^= ZOBRIST_TABLE.key[x][y][zobrist_idx(self.player)];
+            next_board[idx] = player;
+            next_hash ^= ZOBRIST_TABLE.key[x][y][zobrist_idx(player)];
 
-            let opponent = -self.player;
+            let opponent = -player;
             let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0)];
             let mut captured_indices = Vec::new();
 
@@ -146,8 +143,6 @@ impl Game {
 
         self.hash = next_hash;
         self.hash_history.insert(self.hash);
-        self.player = -self.player;
-        self.last_move = Some(mv);
         self.move_cnt += 1;
         true
     }

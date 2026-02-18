@@ -113,7 +113,7 @@ fn main() -> Result<()> {
         let batcher_clone = batcher.clone();
         let handle = thread::spawn(move || {
             loop {
-                let mut state = Game::new(board_size);
+                let mut game = Game::new(board_size);
                 let mut mcts = MCTS::new(
                     batcher_clone.clone(),
                     simulations,
@@ -124,18 +124,18 @@ fn main() -> Result<()> {
 
                 let mut history = Vec::new();
                 for _ in 0..722 {
-                    let feature = MCTS::get_feature(&state);
-                    let mv = mcts.run(&state);
-                    let policy = mcts.get_policy(&state);
-                    history.push((feature, policy, state.player()));
+                    let feature = MCTS::get_feature(&game);
+                    let mv = mcts.run(&game);
+                    let policy = mcts.get_policy(&game);
+                    history.push((feature, policy, game.player()));
 
-                    if !state.play(mv) {
+                    if !game.play(mv) {
                         break;
                     }
                     mcts.update_root(mv);
                 }
 
-                if let Some(winner) = state.get_winner() {
+                if let Some(winner) = game.get_winner() {
                     let model_id = batcher_clone.model_id();
                     let _ = save_game(
                         &model_id,
