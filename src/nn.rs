@@ -1,16 +1,19 @@
 use std::fs;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tch::{CModule, Device, IValue, Tensor};
 
 pub struct Batcher {
     sender: mpsc::Sender<(Tensor, mpsc::Sender<(Tensor, Tensor)>)>,
+    model_id: Arc<Mutex<Option<String>>>,
 }
 
 impl Batcher {
     pub fn new(device: Device, batch_size: usize) -> Self {
         let (tx, rx) = mpsc::channel::<(Tensor, mpsc::Sender<(Tensor, Tensor)>)>();
+        let model_id = Arc::new(Mutex::new(None));
+        let model_id_clone = model_id.clone();
 
         thread::spawn(move || {
             let mut last_loaded_path = None;
@@ -26,6 +29,8 @@ impl Batcher {
                 let path = entry.path();
                 if let Ok(m) = CModule::load_on_device(&path, device) {
                     model = Some(m);
+                    let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+                    *model_id_clone.lock().unwrap() = Some(id);
                     last_loaded_path = Some(path);
                 }
             }
@@ -53,6 +58,9 @@ impl Batcher {
                             if Some(&path) != last_loaded_path.as_ref() {
                                 if let Ok(m) = CModule::load_on_device(&path, device) {
                                     model = Some(m);
+                                    let id =
+                                        path.file_stem().unwrap().to_str().unwrap().to_string();
+                                    *model_id_clone.lock().unwrap() = Some(id);
                                     last_loaded_path = Some(path);
                                 }
                             }
@@ -103,7 +111,14 @@ impl Batcher {
             }
         });
 
-        Self { sender: tx }
+        Self {
+            sender: tx,
+            model_id,
+        }
+    }
+
+    pub fn model_id(&self) -> String {
+        self.model_id.lock().unwrap().clone().unwrap()
     }
 
     pub fn evaluate(&self, input: Tensor) -> (Tensor, Tensor) {

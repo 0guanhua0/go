@@ -213,3 +213,5 @@ wandb/
 *.txt
 *.tex
 *.pt
+data/
+models/

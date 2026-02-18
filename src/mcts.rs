@@ -1,25 +1,25 @@
-use crate::game::{GameState, Move};
+use crate::game::Game;
 use crate::nn::Batcher;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tch::{Device, Tensor};
 
 struct Node {
-    visit_count: u32,
-    value_sum: f32,
+    visit_count: usize,
+    total_action_value: f32,
     prior: f32,
-    children: HashMap<usize, Node>,
-    is_expanded: bool,
+    next: HashMap<usize, Node>,
+    expand: bool,
 }
 
 impl Node {
     fn new(prior: f32) -> Self {
         Self {
             visit_count: 0,
-            value_sum: 0.0,
+            total_action_value: 0.0,
             prior,
-            children: HashMap::new(),
-            is_expanded: false,
+            next: HashMap::new(),
+            expand: false,
         }
     }
 
@@ -27,7 +27,7 @@ impl Node {
         if self.visit_count == 0 {
             0.0
         } else {
-            self.value_sum / self.visit_count as f32
+            self.total_action_value / self.visit_count as f32
         }
     }
 }
@@ -38,6 +38,7 @@ pub struct MCTS {
     batcher: Arc<Batcher>,
     device: Device,
     input_planes: usize,
+    c_puct: f32,
 }
 
 impl MCTS {
@@ -46,6 +47,7 @@ impl MCTS {
         simulations: usize,
         device: Device,
         input_planes: usize,
+        c_puct: f32,
     ) -> Self {
         Self {
             root: Node::new(1.0),
@@ -53,14 +55,15 @@ impl MCTS {
             batcher,
             device,
             input_planes,
+            c_puct,
         }
     }
 
-    pub fn run(&mut self, state: &GameState) -> Move {
-        if !self.root.is_expanded {
+    pub fn run(&mut self, game: &Game) -> usize {
+        if !self.root.expand {
             Self::expand_node(
                 &mut self.root,
-                state,
+                game,
                 &self.batcher,
                 self.device,
                 self.input_planes,
@@ -69,26 +72,24 @@ impl MCTS {
 
         for _ in 0..self.simulations {
             let mut search_path = Vec::new();
-            let mut scratch_state = state.clone();
+            let mut scratch_game = game.clone();
 
             let value = {
                 let mut curr = &mut self.root;
 
-                while curr.is_expanded && !curr.children.is_empty() {
-                    let best_move_idx = Self::select_child(curr);
+                while curr.expand && !curr.next.is_empty() {
+                    let best_move_idx = Self::select(curr, self.c_puct);
                     search_path.push(best_move_idx);
 
-                    let y = best_move_idx / scratch_state.size;
-                    let x = best_move_idx % scratch_state.size;
-                    scratch_state.play(Move::Play(x, y));
+                    scratch_game.play(best_move_idx);
 
-                    curr = curr.children.get_mut(&best_move_idx).unwrap();
+                    curr = curr.next.get_mut(&best_move_idx).unwrap();
                 }
 
-                if !curr.is_expanded {
+                if !curr.expand {
                     Self::expand_node(
                         curr,
-                        &scratch_state,
+                        &scratch_game,
                         &self.batcher,
                         self.device,
                         self.input_planes,
@@ -101,31 +102,94 @@ impl MCTS {
             Self::backup(&mut self.root, &search_path, value);
         }
 
-        let mut best_count = -1;
+        let mut best_count = 0;
         let mut best_move_idx = 0;
 
-        for (idx, child) in self.root.children.iter() {
-            if child.visit_count as i32 > best_count {
-                best_count = child.visit_count as i32;
+        for (idx, n) in self.root.next.iter() {
+            if n.visit_count > best_count {
+                best_count = n.visit_count;
                 best_move_idx = *idx;
             }
         }
 
-        let y = best_move_idx / state.size;
-        let x = best_move_idx % state.size;
-        Move::Play(x, y)
+        best_move_idx
     }
 
-    fn select_child(node: &Node) -> usize {
+    pub fn update_root(&mut self, mv: usize) {
+        if let Some(node) = self.root.next.remove(&mv) {
+            self.root = node;
+        } else {
+            self.root = Node::new(1.0);
+        }
+    }
+
+    pub fn get_policy(&self, game: &Game) -> Vec<f32> {
+        let mut policy = vec![0.0; game.size * game.size + 1];
+        let total_visits: usize = self.root.next.values().map(|c| c.visit_count).sum();
+
+        if total_visits > 0 {
+            for (&idx, n) in self.root.next.iter() {
+                policy[idx] = n.visit_count as f32 / total_visits as f32;
+            }
+        } else {
+            let valid_moves: Vec<_> = self.root.next.keys().collect();
+            if !valid_moves.is_empty() {
+                let p = 1.0 / valid_moves.len() as f32;
+                for &&idx in &valid_moves {
+                    policy[idx] = p;
+                }
+            }
+        }
+        policy
+    }
+
+    pub fn get_features(game: &Game, input_planes: usize) -> Vec<f32> {
+        let mut tensor_data = vec![0.0f32; input_planes * game.size * game.size];
+        let plane_size = game.size * game.size;
+        let history_steps = (input_planes - 1) / 2;
+
+        for i in 0..plane_size {
+            let c = game.board[i];
+            if c != 0 {
+                if c == game.current_player {
+                    tensor_data[i] = 1.0;
+                } else {
+                    tensor_data[history_steps * plane_size + i] = 1.0;
+                }
+            }
+        }
+
+        for (step, hist_board) in game.history.iter().take(history_steps - 1).enumerate() {
+            let p_idx = step + 1;
+            for i in 0..plane_size {
+                let c = hist_board[i];
+                if c != 0 {
+                    if c == game.current_player {
+                        tensor_data[p_idx * plane_size + i] = 1.0;
+                    } else {
+                        tensor_data[(history_steps + p_idx) * plane_size + i] = 1.0;
+                    }
+                }
+            }
+        }
+
+        if game.current_player == 1 {
+            for i in 0..plane_size {
+                tensor_data[(input_planes - 1) * plane_size + i] = 1.0;
+            }
+        }
+        tensor_data
+    }
+
+    fn select(node: &Node, c_puct: f32) -> usize {
         let mut best_score = -f32::INFINITY;
         let mut best_idx = 0;
-        let cpuct = 1.0;
 
-        for (idx, child) in node.children.iter() {
-            let q_value = -child.value();
-            let u_value = cpuct * child.prior * (node.visit_count as f32).sqrt()
-                / (1.0 + child.visit_count as f32);
-            let score = q_value + u_value;
+        for (idx, n) in node.next.iter() {
+            let q = -n.value();
+            let u =
+                c_puct * n.prior * (node.visit_count as f32).sqrt() / (1.0 + n.visit_count as f32);
+            let score = q + u;
 
             if score > best_score {
                 best_score = score;
@@ -137,46 +201,14 @@ impl MCTS {
 
     fn expand_node(
         node: &mut Node,
-        state: &GameState,
+        game: &Game,
         batcher: &Batcher,
         device: Device,
         input_planes: usize,
     ) -> f32 {
-        let mut tensor_data = vec![0.0f32; input_planes * state.size * state.size];
-        let plane_size = state.size * state.size;
-        let history_steps = (input_planes - 1) / 2;
-
-        for i in 0..plane_size {
-            if let Some(c) = state.board[i] {
-                if c == state.current_player {
-                    tensor_data[i] = 1.0;
-                } else {
-                    tensor_data[history_steps * plane_size + i] = 1.0;
-                }
-            }
-        }
-
-        for (step, hist_board) in state.history.iter().take(history_steps - 1).enumerate() {
-            let p_idx = step + 1;
-            for i in 0..plane_size {
-                if let Some(c) = hist_board[i] {
-                    if c == state.current_player {
-                        tensor_data[p_idx * plane_size + i] = 1.0;
-                    } else {
-                        tensor_data[(history_steps + p_idx) * plane_size + i] = 1.0;
-                    }
-                }
-            }
-        }
-
-        if state.current_player == crate::game::Color::Black {
-            for i in 0..plane_size {
-                tensor_data[(input_planes - 1) * plane_size + i] = 1.0;
-            }
-        }
-
+        let tensor_data = Self::get_features(game, input_planes);
         let input = Tensor::from_slice(&tensor_data)
-            .view([1, input_planes as i64, state.size as i64, state.size as i64])
+            .view([1, input_planes as i64, game.size as i64, game.size as i64])
             .to(device);
 
         let (policy, value) = batcher.evaluate(input);
@@ -187,10 +219,10 @@ impl MCTS {
         let mut sum_exp = 0.0;
         let mut valid_moves = Vec::new();
 
-        for y in 0..state.size {
-            for x in 0..state.size {
-                if state.board[state.get_index(x, y)].is_none() {
-                    let idx = state.get_index(x, y);
+        for y in 0..game.size {
+            for x in 0..game.size {
+                if game.board[game.get_index(x, y)] == 0 {
+                    let idx = game.get_index(x, y);
                     let p = policy_vec[idx].exp();
                     sum_exp += p;
                     valid_moves.push((idx, p));
@@ -200,22 +232,24 @@ impl MCTS {
 
         for (idx, p) in valid_moves {
             let prior = p / sum_exp;
-            node.children.insert(idx, Node::new(prior));
+            node.next.insert(idx, Node::new(prior));
         }
 
-        node.is_expanded = true;
+        node.expand = true;
         node_value
     }
 
     fn backup(root: &mut Node, path: &[usize], value: f32) {
         let mut curr = root;
+        let mut current_value = value;
         curr.visit_count += 1;
-        curr.value_sum += value;
+        curr.total_action_value += current_value;
 
         for &idx in path {
-            curr = curr.children.get_mut(&idx).unwrap();
+            current_value = -current_value;
+            curr = curr.next.get_mut(&idx).unwrap();
             curr.visit_count += 1;
-            curr.value_sum += value;
+            curr.total_action_value += current_value;
         }
     }
 }
