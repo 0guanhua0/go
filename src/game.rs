@@ -3,24 +3,22 @@ use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
 
-const BOARD_MAX_SIZE: usize = 19;
-
 struct ZobristTable {
-    pub key: [[[u64; 2]; BOARD_MAX_SIZE]; BOARD_MAX_SIZE],
+    pub key: Vec<u64>,
+    pub player: [u64; 2],
 }
 
 impl ZobristTable {
     fn new() -> Self {
+        let config = Config::load().unwrap();
+        let size = config["board"].as_u64().unwrap() as usize;
         let mut rng = rand::rng();
-        let mut key = [[[0; 2]; BOARD_MAX_SIZE]; BOARD_MAX_SIZE];
-        for r in 0..BOARD_MAX_SIZE {
-            for c in 0..BOARD_MAX_SIZE {
-                for p in 0..2 {
-                    key[r][c][p] = rng.random();
-                }
-            }
+        let mut key = vec![0u64; size * size * 2];
+        for i in 0..key.len() {
+            key[i] = rng.random();
         }
-        ZobristTable { key }
+        let player = [rng.random(), rng.random()];
+        ZobristTable { key, player }
     }
 }
 
@@ -50,15 +48,16 @@ impl Game {
             history.push_front(board.clone());
         }
 
+        let hash = ZOBRIST_TABLE.player[zobrist_idx(1)];
         let mut hash_history = HashSet::new();
-        hash_history.insert(0);
+        hash_history.insert(hash);
 
         Self {
             board,
             history,
             size,
             move_cnt: 0,
-            hash: 0,
+            hash,
             hash_history,
         }
     }
@@ -77,7 +76,9 @@ impl Game {
 
     pub fn play(&mut self, mv: usize) -> bool {
         let player = self.player();
-        let mut next_hash = self.hash;
+        let mut next_hash = self.hash
+            ^ ZOBRIST_TABLE.player[zobrist_idx(player)]
+            ^ ZOBRIST_TABLE.player[zobrist_idx(-player)];
         let mut next_board = self.board.clone();
 
         let pass_move = self.size * self.size;
@@ -91,7 +92,7 @@ impl Game {
             }
 
             next_board[idx] = player;
-            next_hash ^= ZOBRIST_TABLE.key[x][y][zobrist_idx(player)];
+            next_hash ^= ZOBRIST_TABLE.key[(x * self.size + y) * 2 + zobrist_idx(player)];
 
             let opponent = -player;
             let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0)];
@@ -119,7 +120,7 @@ impl Game {
                 let cx = cidx % self.size;
                 let cy = cidx / self.size;
                 next_board[cidx] = 0;
-                next_hash ^= ZOBRIST_TABLE.key[cx][cy][zobrist_idx(opponent)];
+                next_hash ^= ZOBRIST_TABLE.key[(cx * self.size + cy) * 2 + zobrist_idx(opponent)];
             }
 
             if !self.has_liberties_on_board(&next_board, x, y) {
