@@ -34,6 +34,7 @@ pub struct Game {
     pub history: VecDeque<Vec<i8>>,
     pub size: usize,
     pub move_cnt: usize,
+    pub pass_cnt: usize,
     pub hash: u64,
     pub hash_history: HashSet<u64>,
 }
@@ -48,17 +49,16 @@ impl Game {
             history.push_front(board.clone());
         }
 
-        let hash = ZOBRIST_TABLE.player[zobrist_idx(1)];
-        let mut hash_history = HashSet::new();
-        hash_history.insert(hash);
+        let hash = ZOBRIST_TABLE.player[zobrist_idx(-1)];
 
         Self {
             board,
             history,
             size,
             move_cnt: 0,
+            pass_cnt: 0,
             hash,
-            hash_history,
+            hash_history: HashSet::new(),
         }
     }
 
@@ -132,6 +132,11 @@ impl Game {
 
         if mv < pass_move && self.hash_history.contains(&next_hash) {
             return false;
+        }
+        if mv == pass_move {
+            self.pass_cnt += 1;
+        } else {
+            self.pass_cnt = 0;
         }
 
         self.board = next_board;
@@ -274,5 +279,8 @@ impl Game {
         } else {
             None
         }
+    }
+    pub fn end(&self) -> bool {
+        self.pass_cnt >= 2 || self.move_cnt >= self.size * self.size * 2
     }
 }

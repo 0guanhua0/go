@@ -123,15 +123,13 @@ fn main() -> Result<()> {
                 );
 
                 let mut history = Vec::new();
-                for _ in 0..722 {
+                while game.end() == false {
                     let feature = MCTS::get_feature(&game);
                     let mv = mcts.run(&game);
                     let policy = mcts.get_policy(&game);
                     history.push((feature, policy, game.player()));
 
-                    if !game.play(mv) {
-                        break;
-                    }
+                    game.play(mv);
                     mcts.update_root(mv);
                 }
 
