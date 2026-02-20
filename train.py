@@ -2,20 +2,15 @@ import argparse
 import hashlib
 import logging
 import os
-import random
 import time
 
 import torch
 import torch.nn.functional as F
-from sgfmill import sgf
 from torch.multiprocessing import (
     Pipe,
-    Pool,
     Process,
-    current_process,
     set_start_method,
 )
-from whr import whole_history_rating
 
 import json
 from types import SimpleNamespace
@@ -24,8 +19,6 @@ with open("config.json") as f:
     config = SimpleNamespace(**json.load(f))
 
 
-import dihedral
-from mcts import MCTS, Node, State
 from network import AlphaGoZero
 from ring import Ring
 
@@ -33,22 +26,6 @@ LOGGING_CONFIG = {
     "level": logging.INFO,
     "format": "%(asctime)s - %(processName)s - %(message)s",
 }
-
-
-def action_to_coords(action, board):
-    if action == board * board:
-        return board, board
-    x = action // board
-    y = action % board
-    return x, y
-
-
-def set_sgf(sgf_node, player, x, y):
-    p = "b" if player == 1 else "w"
-    sgf_coords = None if x == config.board else (x, y)
-    sgf_node = sgf_node.new_child()
-    sgf_node.set_move(p, sgf_coords)
-    return sgf_node
 
 
 def weight_hash(weight):
@@ -59,244 +36,11 @@ def weight_hash(weight):
     return hasher.hexdigest()
 
 
-def init_sgf():
-    sgf_game = sgf.Sgf_game(size=config.board)
-    sgf_game.get_root().set_raw("RU", b"Tromp-Taylor")
-    sgf_game.get_root().set_raw("KM", b"7.5")
-    return sgf_game, sgf_game.get_root()
-
-
-def sum_sgf(
-    sgf_game, state, winner, resigned, worker_id, black_hash, white_hash, prefix
-):
-    if resigned:
-        sgf_result = "B+R" if winner == 1 else "W+R"
-    else:
-        black_score, white_score = state.get_score()
-        if winner == 1:
-            margin = black_score - white_score
-            sgf_result = f"B+{margin:.1f}"
-        elif winner == -1:
-            margin = white_score - black_score
-            sgf_result = f"W+{margin:.1f}"
-        else:
-            sgf_result = "Jigo"
-
-    root = sgf_game.get_root()
-    root.set("RE", sgf_result)
-    root.set("PB", black_hash)
-    root.set("PW", white_hash)
-    filename = (
-        time.strftime("%Y%m%d-%H%M%S")
-        + f"-{black_hash[:6]}-{white_hash[:6]}-{worker_id}.sgf"
-    )
-    with open(filename, "wb") as f:
-        f.write(sgf_game.serialise())
-    return sgf_result
-
-
-class Worker:
-    request_queue = None
-    result_pipes = None
-    buffer = None
-    mempool = None
-
-    @classmethod
-    def init(cls, request_queue, result_pipes, buffer, mempool):
-        cls.request_queue = request_queue
-        cls.result_pipes = result_pipes
-        cls.buffer = buffer
-        cls.mempool = mempool
-        logging.basicConfig(**LOGGING_CONFIG)
-
-    def __init__(self):
-        self.worker_id = current_process()._identity[0] % len(self.result_pipes)
-        self.net = {
-            "best": NetWrapper(
-                self.worker_id,
-                model="best",
-                request_queue=self.request_queue,
-                result_pipe=self.result_pipes[self.worker_id],
-                mempool=self.mempool,
-            ),
-            "next": NetWrapper(
-                self.worker_id,
-                model="next",
-                request_queue=self.request_queue,
-                result_pipe=self.result_pipes[self.worker_id],
-                mempool=self.mempool,
-            ),
-        }
-
-    def selfplay(self, network, weight_hash, allow_resign, v_resign):
-        state = State(config.board)
-        mcts = MCTS(
-            config.c_puct,
-            config.dirichlet_alpha,
-            config.dirichlet_epsilon,
-            config.search_batch_size,
-        )
-
-        sgf_game, sgf_node = init_sgf()
-
-        root = Node()
-        history = []
-        feature = state.get_feature()
-        resigned = False
-        v_resign_tune = {1: [], -1: []}
-
-        while True:
-            game_over, winner = state.check_terminate()
-            if game_over:
-                break
-
-            t0 = time.time()
-            mcts.search(network, bytes.fromhex(weight_hash), root, state, config.mcts)
-            if os.getenv("DEBUG") >= "2":
-                dt = time.time() - t0
-                logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
-
-            temp = 1.0 if state.move_cnt() < 30 else 0.0
-            act_prob = mcts.get_act_prob(root, temp)
-            root_val = sum(
-                prob * root.mean_act_val().get(act) for act, prob in act_prob.items()
-            )
-
-            max_act = max(act_prob, key=act_prob.get)
-            max_val = root.mean_act_val().get(max_act)
-            if root_val < v_resign and max_val < v_resign:
-                if allow_resign:
-                    game_over, winner = True, -state.player()
-                    resigned = True
-                    break
-                elif not v_resign_tune[state.player()]:
-                    v_resign_tune[state.player()] += [root_val, max_val]
-
-            policy_target = torch.zeros(config.board * config.board + 1)
-            for act, prob in act_prob.items():
-                policy_target[act] = prob
-
-            history.append(
-                (
-                    feature,
-                    policy_target,
-                    state.player(),
-                    root_val,
-                )
-            )
-
-            act_to_play = torch.multinomial(policy_target, 1).item()
-            x, y = action_to_coords(act_to_play, config.board)
-            player = state.player()
-            state.set(x, y, player)
-            sgf_node = set_sgf(sgf_node, player, x, y)
-
-            if os.getenv("DEBUG") >= "1":
-                logging.info(f"{act_prob}")
-                logging.info(f"move {state.move_cnt()}: player {player} {act_to_play}")
-                logging.info(f"\n{state}")
-            feature = state.get_feature()
-
-            root = root.get_child(act_to_play)
-
-        data = []
-        for feature, policy, player, r_val in history:
-            z = torch.tensor(winner * player, dtype=torch.get_default_dtype())
-            data.append((torch.from_numpy(feature), policy, z))
-
-        self.buffer.add(data)
-
-        sgf_result = sum_sgf(
-            sgf_game,
-            state,
-            winner,
-            resigned,
-            self.worker_id,
-            prefix="selfplay",
-            black_hash=weight_hash,
-            white_hash=weight_hash,
-        )
-
-        log_message = (
-            f"Game finished ({len(data)} moves). Result: {sgf_result}. "
-            f"Buffer size: {len(self.buffer)}"
-        )
-        logging.info(log_message)
-
-        return {
-            "moves": len(data),
-            "v_resign_tune": v_resign_tune.get(winner),
-            "weight_hash": weight_hash,
-        }
-
-    def eval(self, best_hash, next_hash):
-        state = State(config.board)
-        mcts = MCTS(
-            config.c_puct, config.dirichlet_alpha, 0.0, config.search_batch_size
-        )
-        root = Node()
-        sgf_game, sgf_node = init_sgf()
-
-        while True:
-            game_over, winner = state.check_terminate()
-            if game_over:
-                sum_sgf(
-                    sgf_game,
-                    state,
-                    winner,
-                    False,
-                    self.worker_id,
-                    prefix="eval",
-                    black_hash=best_hash,
-                    white_hash=next_hash,
-                )
-                return winner
-
-            if state.player() == 1:
-                network = self.net["best"]
-                weight_hash = best_hash
-            else:
-                network = self.net["next"]
-                weight_hash = next_hash
-
-            t0 = time.time()
-            mcts.search(network, bytes.fromhex(weight_hash), root, state, config.mcts)
-            if os.getenv("DEBUG") >= "2":
-                dt = time.time() - t0
-                logging.info(f"mcts {dt:.2f}s ({config.mcts / dt:.2f} sim/s)")
-
-            player = state.player()
-            act_prob = mcts.get_act_prob(root, temp=0)
-            act_to_play = max(act_prob, key=act_prob.get)
-            x, y = action_to_coords(act_to_play, config.board)
-            state.set(x, y, player)
-            sgf_node = set_sgf(sgf_node, player, x, y)
-
-            if os.getenv("DEBUG") >= "1":
-                logging.info(f"{act_prob}")
-                logging.info(f"move {state.move_cnt()}: player {player} {act_to_play}")
-                logging.info(f"\n{state}")
-
-            root = root.get_child(act_to_play)
-
-
-def selfplay_task(weight_hash, allow_resign, v_resign):
-    worker = Worker()
-    return worker.selfplay(worker.net["best"], weight_hash, allow_resign, v_resign)
-
-
-def eval_task(best_hash, next_hash):
-    worker = Worker()
-    return worker.eval(best_hash, next_hash)
-
-
 class GPU(Process):
-    def __init__(self, queue, pipe_gpu, pipe_main, mempool, device):
+    def __init__(self, queue, pipe_main, device):
         super().__init__()
         self.queue = queue
-        self.pipe_gpu = pipe_gpu
         self.pipe_main = pipe_main
-        self.mempool = mempool
         self.device = torch.device(device)
         self.model = None
         self.optimizer = None
@@ -309,16 +53,11 @@ class GPU(Process):
             config.conv_filter,
             config.res_block,
         )
-        self.model = {
-            "best": AlphaGoZero(*net).to(self.device),
-            "next": AlphaGoZero(*net).to(self.device),
-        }
-        self.model["next"].load_state_dict(self.model["best"].state_dict())
+        self.model = AlphaGoZero(*net).to(self.device)
+        self.model.eval()
 
-        for m in self.model.values():
-            m.eval()
         self.optimizer = torch.optim.SGD(
-            self.model["next"].parameters(),
+            self.model.parameters(),
             lr=config.initial_lr,
             momentum=0.9,
         )
@@ -337,90 +76,24 @@ class GPU(Process):
             while not self.queue.empty():
                 requests.append(self.queue.get())
 
-            infer_reqs = []
             for req in requests:
                 command, payload = req
-                if command == "INFER":
-                    infer_reqs.append(payload)
-                elif command == "TRAIN_BATCH":
+                if command == "TRAIN_BATCH":
                     loss = self._train_step(*payload)
                     self.pipe_main.send({"status": "TRAIN_DONE", "loss": loss})
-                elif command == "PROMOTE":
-                    self.model["best"].load_state_dict(self.model["next"].state_dict())
-                    self.model["best"].eval()
-                elif command == "LOAD_MODEL":
-                    path = payload
-                    loaded_model = torch.jit.load(path, map_location=self.device)
-                    self.model["best"].load_state_dict(loaded_model.state_dict())
-                    self.model["next"].load_state_dict(loaded_model.state_dict())
-                    self.model["best"].eval()
-                    self.model["next"].eval()
-                elif command == "RESET":
-                    self.model["next"].load_state_dict(self.model["best"].state_dict())
                 elif command == "STEP_SCHEDULER":
                     self.scheduler.step()
                     logging.info(f"LR: {self.scheduler.get_last_lr()[0]}")
-                elif command == "GET_MODEL_HASHES":
-                    hashes = {
-                        "best": weight_hash(self.model["best"].state_dict().values()),
-                        "next": weight_hash(self.model["next"].state_dict().values()),
-                    }
-                    self.pipe_main.send(hashes)
                 elif command == "GET_CHECKPOINT_DATA":
                     states = {
-                        "best_model_state_dict": {
-                            k: v.cpu()
-                            for k, v in self.model["best"].state_dict().items()
+                        "model_state_dict": {
+                            k: v.cpu() for k, v in self.model.state_dict().items()
                         }
                     }
                     self.pipe_main.send(states)
 
-            if infer_reqs:
-                self._infer(infer_reqs)
-
-    def _infer(self, reqs):
-        batches = {}
-        for worker_id, model_name, batch_size in reqs:
-            batches.setdefault(model_name, []).append((worker_id, batch_size))
-
-        for model_name, items in batches.items():
-            feature = []
-            for worker_id, batch_size in items:
-                feature.append(self.mempool.input[worker_id, :batch_size])
-
-            feature_batch = torch.cat(feature, dim=0)
-
-            dihedral_id = random.randrange(len(dihedral.to))
-            feature = (
-                dihedral.to[dihedral_id](feature_batch).contiguous().to(self.device)
-            )
-
-            with torch.no_grad():
-                policy, value = self.model[model_name](feature)
-                policy = F.softmax(policy, dim=1).cpu().contiguous()
-                value = value.cpu().contiguous()
-
-            reverse_id = dihedral.reverse[dihedral_id]
-            policy_board = (
-                policy[:, :-1].reshape(-1, config.board, config.board).clone()
-            )
-            policy[:, :-1] = dihedral.to[reverse_id](policy_board).reshape(
-                policy.shape[0], -1
-            )
-
-            cursor = 0
-            for worker_id, batch_size in items:
-                self.mempool.policy[worker_id, :batch_size] = policy[
-                    cursor : cursor + batch_size
-                ]
-                self.mempool.value[worker_id, :batch_size] = value[
-                    cursor : cursor + batch_size
-                ]
-                cursor += batch_size
-                self.pipe_gpu[worker_id].send(None)
-
     def _train_step(self, state, policy, value):
-        self.model["next"].train()
+        self.model.train()
 
         state = state.to(self.device)
         policy = policy.to(self.device)
@@ -428,84 +101,20 @@ class GPU(Process):
 
         self.optimizer.zero_grad()
 
-        policy_next, value_next = self.model["next"](state)
+        policy_next, value_next = self.model(state)
 
         policy_loss = F.cross_entropy(policy_next, policy)
         value_loss = F.mse_loss(value_next, value)
         l2_penalty = torch.tensor(0.0, device=self.device)
-        for p in self.model["next"].parameters():
+        for p in self.model.parameters():
             if p.requires_grad and p.dim() > 1:
                 l2_penalty += torch.sum(p.pow(2))
         loss = policy_loss + value_loss + config.l2_regularization * l2_penalty
 
         loss.backward()
         self.optimizer.step()
-        self.model["next"].eval()
+        self.model.eval()
         return loss.item()
-
-
-class MemPool:
-    def __init__(self, num_workers, board_size, history_length):
-        self.num_workers = num_workers
-        plane_cnt = 2 * history_length + 1
-        self.max_batch = config.search_batch_size
-
-        self.input = torch.zeros(
-            num_workers,
-            self.max_batch,
-            plane_cnt,
-            board_size,
-            board_size,
-            dtype=torch.float32,
-        ).share_memory_()
-
-        self.policy = torch.zeros(
-            num_workers,
-            self.max_batch,
-            board_size * board_size + 1,
-            dtype=torch.float32,
-        ).share_memory_()
-
-        self.value = torch.zeros(
-            num_workers, self.max_batch, 1, dtype=torch.float32
-        ).share_memory_()
-
-
-class NetWrapper:
-    def __init__(self, worker_id, model, request_queue, result_pipe, mempool):
-        self.worker_id = worker_id
-        self.model = model
-        self.request_queue = request_queue
-        self.result_pipe = result_pipe
-        self.mempool = mempool
-
-    def infer(self, state_batch):
-        t0 = time.time()
-        batch_size = len(state_batch)
-
-        tensor_batch = torch.as_tensor(state_batch, dtype=torch.float32)
-
-        self.mempool.input[self.worker_id, :batch_size] = tensor_batch
-
-        self.request_queue.put(("INFER", (self.worker_id, self.model, batch_size)))
-
-        self.result_pipe.recv()
-
-        policy = self.mempool.policy[self.worker_id, :batch_size]
-        value = self.mempool.value[self.worker_id, :batch_size]
-        if os.getenv("DEBUG") >= "3":
-            dt = time.time() - t0
-            logging.info(f"infer {dt:.2f}s ({batch_size / dt:.2f} batch/s)")
-
-        return policy.cpu().numpy(), value.cpu().numpy()
-
-
-def selfplay_job(args):
-    return selfplay_task(*args)
-
-
-def eval_job(args):
-    return eval_task(*args)
 
 
 def main(args):
@@ -513,23 +122,10 @@ def main(args):
 
     logging.basicConfig(**LOGGING_CONFIG)
 
-    cpu_count = args.cpu_count
     queue = torch.multiprocessing.Queue()
-    pipe = [Pipe() for _ in range(cpu_count)]
-    pipe_cpu = [p[0] for p in pipe]
-    pipe_gpu = [p[1] for p in pipe]
     pipe_main = Pipe()
 
-    mempool = MemPool(cpu_count, config.board, config.history)
-
-    v_resign_dict = {}
-    current_model_id = None
-    whr = whole_history_rating.Base()
-
     def save_checkpoint():
-        model_hashes = get_model_hashes()
-        model_id = model_hashes["best"]
-
         queue.put(("GET_CHECKPOINT_DATA", None))
         gpu_state = pipe_main[0].recv()
 
@@ -539,46 +135,19 @@ def main(args):
             config.conv_filter,
             config.res_block,
         )
-        model.load_state_dict(gpu_state["best_model_state_dict"])
+        model.load_state_dict(gpu_state["model_state_dict"])
         model.eval()
 
+        model_id = weight_hash(model.state_dict().values())
         filename = f"models/{model_id}.pt"
         example_input = torch.zeros(
             1, config.history * 2 + 1, config.board, config.board
         )
         traced_model = torch.jit.trace(model, example_input)
         traced_model.save(filename)
+        return model_id
 
-    def update_whr_with_results(results, best_id, next_id, time_step):
-        for result in results:
-            winner = "B" if result > 0 else "W"
-            whr.create_game(
-                black=best_id,
-                white=next_id,
-                winner=winner,
-                time_step=time_step,
-                handicap=0,
-            )
-        whr.auto_iterate()
-
-    def add_resign_data(weight, v_resign_tune):
-        lst = v_resign_dict.setdefault(weight, [])
-        lst.extend(v_resign_tune)
-        lst.sort()
-
-    def get_current_model_id():
-        hashes = get_model_hashes()
-        return hashes["best"]
-
-    def get_model_hashes():
-        queue.put(("GET_MODEL_HASHES", None))
-        gpu_hashes = pipe_main[0].recv()
-        return gpu_hashes
-
-    def load_model(path):
-        queue.put(("LOAD_MODEL", path))
-
-    gpu = GPU(queue, pipe_gpu, pipe_main[1], mempool, args.device)
+    gpu = GPU(queue, pipe_main[1], args.device)
     gpu.daemon = True
     gpu.start()
 
@@ -588,47 +157,21 @@ def main(args):
         board=config.board,
     )
 
-    cpu_worker_pool = Pool(
-        processes=cpu_count,
-        initializer=Worker.init,
-        initargs=(queue, pipe_cpu, buffer, mempool),
-    )
-    logging.info(f"{cpu_count} worker and 1 GPU")
-
     os.makedirs("models", exist_ok=True)
-    models = os.listdir("models")
-    if not models:
+    if not os.listdir("models"):
         save_checkpoint()
-        models = os.listdir("models")
-
-    path = max([os.path.join("models", f) for f in models], key=os.path.getmtime)
-    load_model(path)
-
-    current_model_id = get_current_model_id()
-
-    v_resign = config.resignation_threshold
-
-    def run_selfplay_games(num_games, weight_hash, v_resign):
-        game_args = ((weight_hash, i % 10 != 0, v_resign) for i in range(num_games))
-        for game_result in cpu_worker_pool.imap_unordered(selfplay_job, game_args):
-            add_resign_data(weight_hash, game_result.get("v_resign_tune"))
 
     cycle = 1
     while True:
         logging.info(f"cycle {cycle}")
 
-        model_resign_data = v_resign_dict.get(current_model_id)
-        if model_resign_data:
-            idx = max(0, int(0.05 * (len(model_resign_data) - 1)))
-            v_resign = max(config.resignation_threshold, model_resign_data[idx])
-            logging.info(f"weight {current_model_id}: v_resign {v_resign}")
-
-        logging.info("selfplay")
-        run_selfplay_games(config.selfplay, current_model_id, v_resign)
-
         logging.info("train")
         total_loss, batches_done = 0.0, 0
         for i in range(config.training_updates_per_generation):
+            if len(buffer) < config.batch_size:
+                time.sleep(1)
+                continue
+
             batch = buffer.sample(config.batch_size)
             queue.put(("TRAIN_BATCH", batch))
             response = pipe_main[0].recv()
@@ -640,29 +183,7 @@ def main(args):
 
         queue.put(("STEP_SCHEDULER", None))
 
-        logging.info("eval")
-        model_hashes = get_model_hashes()
-        best_model_id = model_hashes["best"]
-        next_model_id = model_hashes["next"]
-        eval_args = ((best_model_id, next_model_id) for _ in range(config.eval))
-        eval_res = list(cpu_worker_pool.imap_unordered(eval_job, eval_args))
-
-        best_win = eval_res.count(1) / len(eval_res)
-        next_win = eval_res.count(-1) / len(eval_res)
-        promoted = False
-        if next_win > config.eval_threshold:
-            update_whr_with_results(eval_res, best_model_id, next_model_id, cycle)
-            logging.info(whr.print_ordered_ratings(current=True))
-            logging.info(f"{best_model_id} win rate: {best_win}")
-            logging.info(f"{next_model_id} win rate: {next_win}")
-            queue.put(("PROMOTE", None))
-            promoted = True
-        else:
-            queue.put(("RESET", None))
-        if promoted:
-            save_checkpoint()
-
-        current_model_id = get_current_model_id()
+        save_checkpoint()
         cycle += 1
 
 

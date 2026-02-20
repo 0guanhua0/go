@@ -2,23 +2,12 @@
 name = "go"
 dynamic = ["version"]
 dependencies = [
-    "sgfmill",
+    "numpy",
     "torch==2.7.0",
-    "whole-history-rating",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "maturin",
     "pre-commit",
     "ruff",
 ]
-
-[build-system]
-requires = ["maturin>=1.9.6"]
-build-backend = "maturin"
-
-[tool.maturin]
-features = ["pyo3/extension-module"]
-module-name = "mcts"
-manifest-path = "mcts/Cargo.toml"

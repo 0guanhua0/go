@@ -30,8 +30,3 @@ repos:
       entry: cargo test --manifest-path Cargo.toml
       language: system
       pass_filenames: false
-    - id: maturin-develop
-      name: maturin develop
-      entry: maturin develop
-      language: system
-      pass_filenames: false

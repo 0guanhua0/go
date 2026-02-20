@@ -104,7 +104,7 @@ impl Game {
                 if self.is_on_board(nx, ny) {
                     let nidx = self.get_index(nx as usize, ny as usize);
                     if next_board[nidx] == opponent {
-                        if !self.has_liberties_on_board(&next_board, nx as usize, ny as usize) {
+                        if !self.liberty(&next_board, nx as usize, ny as usize) {
                             self.capture_group_on_board(
                                 &next_board,
                                 nx as usize,
@@ -123,7 +123,7 @@ impl Game {
                 next_hash ^= ZOBRIST_TABLE.key[(cx * self.size + cy) * 2 + zobrist_idx(opponent)];
             }
 
-            if !self.has_liberties_on_board(&next_board, x, y) {
+            if !self.liberty(&next_board, x, y) {
                 return false;
             }
         } else if mv > pass_move {
@@ -153,7 +153,7 @@ impl Game {
         true
     }
 
-    fn has_liberties_on_board(&self, board: &[i8], x: usize, y: usize) -> bool {
+    fn liberty(&self, board: &[i8], x: usize, y: usize) -> bool {
         let color = board[self.get_index(x, y)];
         if color == 0 {
             return true;
