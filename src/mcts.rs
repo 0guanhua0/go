@@ -200,8 +200,8 @@ impl MCTS {
 
         for y in 0..game.size {
             for x in 0..game.size {
-                if game.board[game.get_index(x, y)] == 0 {
-                    let idx = game.get_index(x, y);
+                if game.board[game.get_idx(x, y)] == 0 {
+                    let idx = game.get_idx(x, y);
                     let p = policy_vec[idx].exp();
                     sum_exp += p;
                     valid_moves.push((idx, p));
