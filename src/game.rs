@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 struct ZobristTable {
     pub key: Vec<u64>,
-    pub player: [u64; 2],
+    pub white: u64,
 }
 
 impl ZobristTable {
@@ -17,8 +17,8 @@ impl ZobristTable {
         for i in 0..key.len() {
             key[i] = rng.random();
         }
-        let player = [rng.random(), rng.random()];
-        ZobristTable { key, player }
+        let white = rng.random();
+        ZobristTable { key, white }
     }
 }
 
@@ -55,7 +55,7 @@ impl Game {
             size,
             move_cnt: 0,
             pass_cnt: 0,
-            hash: ZOBRIST_TABLE.player[zobrist_idx(-1)],
+            hash: ZOBRIST_TABLE.white,
             hash_history: HashSet::new(),
         }
     }
@@ -70,7 +70,7 @@ impl Game {
             .filter_map(move |(dx, dy)| {
                 let nx = x as isize + dx;
                 let ny = y as isize + dy;
-                if self.is_on_board(nx, ny) {
+                if nx >= 0 && nx < self.size as isize && ny >= 0 && ny < self.size as isize {
                     Some((nx as usize, ny as usize))
                 } else {
                     None
@@ -82,15 +82,9 @@ impl Game {
         if self.move_cnt % 2 == 0 { 1 } else { -1 }
     }
 
-    pub fn is_on_board(&self, x: isize, y: isize) -> bool {
-        x >= 0 && x < self.size as isize && y >= 0 && y < self.size as isize
-    }
-
     pub fn play(&mut self, mv: usize) -> bool {
         let player = self.player();
-        let mut next_hash = self.hash
-            ^ ZOBRIST_TABLE.player[zobrist_idx(player)]
-            ^ ZOBRIST_TABLE.player[zobrist_idx(-player)];
+        let mut next_hash = self.hash ^ ZOBRIST_TABLE.white;
         let mut next_board = self.board.clone();
 
         let pass_move = self.size * self.size;
