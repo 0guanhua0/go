@@ -7,6 +7,7 @@ use crate::game::Game;
 use crate::mcts::MCTS;
 use crate::nn::Batcher;
 use anyhow::Result;
+use dashmap::DashMap;
 use ndarray::Array;
 use npyz::WriterBuilder;
 use std::fs;
@@ -106,11 +107,13 @@ fn main() -> Result<()> {
     };
 
     let batcher = Arc::new(Batcher::new(device, batch_size));
+    let nn_cache = Arc::new(DashMap::new());
 
     let mut handles = vec![];
 
     for _ in 0..game_thread {
         let batcher_clone = batcher.clone();
+        let nn_cache_clone = nn_cache.clone();
         let handle = thread::spawn(move || {
             loop {
                 let mut game = Game::new(board_size);
@@ -120,17 +123,18 @@ fn main() -> Result<()> {
                     device,
                     input_planes as usize,
                     c_puct,
+                    nn_cache_clone.clone(),
                 );
 
                 let mut history = Vec::new();
                 while game.end() == false {
                     let feature = MCTS::get_feature(&game);
-                    let mv = mcts.run(&game);
+                    let idx = mcts.run(&game);
                     let policy = mcts.get_policy(&game);
                     history.push((feature, policy, game.player()));
 
-                    game.play(mv);
-                    mcts.update_root(mv);
+                    game.play(idx);
+                    mcts.update_root(idx);
                 }
 
                 if let Some(winner) = game.get_winner() {

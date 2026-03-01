@@ -1,5 +1,6 @@
 use crate::game::Game;
 use crate::nn::Batcher;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tch::{Device, Tensor};
@@ -39,6 +40,7 @@ pub struct MCTS {
     device: Device,
     input_planes: usize,
     c_puct: f32,
+    nn_cache: Arc<DashMap<Vec<u64>, (Vec<f32>, f32)>>,
 }
 
 impl MCTS {
@@ -48,6 +50,7 @@ impl MCTS {
         device: Device,
         input_planes: usize,
         c_puct: f32,
+        nn_cache: Arc<DashMap<Vec<u64>, (Vec<f32>, f32)>>,
     ) -> Self {
         Self {
             root: Node::new(1.0),
@@ -56,6 +59,7 @@ impl MCTS {
             device,
             input_planes,
             c_puct,
+            nn_cache,
         }
     }
 
@@ -67,6 +71,7 @@ impl MCTS {
                 &self.batcher,
                 self.device,
                 self.input_planes,
+                &self.nn_cache,
             );
         }
 
@@ -93,6 +98,7 @@ impl MCTS {
                         &self.batcher,
                         self.device,
                         self.input_planes,
+                        &self.nn_cache,
                     )
                 } else {
                     0.0
@@ -115,8 +121,8 @@ impl MCTS {
         best_move_idx
     }
 
-    pub fn update_root(&mut self, mv: usize) {
-        if let Some(node) = self.root.next.remove(&mv) {
+    pub fn update_root(&mut self, idx: usize) {
+        if let Some(node) = self.root.next.remove(&idx) {
             self.root = node;
         } else {
             self.root = Node::new(1.0);
@@ -182,10 +188,37 @@ impl MCTS {
         game: &Game,
         batcher: &Batcher,
         device: Device,
-        _input_planes: usize,
+        input_planes: usize,
+        nn_cache: &DashMap<Vec<u64>, (Vec<f32>, f32)>,
     ) -> f32 {
+        let set_policy = |node: &mut Node, policy_vec: &[f32]| {
+            let mut sum_exp = 0.0;
+            let mut valid_moves = Vec::new();
+
+            for idx in 0..game.size * game.size + 1 {
+                if game.check(idx) {
+                    let p = policy_vec[idx].exp();
+                    sum_exp += p;
+                    valid_moves.push((idx, p));
+                }
+            }
+
+            for (idx, p) in valid_moves {
+                let prior = p / sum_exp;
+                node.next.insert(idx, Node::new(prior));
+            }
+
+            node.expand = true;
+        };
+
+        let hash_history: Vec<u64> = game.hash_history.iter().cloned().collect();
+        if let Some(entry) = nn_cache.get(&hash_history) {
+            let (policy_vec, node_value) = entry.value();
+            set_policy(node, policy_vec);
+            return *node_value;
+        }
+
         let feature = Self::get_feature(game);
-        let input_planes = game.history.len() * 2 + 1;
         let input = Tensor::from_slice(&feature)
             .view([1, input_planes as i64, game.size as i64, game.size as i64])
             .to(device);
@@ -195,26 +228,8 @@ impl MCTS {
         let policy_vec: Vec<f32> = Vec::try_from(policy.to(Device::Cpu)).unwrap();
         let node_value: f32 = f32::try_from(value.to(Device::Cpu)).unwrap();
 
-        let mut sum_exp = 0.0;
-        let mut valid_moves = Vec::new();
-
-        for y in 0..game.size {
-            for x in 0..game.size {
-                if game.board[game.get_idx(x, y)] == 0 {
-                    let idx = game.get_idx(x, y);
-                    let p = policy_vec[idx].exp();
-                    sum_exp += p;
-                    valid_moves.push((idx, p));
-                }
-            }
-        }
-
-        for (idx, p) in valid_moves {
-            let prior = p / sum_exp;
-            node.next.insert(idx, Node::new(prior));
-        }
-
-        node.expand = true;
+        set_policy(node, &policy_vec);
+        nn_cache.insert(hash_history, (policy_vec, node_value));
         node_value
     }
 

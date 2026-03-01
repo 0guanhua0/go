@@ -36,7 +36,8 @@ pub struct Game {
     pub move_cnt: usize,
     pub pass_cnt: usize,
     pub hash: u64,
-    pub hash_history: HashSet<u64>,
+    pub hash_set: HashSet<u64>,
+    pub hash_history: VecDeque<u64>,
 }
 
 impl Game {
@@ -45,8 +46,10 @@ impl Game {
         let board = vec![0; size * size];
         let cap = config["history"].as_u64().unwrap() as usize;
         let mut history = VecDeque::with_capacity(cap);
+        let mut hash_history = VecDeque::with_capacity(cap);
         for _ in 0..cap {
             history.push_front(board.clone());
+            hash_history.push_front(ZOBRIST_TABLE.white);
         }
 
         Self {
@@ -56,12 +59,17 @@ impl Game {
             move_cnt: 0,
             pass_cnt: 0,
             hash: ZOBRIST_TABLE.white,
-            hash_history: HashSet::new(),
+            hash_set: HashSet::new(),
+            hash_history,
         }
     }
 
     pub fn get_idx(&self, x: usize, y: usize) -> usize {
         y * self.size + x
+    }
+
+    pub fn get_xy(&self, idx: usize) -> (usize, usize) {
+        (idx % self.size, idx / self.size)
     }
 
     pub fn neighbors(&self, x: usize, y: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -82,71 +90,96 @@ impl Game {
         if self.move_cnt % 2 == 0 { 1 } else { -1 }
     }
 
-    pub fn play(&mut self, mv: usize) -> bool {
+    pub fn check(&self, idx: usize) -> bool {
         let player = self.player();
+        let pass = self.size * self.size;
+
+        if idx == pass {
+            return true;
+        }
+        if idx > pass {
+            return false;
+        }
+
+        if self.board[idx] != 0 {
+            return false;
+        }
+
         let mut next_hash = self.hash ^ ZOBRIST_TABLE.white;
         let mut next_board = self.board.clone();
 
-        let pass_move = self.size * self.size;
+        next_board[idx] = player;
+        next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
 
-        if mv < pass_move {
-            let x = mv % self.size;
-            let y = mv / self.size;
-            let idx = mv;
-            if self.board[idx] != 0 {
-                return false;
+        let (x, y) = self.get_xy(idx);
+
+        let rival = -player;
+        let mut captured = Vec::new();
+
+        for (nx, ny) in self.neighbors(x, y) {
+            let nidx = self.get_idx(nx, ny);
+            if next_board[nidx] == rival {
+                if !self.liberty(&next_board, nx, ny) {
+                    self.capture(&next_board, nx, ny, &mut captured);
+                }
             }
+        }
 
-            next_board[idx] = player;
-            next_hash ^= ZOBRIST_TABLE.key[self.get_idx(x, y) * 2 + zobrist_idx(player)];
+        for &cidx in &captured {
+            next_board[cidx] = 0;
+            next_hash ^= ZOBRIST_TABLE.key[cidx * 2 + zobrist_idx(rival)];
+        }
+
+        if !self.liberty(&next_board, x, y) {
+            return false;
+        }
+
+        if self.hash_set.contains(&next_hash) {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn play(&mut self, idx: usize) {
+        let player = self.player();
+        self.hash ^= ZOBRIST_TABLE.white;
+        let pass = self.size * self.size;
+
+        if idx < pass {
+            let (x, y) = self.get_xy(idx);
+
+            self.board[idx] = player;
+            self.hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
 
             let rival = -player;
             let mut captured = Vec::new();
 
             for (nx, ny) in self.neighbors(x, y) {
                 let nidx = self.get_idx(nx, ny);
-                if next_board[nidx] == rival {
-                    if !self.liberty(&next_board, nx, ny) {
-                        self.capture(&next_board, nx, ny, &mut captured);
+                if self.board[nidx] == rival {
+                    if !self.liberty(&self.board, nx, ny) {
+                        self.capture(&self.board, nx, ny, &mut captured);
                     }
                 }
             }
 
             for &cidx in &captured {
-                let cx = cidx % self.size;
-                let cy = cidx / self.size;
-                next_board[cidx] = 0;
-                next_hash ^= ZOBRIST_TABLE.key[self.get_idx(cx, cy) * 2 + zobrist_idx(rival)];
+                self.board[cidx] = 0;
+                self.hash ^= ZOBRIST_TABLE.key[cidx * 2 + zobrist_idx(rival)];
             }
-
-            if !self.liberty(&next_board, x, y) {
-                return false;
-            }
-        } else if mv > pass_move {
-            return false;
-        }
-
-        if mv < pass_move && self.hash_history.contains(&next_hash) {
-            return false;
-        }
-
-        self.board = next_board;
-        if self.history.len() == self.history.capacity() {
-            self.history.rotate_right(1);
-            self.history[0].clone_from(&self.board);
-        } else {
-            self.history.push_front(self.board.clone());
-        }
-
-        self.hash = next_hash;
-        self.hash_history.insert(self.hash);
-        self.move_cnt += 1;
-        if mv == pass_move {
-            self.pass_cnt += 1;
-        } else {
             self.pass_cnt = 0;
+        } else {
+            self.pass_cnt += 1;
         }
-        true
+
+        self.history.rotate_right(1);
+        self.history[0].clone_from(&self.board);
+        self.hash_history.rotate_right(1);
+        self.hash_history[0] = self.hash;
+
+        self.hash_set.insert(self.hash);
+        self.move_cnt += 1;
     }
 
     fn liberty(&self, board: &[i8], x: usize, y: usize) -> bool {
