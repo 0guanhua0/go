@@ -24,6 +24,8 @@ impl ZobristTable {
 
 static ZOBRIST_TABLE: LazyLock<ZobristTable> = LazyLock::new(ZobristTable::new);
 
+const MAX_BOARD: usize = 512;
+
 fn zobrist_idx(player: i8) -> usize {
     if player == 1 { 1 } else { 0 }
 }
@@ -42,6 +44,7 @@ pub struct Game {
 impl Game {
     pub fn new(size: usize) -> Self {
         let config = Config::load().unwrap();
+        assert!(size * size <= MAX_BOARD);
         let board = vec![0; size * size];
         let cap = config["history"].as_u64().unwrap() as usize;
         let mut history = VecDeque::with_capacity(cap);
@@ -60,21 +63,21 @@ impl Game {
         }
     }
 
-    pub fn get_idx(&self, x: usize, y: usize) -> usize {
-        y * self.size + x
+    pub fn get_idx(size: usize, x: usize, y: usize) -> usize {
+        y * size + x
     }
 
-    pub fn get_xy(&self, idx: usize) -> (usize, usize) {
-        (idx % self.size, idx / self.size)
+    pub fn get_xy(size: usize, idx: usize) -> (usize, usize) {
+        (idx % size, idx / size)
     }
 
-    pub fn neighbors(&self, x: usize, y: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub fn neighbors(size: usize, x: usize, y: usize) -> impl Iterator<Item = (usize, usize)> {
         [(0, 1), (0, -1), (1, 0), (-1, 0)]
             .into_iter()
             .filter_map(move |(dx, dy)| {
                 let nx = x as isize + dx;
                 let ny = y as isize + dy;
-                if nx >= 0 && nx < self.size as isize && ny >= 0 && ny < self.size as isize {
+                if nx >= 0 && nx < size as isize && ny >= 0 && ny < size as isize {
                     Some((nx as usize, ny as usize))
                 } else {
                     None
@@ -102,31 +105,37 @@ impl Game {
         }
 
         let mut next_hash = self.hash ^ ZOBRIST_TABLE.white;
-        let mut next_board = self.board.clone();
+        let mut next_board = [0i8; MAX_BOARD];
+        next_board[..self.board.len()].copy_from_slice(&self.board);
 
         next_board[idx] = player;
         next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
 
-        let (x, y) = self.get_xy(idx);
-
+        let (x, y) = Self::get_xy(self.size, idx);
         let rival = -player;
-        let mut captured = Vec::new();
 
-        for (nx, ny) in self.neighbors(x, y) {
-            let nidx = self.get_idx(nx, ny);
+        let mut visited = [false; MAX_BOARD];
+        let mut stack = [0usize; MAX_BOARD];
+
+        for (nx, ny) in Self::neighbors(self.size, x, y) {
+            let nidx = Self::get_idx(self.size, nx, ny);
             if next_board[nidx] == rival {
-                if !self.liberty(&next_board, nx, ny) {
-                    self.capture(&next_board, nx, ny, &mut captured);
+                if !Self::liberty(self.size, &next_board, nx, ny, &mut visited, &mut stack) {
+                    Self::capture(
+                        self.size,
+                        &mut next_board,
+                        nx,
+                        ny,
+                        &mut next_hash,
+                        rival,
+                        &mut visited,
+                        &mut stack,
+                    );
                 }
             }
         }
 
-        for &cidx in &captured {
-            next_board[cidx] = 0;
-            next_hash ^= ZOBRIST_TABLE.key[cidx * 2 + zobrist_idx(rival)];
-        }
-
-        if !self.liberty(&next_board, x, y) {
+        if !Self::liberty(self.size, &next_board, x, y, &mut visited, &mut stack) {
             return false;
         }
 
@@ -143,26 +152,31 @@ impl Game {
         let pass = self.size * self.size;
 
         if idx < pass {
-            let (x, y) = self.get_xy(idx);
+            let (x, y) = Self::get_xy(self.size, idx);
 
             self.board[idx] = player;
             self.hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
 
             let rival = -player;
-            let mut captured = Vec::new();
+            let mut visited = [false; MAX_BOARD];
+            let mut stack = [0usize; MAX_BOARD];
 
-            for (nx, ny) in self.neighbors(x, y) {
-                let nidx = self.get_idx(nx, ny);
+            for (nx, ny) in Self::neighbors(self.size, x, y) {
+                let nidx = Self::get_idx(self.size, nx, ny);
                 if self.board[nidx] == rival {
-                    if !self.liberty(&self.board, nx, ny) {
-                        self.capture(&self.board, nx, ny, &mut captured);
+                    if !Self::liberty(self.size, &self.board, nx, ny, &mut visited, &mut stack) {
+                        Self::capture(
+                            self.size,
+                            &mut self.board,
+                            nx,
+                            ny,
+                            &mut self.hash,
+                            rival,
+                            &mut visited,
+                            &mut stack,
+                        );
                     }
                 }
-            }
-
-            for &cidx in &captured {
-                self.board[cidx] = 0;
-                self.hash ^= ZOBRIST_TABLE.key[cidx * 2 + zobrist_idx(rival)];
             }
             self.pass_cnt = 0;
         } else {
@@ -176,47 +190,77 @@ impl Game {
         self.move_cnt += 1;
     }
 
-    fn liberty(&self, board: &[i8], x: usize, y: usize) -> bool {
-        let color = board[self.get_idx(x, y)];
+    fn liberty(
+        size: usize,
+        board: &[i8],
+        x: usize,
+        y: usize,
+        visited: &mut [bool; MAX_BOARD],
+        stack: &mut [usize; MAX_BOARD],
+    ) -> bool {
+        let color = board[Self::get_idx(size, x, y)];
         if color == 0 {
             return true;
         }
-        let mut visited = vec![false; self.size * self.size];
-        let mut stack = vec![(x, y)];
-        visited[self.get_idx(x, y)] = true;
+        visited.fill(false);
+        let mut stack_ptr = 0;
 
-        while let Some((cx, cy)) = stack.pop() {
-            for (nx, ny) in self.neighbors(cx, cy) {
-                let nidx = self.get_idx(nx, ny);
+        let start_idx = Self::get_idx(size, x, y);
+        visited[start_idx] = true;
+        stack[stack_ptr] = start_idx;
+        stack_ptr += 1;
+
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let idx = stack[stack_ptr];
+            let (cx, cy) = Self::get_xy(size, idx);
+            for (nx, ny) in Self::neighbors(size, cx, cy) {
+                let nidx = Self::get_idx(size, nx, ny);
                 if board[nidx] == 0 {
                     return true;
                 }
                 if board[nidx] == color && !visited[nidx] {
                     visited[nidx] = true;
-                    stack.push((nx, ny));
+                    stack[stack_ptr] = nidx;
+                    stack_ptr += 1;
                 }
             }
         }
         false
     }
 
-    fn capture(&self, board: &[i8], x: usize, y: usize, captured: &mut Vec<usize>) {
-        let color = board[self.get_idx(x, y)];
-        if color == 0 {
-            return;
-        }
-        let mut visited = vec![false; self.size * self.size];
-        let mut stack = vec![(x, y)];
-        visited[self.get_idx(x, y)] = true;
-        captured.push(self.get_idx(x, y));
+    fn capture(
+        size: usize,
+        board: &mut [i8],
+        x: usize,
+        y: usize,
+        next_hash: &mut u64,
+        color: i8,
+        visited: &mut [bool; MAX_BOARD],
+        stack: &mut [usize; MAX_BOARD],
+    ) {
+        visited.fill(false);
+        let mut stack_ptr = 0;
 
-        while let Some((cx, cy)) = stack.pop() {
-            for (nx, ny) in self.neighbors(cx, cy) {
-                let nidx = self.get_idx(nx, ny);
+        let start_idx = Self::get_idx(size, x, y);
+        visited[start_idx] = true;
+        stack[stack_ptr] = start_idx;
+        stack_ptr += 1;
+
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let idx = stack[stack_ptr];
+
+            board[idx] = 0;
+            *next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(color)];
+
+            let (cx, cy) = Self::get_xy(size, idx);
+            for (nx, ny) in Self::neighbors(size, cx, cy) {
+                let nidx = Self::get_idx(size, nx, ny);
                 if board[nidx] == color && !visited[nidx] {
                     visited[nidx] = true;
-                    captured.push(nidx);
-                    stack.push((nx, ny));
+                    stack[stack_ptr] = nidx;
+                    stack_ptr += 1;
                 }
             }
         }
@@ -228,7 +272,7 @@ impl Game {
 
         for y in 0..self.size {
             for x in 0..self.size {
-                let idx = self.get_idx(x, y);
+                let idx = Self::get_idx(self.size, x, y);
                 if tmp[idx] != 0 || flood[idx] {
                     continue;
                 }
@@ -241,10 +285,10 @@ impl Game {
                 flood[idx] = true;
 
                 while let Some((cx, cy)) = queue.pop_front() {
-                    region.push(self.get_idx(cx, cy));
+                    region.push(Self::get_idx(self.size, cx, cy));
 
-                    for (nx, ny) in self.neighbors(cx, cy) {
-                        let nidx = self.get_idx(nx, ny);
+                    for (nx, ny) in Self::neighbors(self.size, cx, cy) {
+                        let nidx = Self::get_idx(self.size, nx, ny);
                         if tmp[nidx] == 0 {
                             if !flood[nidx] {
                                 flood[nidx] = true;
