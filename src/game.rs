@@ -37,7 +37,6 @@ pub struct Game {
     pub pass_cnt: usize,
     pub hash: u64,
     pub hash_set: HashSet<u64>,
-    pub hash_history: VecDeque<u64>,
 }
 
 impl Game {
@@ -46,10 +45,8 @@ impl Game {
         let board = vec![0; size * size];
         let cap = config["history"].as_u64().unwrap() as usize;
         let mut history = VecDeque::with_capacity(cap);
-        let mut hash_history = VecDeque::with_capacity(cap);
         for _ in 0..cap {
             history.push_front(board.clone());
-            hash_history.push_front(ZOBRIST_TABLE.white);
         }
 
         Self {
@@ -60,7 +57,6 @@ impl Game {
             pass_cnt: 0,
             hash: ZOBRIST_TABLE.white,
             hash_set: HashSet::new(),
-            hash_history,
         }
     }
 
@@ -175,8 +171,6 @@ impl Game {
 
         self.history.rotate_right(1);
         self.history[0].clone_from(&self.board);
-        self.hash_history.rotate_right(1);
-        self.hash_history[0] = self.hash;
 
         self.hash_set.insert(self.hash);
         self.move_cnt += 1;

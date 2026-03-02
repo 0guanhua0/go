@@ -40,7 +40,7 @@ pub struct MCTS {
     device: Device,
     input_planes: usize,
     c_puct: f32,
-    nn_cache: Arc<DashMap<Vec<u64>, (Vec<f32>, f32)>>,
+    nn_cache: Arc<DashMap<u64, (Vec<f32>, f32)>>,
 }
 
 impl MCTS {
@@ -50,7 +50,7 @@ impl MCTS {
         device: Device,
         input_planes: usize,
         c_puct: f32,
-        nn_cache: Arc<DashMap<Vec<u64>, (Vec<f32>, f32)>>,
+        nn_cache: Arc<DashMap<u64, (Vec<f32>, f32)>>,
     ) -> Self {
         Self {
             root: Node::new(1.0),
@@ -189,7 +189,7 @@ impl MCTS {
         batcher: &Batcher,
         device: Device,
         input_planes: usize,
-        nn_cache: &DashMap<Vec<u64>, (Vec<f32>, f32)>,
+        nn_cache: &DashMap<u64, (Vec<f32>, f32)>,
     ) -> f32 {
         let set_policy = |node: &mut Node, policy_vec: &[f32]| {
             let mut sum_exp = 0.0;
@@ -211,8 +211,7 @@ impl MCTS {
             node.expand = true;
         };
 
-        let hash_history: Vec<u64> = game.hash_history.iter().cloned().collect();
-        if let Some(entry) = nn_cache.get(&hash_history) {
+        if let Some(entry) = nn_cache.get(&game.hash) {
             let (policy_vec, node_value) = entry.value();
             set_policy(node, policy_vec);
             return *node_value;
@@ -229,7 +228,7 @@ impl MCTS {
         let node_value: f32 = f32::try_from(value.to(Device::Cpu)).unwrap();
 
         set_policy(node, &policy_vec);
-        nn_cache.insert(hash_history, (policy_vec, node_value));
+        nn_cache.insert(game.hash, (policy_vec, node_value));
         node_value
     }
 
