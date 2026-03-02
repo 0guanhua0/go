@@ -142,12 +142,12 @@ impl MCTS {
     }
 
     pub fn get_feature(game: &Game) -> Vec<f32> {
-        let cap = game.history.capacity();
+        let cap = game.cap;
         let input_planes = 2 * cap + 1;
         let plane_size = game.size * game.size;
         let mut feature = vec![0.0f32; input_planes * plane_size];
 
-        for (idx, board) in game.history.iter().enumerate() {
+        for (idx, board) in game.history[0..cap].iter().enumerate() {
             let p1 = idx * 2 * plane_size;
             let p2 = p1 + plane_size;
             for i in 0..plane_size {

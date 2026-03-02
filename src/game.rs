@@ -25,6 +25,7 @@ impl ZobristTable {
 static ZOBRIST_TABLE: LazyLock<ZobristTable> = LazyLock::new(ZobristTable::new);
 
 const MAX_BOARD: usize = 512;
+const MAX_HISTORY: usize = 8;
 
 fn zobrist_idx(player: i8) -> usize {
     if player == 1 { 1 } else { 0 }
@@ -32,8 +33,9 @@ fn zobrist_idx(player: i8) -> usize {
 
 #[derive(Clone)]
 pub struct Game {
-    pub board: Vec<i8>,
-    pub history: VecDeque<Vec<i8>>,
+    pub board: [i8; MAX_BOARD],
+    pub history: [[i8; MAX_BOARD]; MAX_HISTORY],
+    pub cap: usize,
     pub size: usize,
     pub move_cnt: usize,
     pub pass_cnt: usize,
@@ -45,16 +47,18 @@ impl Game {
     pub fn new(size: usize) -> Self {
         let config = Config::load().unwrap();
         assert!(size * size <= MAX_BOARD);
-        let board = vec![0; size * size];
+        let board = [0; MAX_BOARD];
         let cap = config["history"].as_u64().unwrap() as usize;
-        let mut history = VecDeque::with_capacity(cap);
-        for _ in 0..cap {
-            history.push_front(board.clone());
+        assert!(cap <= MAX_HISTORY);
+        let mut history = [[0; MAX_BOARD]; MAX_HISTORY];
+        for i in 0..cap {
+            history[i] = board;
         }
 
         Self {
             board,
             history,
+            cap,
             size,
             move_cnt: 0,
             pass_cnt: 0,
@@ -105,8 +109,7 @@ impl Game {
         }
 
         let mut next_hash = self.hash ^ ZOBRIST_TABLE.white;
-        let mut next_board = [0i8; MAX_BOARD];
-        next_board[..self.board.len()].copy_from_slice(&self.board);
+        let mut next_board = self.board;
 
         next_board[idx] = player;
         next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
@@ -183,8 +186,8 @@ impl Game {
             self.pass_cnt += 1;
         }
 
-        self.history.rotate_right(1);
-        self.history[0].clone_from(&self.board);
+        self.history[0..self.cap].copy_within(0..self.cap - 1, 1);
+        self.history[0] = self.board;
 
         self.hash_set.insert(self.hash);
         self.move_cnt += 1;
