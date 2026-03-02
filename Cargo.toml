@@ -12,4 +12,3 @@ npyz = { version = "0.8", features = ["npz"] }
 ndarray = "0.16"
 zip = "0.6"
 uuid = { version = "1.21.0", features = ["v4"] }
-dashmap = "6.1.0"

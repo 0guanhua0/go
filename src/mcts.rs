@@ -1,8 +1,7 @@
 use crate::game::Game;
 use crate::nn::Batcher;
-use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tch::{Device, Tensor};
 
 struct Node {
@@ -33,6 +32,39 @@ impl Node {
     }
 }
 
+pub struct NNCache {
+    table: Vec<RwLock<Option<(u64, [f32; Game::MAX_BOARD], f32)>>>,
+}
+
+impl NNCache {
+    pub fn new(size: usize) -> Self {
+        let mut table = Vec::with_capacity(size);
+        for _ in 0..size {
+            table.push(RwLock::new(None));
+        }
+        Self { table }
+    }
+
+    pub fn get(&self, hash: u64) -> Option<([f32; Game::MAX_BOARD], f32)> {
+        let idx = (hash as usize) % self.table.len();
+        let entry = self.table[idx].read().unwrap();
+        if let Some((h, p, v)) = &*entry {
+            if *h == hash {
+                return Some((*p, *v));
+            }
+        }
+        None
+    }
+
+    pub fn insert(&self, hash: u64, policy: &[f32], value: f32) {
+        let idx = (hash as usize) % self.table.len();
+        let mut entry = self.table[idx].write().unwrap();
+        let mut p = [0.0f32; Game::MAX_BOARD];
+        p[..policy.len()].copy_from_slice(policy);
+        *entry = Some((hash, p, value));
+    }
+}
+
 pub struct MCTS {
     root: Node,
     simulations: usize,
@@ -40,7 +72,7 @@ pub struct MCTS {
     device: Device,
     input_planes: usize,
     c_puct: f32,
-    nn_cache: Arc<DashMap<u64, (Vec<f32>, f32)>>,
+    nn_cache: Arc<NNCache>,
 }
 
 impl MCTS {
@@ -50,7 +82,7 @@ impl MCTS {
         device: Device,
         input_planes: usize,
         c_puct: f32,
-        nn_cache: Arc<DashMap<u64, (Vec<f32>, f32)>>,
+        nn_cache: Arc<NNCache>,
     ) -> Self {
         Self {
             root: Node::new(1.0),
@@ -189,7 +221,7 @@ impl MCTS {
         batcher: &Batcher,
         device: Device,
         input_planes: usize,
-        nn_cache: &DashMap<u64, (Vec<f32>, f32)>,
+        nn_cache: &NNCache,
     ) -> f32 {
         let set_policy = |node: &mut Node, policy_vec: &[f32]| {
             let mut sum_exp = 0.0;
@@ -211,10 +243,9 @@ impl MCTS {
             node.expand = true;
         };
 
-        if let Some(entry) = nn_cache.get(&game.hash) {
-            let (policy_vec, node_value) = entry.value();
-            set_policy(node, policy_vec);
-            return *node_value;
+        if let Some((policy_arr, node_value)) = nn_cache.get(game.hash) {
+            set_policy(node, &policy_arr);
+            return node_value;
         }
 
         let feature = Self::get_feature(game);
@@ -228,7 +259,7 @@ impl MCTS {
         let node_value: f32 = f32::try_from(value.to(Device::Cpu)).unwrap();
 
         set_policy(node, &policy_vec);
-        nn_cache.insert(game.hash, (policy_vec, node_value));
+        nn_cache.insert(game.hash, &policy_vec, node_value);
         node_value
     }
 

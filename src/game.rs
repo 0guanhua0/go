@@ -24,17 +24,10 @@ impl ZobristTable {
 
 static ZOBRIST_TABLE: LazyLock<ZobristTable> = LazyLock::new(ZobristTable::new);
 
-const MAX_BOARD: usize = 512;
-const MAX_HISTORY: usize = 8;
-
-fn zobrist_idx(player: i8) -> usize {
-    if player == 1 { 1 } else { 0 }
-}
-
 #[derive(Clone)]
 pub struct Game {
-    pub board: [i8; MAX_BOARD],
-    pub history: [[i8; MAX_BOARD]; MAX_HISTORY],
+    pub board: [i8; Self::MAX_BOARD],
+    pub history: [[i8; Self::MAX_BOARD]; Self::MAX_HISTORY],
     pub cap: usize,
     pub size: usize,
     pub move_cnt: usize,
@@ -44,13 +37,20 @@ pub struct Game {
 }
 
 impl Game {
+    pub const MAX_BOARD: usize = 512;
+    pub const MAX_HISTORY: usize = 8;
+
+    fn zobrist_idx(player: i8) -> usize {
+        if player == 1 { 1 } else { 0 }
+    }
+
     pub fn new(size: usize) -> Self {
         let config = Config::load().unwrap();
-        assert!(size * size <= MAX_BOARD);
-        let board = [0; MAX_BOARD];
+        assert!(size * size <= Self::MAX_BOARD);
+        let board = [0; Self::MAX_BOARD];
         let cap = config["history"].as_u64().unwrap() as usize;
-        assert!(cap <= MAX_HISTORY);
-        let mut history = [[0; MAX_BOARD]; MAX_HISTORY];
+        assert!(cap <= Self::MAX_HISTORY);
+        let mut history = [[0; Self::MAX_BOARD]; Self::MAX_HISTORY];
         for i in 0..cap {
             history[i] = board;
         }
@@ -112,13 +112,13 @@ impl Game {
         let mut next_board = self.board;
 
         next_board[idx] = player;
-        next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
+        next_hash ^= ZOBRIST_TABLE.key[idx * 2 + Self::zobrist_idx(player)];
 
         let (x, y) = Self::get_xy(self.size, idx);
         let rival = -player;
 
-        let mut visited = [false; MAX_BOARD];
-        let mut stack = [0usize; MAX_BOARD];
+        let mut visited = [false; Self::MAX_BOARD];
+        let mut stack = [0usize; Self::MAX_BOARD];
 
         for (nx, ny) in Self::neighbors(self.size, x, y) {
             let nidx = Self::get_idx(self.size, nx, ny);
@@ -158,11 +158,11 @@ impl Game {
             let (x, y) = Self::get_xy(self.size, idx);
 
             self.board[idx] = player;
-            self.hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(player)];
+            self.hash ^= ZOBRIST_TABLE.key[idx * 2 + Self::zobrist_idx(player)];
 
             let rival = -player;
-            let mut visited = [false; MAX_BOARD];
-            let mut stack = [0usize; MAX_BOARD];
+            let mut visited = [false; Self::MAX_BOARD];
+            let mut stack = [0usize; Self::MAX_BOARD];
 
             for (nx, ny) in Self::neighbors(self.size, x, y) {
                 let nidx = Self::get_idx(self.size, nx, ny);
@@ -198,8 +198,8 @@ impl Game {
         board: &[i8],
         x: usize,
         y: usize,
-        visited: &mut [bool; MAX_BOARD],
-        stack: &mut [usize; MAX_BOARD],
+        visited: &mut [bool; Self::MAX_BOARD],
+        stack: &mut [usize; Self::MAX_BOARD],
     ) -> bool {
         let color = board[Self::get_idx(size, x, y)];
         if color == 0 {
@@ -239,8 +239,8 @@ impl Game {
         y: usize,
         next_hash: &mut u64,
         color: i8,
-        visited: &mut [bool; MAX_BOARD],
-        stack: &mut [usize; MAX_BOARD],
+        visited: &mut [bool; Self::MAX_BOARD],
+        stack: &mut [usize; Self::MAX_BOARD],
     ) {
         visited.fill(false);
         let mut stack_ptr = 0;
@@ -255,7 +255,7 @@ impl Game {
             let idx = stack[stack_ptr];
 
             board[idx] = 0;
-            *next_hash ^= ZOBRIST_TABLE.key[idx * 2 + zobrist_idx(color)];
+            *next_hash ^= ZOBRIST_TABLE.key[idx * 2 + Self::zobrist_idx(color)];
 
             let (cx, cy) = Self::get_xy(size, idx);
             for (nx, ny) in Self::neighbors(size, cx, cy) {

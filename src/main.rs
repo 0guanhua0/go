@@ -4,10 +4,9 @@ mod mcts;
 mod nn;
 
 use crate::game::Game;
-use crate::mcts::MCTS;
+use crate::mcts::{MCTS, NNCache};
 use crate::nn::Batcher;
 use anyhow::Result;
-use dashmap::DashMap;
 use ndarray::Array;
 use npyz::WriterBuilder;
 use std::fs;
@@ -107,7 +106,7 @@ fn main() -> Result<()> {
     };
 
     let batcher = Arc::new(Batcher::new(device, batch_size));
-    let nn_cache = Arc::new(DashMap::new());
+    let nn_cache = Arc::new(NNCache::new(1 << 20));
 
     let mut handles = vec![];
 
