@@ -47,7 +47,7 @@ fn save_game(
     let mut writer = npyz::npz::NpzWriter::new(fs::File::create(path)?);
 
     writer
-        .array("features", zip::write::FileOptions::default())?
+        .array("board", zip::write::FileOptions::default())?
         .default_dtype()
         .shape(
             &feature_arr
@@ -60,7 +60,7 @@ fn save_game(
         .extend(feature_arr.iter())?;
 
     writer
-        .array("policies", zip::write::FileOptions::default())?
+        .array("policy", zip::write::FileOptions::default())?
         .default_dtype()
         .shape(
             &policies_arr
@@ -73,7 +73,7 @@ fn save_game(
         .extend(policies_arr.iter())?;
 
     writer
-        .array("values", zip::write::FileOptions::default())?
+        .array("value", zip::write::FileOptions::default())?
         .default_dtype()
         .shape(
             &values_arr
