@@ -6,8 +6,7 @@ import json
 import multiprocessing
 import numpy as np
 import os
-import shutil
-import time
+import psutil
 import zipfile
 
 
@@ -25,10 +24,23 @@ def get_row(f):
                 if num_rows is None:
                     num_rows = shape[0]
                 assert num_rows == shape[0]
-        return (f, num_rows)
+        return num_rows
 
 
-def shard(idx, input_file_group, file_cnt, out_tmp_dirs, keep_prob):
+def scan(dir, path_md5_min, path_md5_max):
+    for entry in os.scandir(dir):
+        if entry.is_dir():
+            yield from scan(entry.path, path_md5_min, path_md5_max)
+        elif entry.is_file() and entry.name.endswith(".npz"):
+            path_md5 = (
+                int(hashlib.md5(entry.name.encode()).hexdigest()[:13], 16) / 2**52
+            )
+            if path_md5_min <= path_md5 < path_md5_max:
+                num_rows = get_row(entry.path)
+                yield (entry.path, entry.stat(), num_rows)
+
+
+def shard(idx, input_file_group, file_cnt, tmp_dirs, keep_prob):
     board_list = []
     policy_list = []
     value_list = []
@@ -44,8 +56,8 @@ def shard(idx, input_file_group, file_cnt, out_tmp_dirs, keep_prob):
     value = np.concatenate(value_list, axis=0)
 
     row_cnt = board.shape[0]
-    assert policy.shape[0] == row_cnt
-    assert value.shape[0] == row_cnt
+    assert row_cnt == policy.shape[0]
+    assert row_cnt == value.shape[0]
 
     keep_cnt = int(row_cnt * keep_prob)
     rng = np.random.default_rng()
@@ -65,18 +77,16 @@ def shard(idx, input_file_group, file_cnt, out_tmp_dirs, keep_prob):
             "value": value[shard_perm],
         }
 
-        np.savez_compressed(
-            os.path.join(out_tmp_dirs[i], str(idx) + ".npz"), **save_dict
-        )
+        np.savez_compressed(os.path.join(tmp_dirs[i], str(idx) + ".npz"), **save_dict)
 
 
-def merge(filename, num_shards_to_merge, out_tmp_dir, batch):
+def merge(filename, num_shards_to_merge, tmp_dir, batch):
     board_list = []
     policy_list = []
     value_list = []
 
     for idx in range(num_shards_to_merge):
-        shard_filename = os.path.join(out_tmp_dir, str(idx) + ".npz")
+        shard_filename = os.path.join(tmp_dir, str(idx) + ".npz")
         with np.load(shard_filename) as npz:
             board_list.append(npz["board"])
             policy_list.append(npz["policy"])
@@ -90,8 +100,8 @@ def merge(filename, num_shards_to_merge, out_tmp_dir, batch):
     assert policy.shape[0] == num_rows
     assert value.shape[0] == num_rows
 
-    num_batches = num_rows // batch
-    keep_cnt = num_batches * batch
+    batch_cnt = num_rows // batch
+    keep_cnt = batch_cnt * batch
 
     rng = np.random.default_rng()
     perm = rng.choice(num_rows, size=keep_cnt, replace=False)
@@ -106,72 +116,55 @@ def merge(filename, num_shards_to_merge, out_tmp_dir, batch):
 
     jsonfilename = os.path.splitext(filename)[0] + ".json"
     with open(jsonfilename, "w") as f:
-        json.dump({"num_rows": keep_cnt, "num_batches": num_batches}, f)
-
-    return keep_cnt
+        json.dump({"num_rows": keep_cnt, "batch_cnt": batch_cnt}, f)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dirs", nargs="+")
-    parser.add_argument("-out-dir", required=True)
-    parser.add_argument("-out-tmp-dir", required=True)
-    parser.add_argument("-path-md5-min", type=float, required=True)
-    parser.add_argument("-path-md5-max", type=float, required=True)
-    parser.add_argument("-batch", type=int, required=True)
+    parser.add_argument("--batch", type=int, required=True)
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--path-md5-max", type=float, required=True)
+    parser.add_argument("--path-md5-min", type=float, required=True)
+    parser.add_argument("--tmp-dir", required=True)
 
     args = parser.parse_args()
     dirs = args.dirs
-    out_dir = args.out_dir
-    out_tmp_dir = args.out_tmp_dir
-    num_processes = multiprocessing.cpu_count()
     batch = args.batch
+    out_dir = args.out_dir
+    path_md5_max = args.path_md5_max
+    path_md5_min = args.path_md5_min
+    tmp_dir = args.tmp_dir
 
-    worker_group_size = 1 << 17
+    mem = psutil.virtual_memory().available
+    cpu_count = multiprocessing.cpu_count()
+    cpu_mem = mem // cpu_count
+    gpu_mem = int(os.environ["GPU_MEM"])
+
     target_row = 1 << 24
     max_row = 1 << 30
     row_per_file = 1 << 16
-    path_md5_min = args.path_md5_min
-    path_md5_max = args.path_md5_max
 
     all_npz = []
-
-    def scan(dir):
-        for entry in os.scandir(dir):
-            if entry.is_dir():
-                yield from scan(entry.path)
-            elif entry.is_file() and entry.name.endswith(".npz"):
-                yield (entry.path, entry.stat().st_mtime)
-
     for d in dirs:
-        for path, mtime in scan(d):
-            all_npz.append((path, mtime))
+        for path, stat, num_rows in scan(d, path_md5_min, path_md5_max):
+            all_npz.append((path, stat, num_rows))
 
-    all_npz.sort(key=(lambda x: x[1]))
-    time.sleep(3)
+    if not all_npz:
+        exit(1)
 
-    gc.collect()
-    with multiprocessing.Pool(num_processes) as pool:
-        dict_row = dict(pool.map(get_row, [x[0] for x in all_npz]))
-
-    all_npz = [(path, mtime, dict_row[path]) for path, mtime in all_npz]
-
-    os.mkdir(out_dir)
+    all_npz.sort(key=(lambda x: x[1].st_mtime), reverse=True)
     shuffle_input = []
-    head = all_npz[0]
-    tail = all_npz[0]
+    head, tail = all_npz[0], all_npz[0]
     row_cnt = 0
-    for filename, mtime, num_rows in all_npz:
+    for filename, stat, num_rows in all_npz:
         if num_rows:
             shuffle_input.append((filename, num_rows))
             row_cnt += num_rows
-            tail = (filename, mtime, num_rows)
+            tail = (filename, stat, num_rows)
 
         if row_cnt >= max_row:
             break
-
-    if row_cnt == 0:
-        exit(1)
 
     del all_npz
     gc.collect()
@@ -184,41 +177,27 @@ if __name__ == "__main__":
 
     out_files = [os.path.join(out_dir, "data%d.npz" % i) for i in range(file_cnt)]
 
-    out_tmp_dirs = [
-        os.path.join(out_tmp_dir, "tmp.shuf%d" % i) for i in range(file_cnt)
-    ]
+    tmp_dirs = [os.path.join(tmp_dir, "tmp.shuf%d" % i) for i in range(file_cnt)]
 
-    for tmp_dir in out_tmp_dirs:
+    for tmp_dir in tmp_dirs:
         os.makedirs(tmp_dir, exist_ok=True)
-
-    num_rows_in_desired_files = 0
-    new_shuffle_input = []
-    for input_file, num_rows_in_file in shuffle_input:
-        input_file_base = os.path.basename(input_file)
-        path_md5 = (
-            int(hashlib.md5(input_file_base.encode()).hexdigest()[:13], 16) / 2**52
-        )
-        if path_md5_min <= path_md5 < path_md5_max:
-            new_shuffle_input.append((input_file, num_rows_in_file))
-            num_rows_in_desired_files += num_rows_in_file
-    shuffle_input = new_shuffle_input
 
     shard_input = []
     group, size = [], 0
     for input_file, num_rows_in_file in shuffle_input:
         group.append(input_file)
-        size += num_rows_in_file
-        if size >= worker_group_size:
+        size += os.path.getsize(input_file)
+        if size >= cpu_mem:
             shard_input.append(group)
             group, size = [], 0
     if group:
         shard_input.append(group)
 
-    with multiprocessing.Pool(num_processes) as pool:
+    with multiprocessing.Pool(cpu_count) as pool:
         pool.starmap(
             shard,
             [
-                (idx, group, file_cnt, out_tmp_dirs, keep_prob)
+                (idx, group, file_cnt, tmp_dirs, keep_prob)
                 for idx, group in enumerate(shard_input)
             ],
         )
@@ -227,16 +206,26 @@ if __name__ == "__main__":
         pool.starmap(
             merge,
             [
-                (out_file, num_shards_to_merge, out_tmp_dir, batch)
-                for out_file, out_tmp_dir in zip(out_files, out_tmp_dirs)
+                (out_file, num_shards_to_merge, tmp_dir, batch)
+                for out_file, tmp_dir in zip(out_files, tmp_dirs)
             ],
         )
 
-    for tmp_dir in out_tmp_dirs:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-
-    dump_value = {"range": (head, tail)}
-
     with open(out_dir + ".json", "w") as f:
-        json.dump(dump_value, f)
+        json.dump(
+            {
+                "range": (
+                    {
+                        "path": head[0],
+                        "st_mtime": head[1].st_mtime,
+                        "num_rows": head[2],
+                    },
+                    {
+                        "path": tail[0],
+                        "st_mtime": tail[1].st_mtime,
+                        "num_rows": tail[2],
+                    },
+                )
+            },
+            f,
+        )

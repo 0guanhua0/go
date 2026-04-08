@@ -4,6 +4,7 @@ dynamic = ["version"]
 dependencies = [
     "numpy",
     "torch==2.7.0",
+    "psutil",
 ]
 
 [project.optional-dependencies]
