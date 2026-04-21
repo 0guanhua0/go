@@ -2,7 +2,6 @@ import argparse
 import hashlib
 import logging
 import os
-import time
 
 import torch
 import torch.nn.functional as F
@@ -56,11 +55,11 @@ class Trainer:
             self.optimizer, milestones=config.lr_milestones, gamma=0.1
         )
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, save_dir):
         self.model.eval()
         model_id = weight_hash(self.model.state_dict().values())
-        os.makedirs("models", exist_ok=True)
-        filename = f"models/{model_id}.pt"
+        os.makedirs(save_dir, exist_ok=True)
+        filename = f"{save_dir}/{model_id}.pt"
 
         example_input = torch.zeros(
             1, config.history * 2 + 1, config.board, config.board
@@ -68,8 +67,7 @@ class Trainer:
 
         traced_model = torch.jit.trace(self.model, example_input)
         traced_model.save(filename)
-        logging.info(f"saved checkpoint: {filename}")
-        return model_id
+        logging.info(f"checkpoint {filename}")
 
     def train_step(self, state, policy, value):
         self.model.train()
@@ -93,64 +91,79 @@ class Trainer:
         self.optimizer.step()
         return loss.item()
 
+    def eval_step(self, state, policy, value):
+        self.model.eval()
+        with torch.no_grad():
+            state = state.to(self.device)
+            policy = policy.to(self.device)
+            value = value.to(self.device)
+
+            policy_next, value_next = self.model(state)
+
+            policy_loss = F.cross_entropy(policy_next, policy)
+            value_loss = F.mse_loss(value_next, value)
+
+            loss = policy_loss + value_loss
+            return loss.item()
+
 
 def main(args):
     logging.basicConfig(**LOGGING_CONFIG)
     trainer = Trainer(args.device)
 
-    if not os.listdir("models") if os.path.exists("models") else True:
-        trainer.save_checkpoint()
+    if not os.path.isdir("models") or not os.listdir("models"):
+        trainer.save_checkpoint("models")
 
-    data_path = "data/shuffle/latest.npz"
+    data = np.load(args.data_train, allow_pickle=True).item()
+    board = torch.from_numpy(data["board"])
+    policy = torch.from_numpy(data["policy"])
+    value = torch.from_numpy(data["value"])
 
-    while True:
-        if not os.path.exists(data_path):
-            logging.warning(f"waiting for {data_path}...")
-            time.sleep(10)
-            continue
+    sample_cnt = board.shape[0]
+    logging.info(f"sample {sample_cnt}")
 
-        logging.info(f"loading data from {data_path}")
-        try:
-            data = np.load(data_path)
-            features = torch.from_numpy(data["board"])
-            policies = torch.from_numpy(data["policy"])
-            values = torch.from_numpy(data["value"])
-        except Exception as e:
-            logging.error(f"failed to load data: {e}")
-            time.sleep(5)
-            continue
+    step = 0
 
-        num_samples = features.shape[0]
-        logging.info(f"training on {num_samples} samples")
+    for i in range(0, sample_cnt - config.batch_size + 1, config.batch_size):
+        idx = range(i, i + config.batch_size)
+        loss = trainer.train_step(board[idx], policy[idx], value[idx])
+        step += 1
 
-        total_loss = 0.0
-        batches_done = 0
+        if step % 100 == 0:
+            logging.info(f"step {step} loss {loss:.4f}")
 
-        # Shuffle indices for this epoch
-        perm = torch.randperm(num_samples)
+        if step >= config.epoch:
+            break
 
-        for i in range(0, num_samples - config.batch_size + 1, config.batch_size):
-            indices = perm[i : i + config.batch_size]
-            loss = trainer.train_step(
-                features[indices], policies[indices], values[indices]
-            )
-            total_loss += loss
-            batches_done += 1
+    valid_data = np.load(args.data_valid, allow_pickle=True).item()
+    v_board = torch.from_numpy(valid_data["board"])
+    v_policy = torch.from_numpy(valid_data["policy"])
+    v_value = torch.from_numpy(valid_data["value"])
 
-            if batches_done % 100 == 0:
-                logging.info(f"step {batches_done}: loss={loss:.4f}")
+    v_sample_cnt = v_board.shape[0]
+    v_step = 0
+    v_total_loss = 0.0
+    for i in range(0, v_sample_cnt - config.batch_size + 1, config.batch_size):
+        v_loss = trainer.eval_step(
+            v_board[i : i + config.batch_size],
+            v_policy[i : i + config.batch_size],
+            v_value[i : i + config.batch_size],
+        )
+        v_total_loss += v_loss
+        v_step += 1
 
-            if batches_done >= config.training_updates_per_generation:
-                break
+    logging.info(f"validation loss {v_total_loss / v_step:.4f}")
 
-        trainer.scheduler.step()
-        logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
+    trainer.scheduler.step()
+    logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
 
-        trainer.save_checkpoint()
+    trainer.save_checkpoint("eval")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--data-train", required=True)
+    parser.add_argument("--data-valid", required=True)
     args = parser.parse_args()
     main(args)

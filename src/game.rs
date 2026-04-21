@@ -324,16 +324,6 @@ impl Game {
         (black, white)
     }
 
-    pub fn get_winner(&self) -> Option<i8> {
-        let (black, white) = self.get_score();
-        if black > white {
-            Some(1)
-        } else if white > black {
-            Some(-1)
-        } else {
-            None
-        }
-    }
     pub fn end(&self) -> bool {
         self.pass_cnt >= 2 || self.move_cnt >= self.size * self.size * 2
     }

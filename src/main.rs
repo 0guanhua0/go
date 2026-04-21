@@ -7,83 +7,61 @@ use crate::game::Game;
 use crate::mcts::{MCTS, NNCache};
 use crate::nn::Batcher;
 use anyhow::Result;
-use ndarray::Array;
-use npyz::WriterBuilder;
+use sgf_parse::SgfNode;
+use sgf_parse::go::{Move, Prop};
 use std::fs;
 use std::sync::Arc;
 use std::thread;
 use tch::Device;
 use uuid::Uuid;
 
-fn save_game(
+fn save(
     model_id: &str,
     history: &[(Vec<f32>, Vec<f32>, i8)],
     winner: i8,
     board_size: usize,
     input_planes: usize,
+    sgf_root: &SgfNode<Prop>,
 ) -> Result<()> {
+    let game_id = Uuid::new_v4();
     let dir = format!("data/selfplay/{}", model_id);
     fs::create_dir_all(&dir)?;
 
-    let game_id = Uuid::new_v4();
     let path = format!("{}/{}.npz", dir, game_id);
+    let sgf_path = format!("{}/{}.sgf", dir, game_id);
+    let _ = fs::write(&sgf_path, sgf_root.serialize());
 
     let n = history.len();
-    let mut feature = Vec::with_capacity(n * input_planes * board_size * board_size);
-    let mut policies = Vec::with_capacity(n * (board_size * board_size + 1));
-    let mut values = Vec::with_capacity(n);
+    let feature_size = input_planes * board_size * board_size;
+    let policy_size = board_size * board_size + 1;
+    let mut board_data = Vec::with_capacity(n * feature_size);
+    let mut policy_data = Vec::with_capacity(n * policy_size);
+    let mut value_data = Vec::with_capacity(n);
 
     for (f, p, player) in history {
-        feature.extend_from_slice(f);
-        policies.extend_from_slice(p);
+        board_data.extend_from_slice(f);
+        policy_data.extend_from_slice(p);
         let v = if *player == winner { 1.0f32 } else { -1.0f32 };
-        values.push(v);
+        value_data.push(v);
     }
 
-    let feature_arr = Array::from_shape_vec((n, input_planes, board_size, board_size), feature)?;
-    let policies_arr = Array::from_shape_vec((n, board_size * board_size + 1), policies)?;
-    let values_arr = Array::from_shape_vec((n, 1), values)?;
+    let board_tensor = tch::Tensor::from_slice(&board_data).view([
+        n as i64,
+        input_planes as i64,
+        board_size as i64,
+        board_size as i64,
+    ]);
+    let policy_tensor = tch::Tensor::from_slice(&policy_data).view([n as i64, policy_size as i64]);
+    let value_tensor = tch::Tensor::from_slice(&value_data).view([n as i64, 1]);
 
-    let mut writer = npyz::npz::NpzWriter::new(fs::File::create(path)?);
-
-    writer
-        .array("board", zip::write::FileOptions::default())?
-        .default_dtype()
-        .shape(
-            &feature_arr
-                .shape()
-                .iter()
-                .map(|&x| x as u64)
-                .collect::<Vec<_>>(),
-        )
-        .begin_nd()?
-        .extend(feature_arr.iter())?;
-
-    writer
-        .array("policy", zip::write::FileOptions::default())?
-        .default_dtype()
-        .shape(
-            &policies_arr
-                .shape()
-                .iter()
-                .map(|&x| x as u64)
-                .collect::<Vec<_>>(),
-        )
-        .begin_nd()?
-        .extend(policies_arr.iter())?;
-
-    writer
-        .array("value", zip::write::FileOptions::default())?
-        .default_dtype()
-        .shape(
-            &values_arr
-                .shape()
-                .iter()
-                .map(|&x| x as u64)
-                .collect::<Vec<_>>(),
-        )
-        .begin_nd()?
-        .extend(values_arr.iter())?;
+    tch::Tensor::write_npz(
+        &[
+            ("board", &board_tensor),
+            ("policy", &policy_tensor),
+            ("value", &value_tensor),
+        ],
+        &path,
+    )?;
 
     Ok(())
 }
@@ -126,26 +104,72 @@ fn main() -> Result<()> {
                 );
 
                 let mut history = Vec::new();
+                let mut sgf_root = SgfNode::new(
+                    vec![Prop::SZ((board_size as u8, board_size as u8))],
+                    vec![],
+                    true,
+                );
+                let mut curr_node = &mut sgf_root;
+
                 while game.end() == false {
                     let feature = MCTS::get_feature(&game);
                     let idx = mcts.run(&game);
                     let policy = mcts.get_policy(&game);
-                    history.push((feature, policy, game.player()));
+
+                    let player = game.player();
+                    history.push((feature, policy, player));
+
+                    let mut move_node = SgfNode::new(vec![], vec![], false);
+                    if idx == board_size * board_size {
+                        if player == 1 {
+                            move_node.properties.push(Prop::B(Move::Pass));
+                        } else {
+                            move_node.properties.push(Prop::W(Move::Pass));
+                        }
+                    } else {
+                        let x = (idx % board_size) as u8;
+                        let y = (idx / board_size) as u8;
+                        if player == 1 {
+                            move_node
+                                .properties
+                                .push(Prop::B(Move::Move(sgf_parse::go::Point { x, y })));
+                        } else {
+                            move_node
+                                .properties
+                                .push(Prop::W(Move::Move(sgf_parse::go::Point { x, y })));
+                        }
+                    }
+                    curr_node.children.push(move_node);
+                    curr_node = curr_node.children.last_mut().unwrap();
 
                     game.play(idx);
                     mcts.update_root(idx);
                 }
 
-                if let Some(winner) = game.get_winner() {
-                    let model_id = batcher_clone.model_id();
-                    let _ = save_game(
-                        &model_id,
-                        &history,
-                        winner,
-                        board_size,
-                        input_planes as usize,
-                    );
+                let (black, white) = game.get_score();
+                let winner = if black > white { 1 } else { -1 };
+                if winner == 1 {
+                    let diff = black - white;
+                    sgf_root.properties.push(Prop::RE(sgf_parse::SimpleText {
+                        text: format!("B+{}", diff),
+                    }));
+                } else if winner == -1 {
+                    let diff = white - black;
+                    sgf_root.properties.push(Prop::RE(sgf_parse::SimpleText {
+                        text: format!("W+{}", diff),
+                    }));
                 }
+
+                let model_id = batcher_clone.model_id();
+
+                let _ = save(
+                    &model_id,
+                    &history,
+                    winner,
+                    board_size,
+                    input_planes as usize,
+                    &sgf_root,
+                );
             }
         });
         handles.push(handle);
