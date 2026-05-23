@@ -1,24 +1,22 @@
-use super::config::Config;
+//https://tromp.github.io/go.html
+
 use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
 
 struct ZobristTable {
     pub key: Vec<u64>,
-    pub white: u64,
 }
 
 impl ZobristTable {
     fn new() -> Self {
-        let config = Config::load().unwrap();
-        let size = config["board"].as_u64().unwrap() as usize;
+        let size = std::env::var("BOARD").unwrap().parse::<usize>().unwrap();
         let mut rng = rand::rng();
         let mut key = vec![0u64; size * size * 2];
         for i in 0..key.len() {
             key[i] = rng.random();
         }
-        let white = rng.random();
-        ZobristTable { key, white }
+        ZobristTable { key }
     }
 }
 
@@ -45,11 +43,9 @@ impl Game {
     }
 
     pub fn new(size: usize) -> Self {
-        let config = Config::load().unwrap();
         assert!(size * size <= Self::MAX_BOARD);
         let board = [0; Self::MAX_BOARD];
-        let cap = config["history"].as_u64().unwrap() as usize;
-        assert!(cap <= Self::MAX_HISTORY);
+        let cap = std::env::var("HISTORY").unwrap().parse::<usize>().unwrap();
         let mut history = [[0; Self::MAX_BOARD]; Self::MAX_HISTORY];
         for i in 0..cap {
             history[i] = board;
@@ -62,8 +58,8 @@ impl Game {
             size,
             move_cnt: 0,
             pass_cnt: 0,
-            hash: ZOBRIST_TABLE.white,
-            hash_set: HashSet::new(),
+            hash: 0,
+            hash_set: HashSet::from([0]),
         }
     }
 
@@ -108,7 +104,7 @@ impl Game {
             return false;
         }
 
-        let mut next_hash = self.hash ^ ZOBRIST_TABLE.white;
+        let mut next_hash = self.hash;
         let mut next_board = self.board;
 
         next_board[idx] = player;
@@ -151,7 +147,6 @@ impl Game {
 
     pub fn play(&mut self, idx: usize) {
         let player = self.player();
-        self.hash ^= ZOBRIST_TABLE.white;
         let pass = self.size * self.size;
 
         if idx < pass {
@@ -320,7 +315,8 @@ impl Game {
         }
 
         let black = tmp.iter().filter(|&&x| x == 1).count() as f32;
-        let white = tmp.iter().filter(|&&x| x == -1).count() as f32 + 7.5;
+        let komi: f32 = std::env::var("KOMI").unwrap().parse::<f32>().unwrap();
+        let white = tmp.iter().filter(|&&x| x == -1).count() as f32 + komi;
         (black, white)
     }
 

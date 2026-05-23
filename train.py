@@ -7,12 +7,19 @@ import torch
 import torch.nn.functional as F
 import json
 import numpy as np
-from types import SimpleNamespace
-
-with open("config.json") as f:
-    config = SimpleNamespace(**json.load(f))
 
 from network import AlphaGoZero
+
+BATCH = int(os.environ["BATCH"])
+BOARD = int(os.environ["BOARD"])
+CONV_FILTER = int(os.environ["CONV_FILTER"])
+DEVICE = os.environ["DEVICE"]
+EPOCH = int(os.environ["EPOCH"])
+HISTORY = int(os.environ["HISTORY"])
+INITIAL_LR = float(os.environ["INITIAL_LR"])
+L2_REGULARIZATION = float(os.environ["L2_REGULARIZATION"])
+LR_MILESTONES = json.loads(os.environ["LR_MILESTONES"])
+RES_BLOCK = int(os.environ["RES_BLOCK"])
 
 LOGGING_CONFIG = {
     "level": logging.INFO,
@@ -29,8 +36,8 @@ def weight_hash(weight):
 
 
 class Trainer:
-    def __init__(self, device):
-        self.device = torch.device(device)
+    def __init__(self):
+        self.device = torch.device(DEVICE)
         self.model = None
         self.optimizer = None
         self.scheduler = None
@@ -38,21 +45,21 @@ class Trainer:
 
     def _init_model(self):
         net = (
-            config.board,
-            config.history,
-            config.conv_filter,
-            config.res_block,
+            BOARD,
+            HISTORY,
+            CONV_FILTER,
+            RES_BLOCK,
         )
         self.model = AlphaGoZero(*net).to(self.device)
         self.model.eval()
 
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
-            lr=config.initial_lr,
+            lr=INITIAL_LR,
             momentum=0.9,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer, milestones=config.lr_milestones, gamma=0.1
+            self.optimizer, milestones=LR_MILESTONES, gamma=0.1
         )
 
     def save_checkpoint(self, save_dir):
@@ -61,13 +68,23 @@ class Trainer:
         os.makedirs(save_dir, exist_ok=True)
         filename = f"{save_dir}/{model_id}.pt"
 
-        example_input = torch.zeros(
-            1, config.history * 2 + 1, config.board, config.board
-        ).to(self.device)
+        example_input = torch.zeros(1, HISTORY * 2 + 1, BOARD, BOARD).to(self.device)
 
         traced_model = torch.jit.trace(self.model, example_input)
         traced_model.save(filename)
         logging.info(f"checkpoint {filename}")
+
+    def load_checkpoint(self, load_dir):
+        model_files = [f for f in os.listdir(load_dir) if f.endswith(".pt")]
+
+        latest_model = max(
+            model_files, key=lambda f: os.path.getmtime(os.path.join(load_dir, f))
+        )
+        model_path = os.path.join(load_dir, latest_model)
+
+        jit_model = torch.jit.load(model_path, map_location=self.device)
+        self.model.load_state_dict(jit_model.state_dict())
+        logging.info(f"load {model_path}")
 
     def train_step(self, state, policy, value):
         self.model.train()
@@ -86,7 +103,7 @@ class Trainer:
             if p.requires_grad and p.dim() > 1:
                 l2_penalty += torch.sum(p.pow(2))
 
-        loss = policy_loss + value_loss + config.l2_regularization * l2_penalty
+        loss = policy_loss + value_loss + L2_REGULARIZATION * l2_penalty
         loss.backward()
         self.optimizer.step()
         return loss.item()
@@ -109,11 +126,13 @@ class Trainer:
 
 def main(args):
     logging.basicConfig(**LOGGING_CONFIG)
-    trainer = Trainer(args.device)
+    trainer = Trainer()
 
-    if not os.path.isdir("models") or not os.listdir("models"):
-        trainer.save_checkpoint("models")
+    if args.init:
+        trainer.save_checkpoint("model")
+        exit(0)
 
+    trainer.load_checkpoint("model")
     data = np.load(args.data_train, allow_pickle=True).item()
     board = torch.from_numpy(data["board"])
     policy = torch.from_numpy(data["policy"])
@@ -124,15 +143,15 @@ def main(args):
 
     step = 0
 
-    for i in range(0, sample_cnt - config.batch_size + 1, config.batch_size):
-        idx = range(i, i + config.batch_size)
+    for i in range(0, sample_cnt - BATCH + 1, BATCH):
+        idx = range(i, i + BATCH)
         loss = trainer.train_step(board[idx], policy[idx], value[idx])
         step += 1
 
         if step % 100 == 0:
             logging.info(f"step {step} loss {loss:.4f}")
 
-        if step >= config.epoch:
+        if step >= EPOCH:
             break
 
     valid_data = np.load(args.data_valid, allow_pickle=True).item()
@@ -143,11 +162,11 @@ def main(args):
     v_sample_cnt = v_board.shape[0]
     v_step = 0
     v_total_loss = 0.0
-    for i in range(0, v_sample_cnt - config.batch_size + 1, config.batch_size):
+    for i in range(0, v_sample_cnt - BATCH + 1, BATCH):
         v_loss = trainer.eval_step(
-            v_board[i : i + config.batch_size],
-            v_policy[i : i + config.batch_size],
-            v_value[i : i + config.batch_size],
+            v_board[i : i + BATCH],
+            v_policy[i : i + BATCH],
+            v_value[i : i + BATCH],
         )
         v_total_loss += v_loss
         v_step += 1
@@ -162,8 +181,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", required=True)
-    parser.add_argument("--data-train", required=True)
-    parser.add_argument("--data-valid", required=True)
+    parser.add_argument("--init", action="store_true")
+    parser.add_argument("--data-train")
+    parser.add_argument("--data-valid")
     args = parser.parse_args()
     main(args)

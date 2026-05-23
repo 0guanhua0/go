@@ -214,4 +214,6 @@ wandb/
 *.tex
 *.pt
 data/
+model/
 models/
+*.png

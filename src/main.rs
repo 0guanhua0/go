@@ -1,39 +1,45 @@
-mod config;
 mod game;
 mod mcts;
 mod nn;
 
 use crate::game::Game;
-use crate::mcts::{MCTS, NNCache};
+use crate::mcts::MCTS;
 use crate::nn::Batcher;
 use anyhow::Result;
 use sgf_parse::SgfNode;
 use sgf_parse::go::{Move, Prop};
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tch::Device;
 use uuid::Uuid;
 
+fn get_model(model_dir: &str) -> String {
+    let newest = fs::read_dir(model_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    newest.unwrap().path().to_string_lossy().to_string()
+}
+
 fn save(
-    model_id: &str,
+    dir: &str,
     history: &[(Vec<f32>, Vec<f32>, i8)],
     winner: i8,
-    board_size: usize,
+    board: usize,
     input_planes: usize,
     sgf_root: &SgfNode<Prop>,
 ) -> Result<()> {
     let game_id = Uuid::new_v4();
-    let dir = format!("data/selfplay/{}", model_id);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
 
     let path = format!("{}/{}.npz", dir, game_id);
     let sgf_path = format!("{}/{}.sgf", dir, game_id);
     let _ = fs::write(&sgf_path, sgf_root.serialize());
 
     let n = history.len();
-    let feature_size = input_planes * board_size * board_size;
-    let policy_size = board_size * board_size + 1;
+    let feature_size = input_planes * board * board;
+    let policy_size = board * board + 1;
     let mut board_data = Vec::with_capacity(n * feature_size);
     let mut policy_data = Vec::with_capacity(n * policy_size);
     let mut value_data = Vec::with_capacity(n);
@@ -48,8 +54,8 @@ fn save(
     let board_tensor = tch::Tensor::from_slice(&board_data).view([
         n as i64,
         input_planes as i64,
-        board_size as i64,
-        board_size as i64,
+        board as i64,
+        board as i64,
     ]);
     let policy_tensor = tch::Tensor::from_slice(&policy_data).view([n as i64, policy_size as i64]);
     let value_tensor = tch::Tensor::from_slice(&value_data).view([n as i64, 1]);
@@ -67,68 +73,122 @@ fn save(
 }
 
 fn main() -> Result<()> {
-    let config = config::Config::load()?;
-    let batch_size = config["batch_size"].as_u64().unwrap() as usize;
-    let game_thread = config["game_thread"].as_u64().unwrap() as usize;
-    let simulations = config["mcts"].as_u64().unwrap() as usize;
-    let board_size = config["board"].as_u64().unwrap() as usize;
-    let c_puct = config["c_puct"].as_f64().unwrap() as f32;
-    let input_planes = config["history"].as_u64().unwrap() * 2 + 1;
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "selfplay".to_string());
 
-    let device = if tch::Cuda::is_available() {
-        Device::Cuda(0)
-    } else if tch::utils::has_mps() {
-        Device::Mps
-    } else {
-        Device::Cpu
+    let batch = std::env::var("BATCH").unwrap().parse::<usize>().unwrap();
+    let mut game_thread = std::env::var("GAME_THREAD")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mcts_sim = std::env::var("MCTS_SIM").unwrap().parse::<usize>().unwrap();
+    let board = std::env::var("BOARD").unwrap().parse::<usize>().unwrap();
+    let c_puct = std::env::var("C_PUCT").unwrap().parse::<f32>().unwrap();
+    let history = std::env::var("HISTORY").unwrap().parse::<usize>().unwrap();
+    let input_planes = history * 2 + 1;
+    let eval_game = std::env::var("EVAL_GAME")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    if mode == "eval" {
+        game_thread = eval_game;
+    }
+
+    struct EvalStats {
+        game: usize,
+        eval_win: usize,
+    }
+    let stats = Arc::new(Mutex::new(EvalStats {
+        game: 0,
+        eval_win: 0,
+    }));
+
+    let device = match std::env::var("DEVICE").unwrap().as_str() {
+        "cuda" => Device::Cuda(0),
+        "mps" => Device::Mps,
+        "vulkan" => Device::Vulkan,
+        _ => Device::Cpu,
     };
-
-    let batcher = Arc::new(Batcher::new(device, batch_size));
-    let nn_cache = Arc::new(NNCache::new(1 << 20));
+    let black_batcher = Arc::new(Batcher::new(device, batch, &get_model("model")));
+    let white_batcher = if mode == "eval" {
+        Arc::new(Batcher::new(device, batch, &get_model("eval")))
+    } else {
+        black_batcher.clone()
+    };
 
     let mut handles = vec![];
 
-    for _ in 0..game_thread {
-        let batcher_clone = batcher.clone();
-        let nn_cache_clone = nn_cache.clone();
+    for _thread_id in 0..game_thread {
+        let stats = stats.clone();
+        let mode = mode.clone();
+        let black_batcher = black_batcher.clone();
+        let white_batcher = white_batcher.clone();
+
         let handle = thread::spawn(move || {
             loop {
-                let mut game = Game::new(board_size);
-                let mut mcts = MCTS::new(
-                    batcher_clone.clone(),
-                    simulations,
+                let black_batcher = black_batcher.clone();
+                let white_batcher = white_batcher.clone();
+
+                let mut game = Game::new(board);
+                let mut mcts_black = MCTS::new(
+                    black_batcher.clone(),
+                    mcts_sim,
                     device,
-                    input_planes as usize,
+                    input_planes,
                     c_puct,
-                    nn_cache_clone.clone(),
+                );
+
+                let mut mcts_white = MCTS::new(
+                    white_batcher.clone(),
+                    mcts_sim,
+                    device,
+                    input_planes,
+                    c_puct,
                 );
 
                 let mut history = Vec::new();
                 let mut sgf_root = SgfNode::new(
-                    vec![Prop::SZ((board_size as u8, board_size as u8))],
+                    vec![
+                        Prop::SZ((board as u8, board as u8)),
+                        Prop::PB(sgf_parse::SimpleText {
+                            text: black_batcher.model_id(),
+                        }),
+                        Prop::PW(sgf_parse::SimpleText {
+                            text: white_batcher.model_id(),
+                        }),
+                    ],
                     vec![],
                     true,
                 );
                 let mut curr_node = &mut sgf_root;
 
                 while game.end() == false {
-                    let feature = MCTS::get_feature(&game);
-                    let idx = mcts.run(&game);
-                    let policy = mcts.get_policy(&game);
-
                     let player = game.player();
+                    let (feature, idx, policy) = if player == 1 {
+                        let feature = MCTS::get_feature(&game);
+                        let idx = mcts_black.run(&game);
+                        let policy = mcts_black.get_policy(&game);
+                        (feature, idx, policy)
+                    } else {
+                        let feature = MCTS::get_feature(&game);
+                        let idx = mcts_white.run(&game);
+                        let policy = mcts_white.get_policy(&game);
+                        (feature, idx, policy)
+                    };
+
                     history.push((feature, policy, player));
 
                     let mut move_node = SgfNode::new(vec![], vec![], false);
-                    if idx == board_size * board_size {
+                    if idx == board * board {
                         if player == 1 {
                             move_node.properties.push(Prop::B(Move::Pass));
                         } else {
                             move_node.properties.push(Prop::W(Move::Pass));
                         }
                     } else {
-                        let x = (idx % board_size) as u8;
-                        let y = (idx / board_size) as u8;
+                        let x = (idx % board) as u8;
+                        let y = (idx / board) as u8;
                         if player == 1 {
                             move_node
                                 .properties
@@ -143,7 +203,8 @@ fn main() -> Result<()> {
                     curr_node = curr_node.children.last_mut().unwrap();
 
                     game.play(idx);
-                    mcts.update_root(idx);
+                    mcts_black.update_root(idx);
+                    mcts_white.update_root(idx);
                 }
 
                 let (black, white) = game.get_score();
@@ -160,16 +221,30 @@ fn main() -> Result<()> {
                     }));
                 }
 
-                let model_id = batcher_clone.model_id();
+                let dir = if mode == "selfplay" {
+                    format!(
+                        "data/selfplay/{}_{}",
+                        black_batcher.model_id(),
+                        white_batcher.model_id()
+                    )
+                } else {
+                    format!(
+                        "data/eval/{}_{}",
+                        black_batcher.model_id(),
+                        white_batcher.model_id()
+                    )
+                };
 
-                let _ = save(
-                    &model_id,
-                    &history,
-                    winner,
-                    board_size,
-                    input_planes as usize,
-                    &sgf_root,
-                );
+                let _ = save(&dir, &history, winner, board, input_planes, &sgf_root);
+
+                if mode == "eval" {
+                    let mut stats = stats.lock().unwrap();
+                    stats.game += 1;
+                    if winner == -1 {
+                        stats.eval_win += 1;
+                    }
+                    break;
+                }
             }
         });
         handles.push(handle);
@@ -177,6 +252,59 @@ fn main() -> Result<()> {
 
     for h in handles {
         h.join().unwrap();
+    }
+
+    if mode == "eval" {
+        let stats = stats.lock().unwrap();
+        println!(
+            "{} {}/{}",
+            black_batcher.model_id(),
+            stats.game - stats.eval_win,
+            stats.game
+        );
+        println!(
+            "{} {}/{}",
+            white_batcher.model_id(),
+            stats.eval_win,
+            stats.game
+        );
+        let rate = stats.eval_win as f32 / stats.game as f32;
+        println!("new model win rate {:.2}", rate);
+
+        let eval_threshold = std::env::var("EVAL_THRESHOLD")
+            .unwrap()
+            .parse::<f32>()
+            .unwrap();
+        if rate > eval_threshold {
+            let white_id = white_batcher.model_id();
+            let black_id = black_batcher.model_id();
+
+            fs::rename(
+                format!("eval/{}.pt", white_id),
+                format!("model/{}.pt", white_id),
+            )
+            .unwrap();
+
+            use std::io::Write;
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("whr_history.csv")
+            {
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let mut log_data = String::new();
+                for _ in 0..(stats.game - stats.eval_win) {
+                    log_data.push_str(&format!("{},{},B,{}\n", black_id, white_id, time));
+                }
+                for _ in 0..stats.eval_win {
+                    log_data.push_str(&format!("{},{},W,{}\n", black_id, white_id, time));
+                }
+                let _ = file.write_all(log_data.as_bytes());
+            }
+        }
     }
 
     Ok(())

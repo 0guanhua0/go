@@ -130,7 +130,7 @@ if __name__ == "__main__":
     for path, stat, num_row in shuffle_input:
         group.append(path)
         size += stat.st_size
-        if size >= cpu_mem:
+        if size > cpu_mem // 4:
             shard_input.append(group)
             group, size = [], 0
     if group:

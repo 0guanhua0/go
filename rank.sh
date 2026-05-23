@@ -1,6 +1,6 @@
-#!/bin/bash
+DIR=${1:-.}
 
-for f in *.sgf; do
+for f in "$DIR"/*.sgf; do
 	echo "$f"
 
 	PB=$(grep -o 'PB\[.*\]' "$f" | cut -d '[' -f2 | cut -d ']' -f1)

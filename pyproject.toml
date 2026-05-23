@@ -2,9 +2,11 @@
 name = "go"
 dynamic = ["version"]
 dependencies = [
+    "matplotlib",
     "numpy",
-    "torch==2.7.0",
     "psutil",
+    "torch==2.7.0",
+    "whr",
 ]
 
 [project.optional-dependencies]
