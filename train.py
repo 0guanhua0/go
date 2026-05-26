@@ -7,8 +7,31 @@ import torch
 import torch.nn.functional as F
 import json
 import numpy as np
+from torch.utils.data import IterableDataset, DataLoader
 
 from network import AlphaGoZero
+
+
+class StreamingDataset(IterableDataset):
+    def __init__(self, path, batch_size):
+        self.path = path
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        data = np.load(self.path, allow_pickle=True).item()
+
+        board = torch.from_numpy(data["board"])
+        policy = torch.from_numpy(data["policy"])
+        value = torch.from_numpy(data["value"])
+
+        sample_cnt = board.shape[0]
+        for i in range(0, sample_cnt - self.batch_size + 1, self.batch_size):
+            yield (
+                board[i : i + self.batch_size],
+                policy[i : i + self.batch_size],
+                value[i : i + self.batch_size],
+            )
+
 
 BATCH = int(os.environ["BATCH"])
 BOARD = int(os.environ["BOARD"])
@@ -133,19 +156,11 @@ def main(args):
         exit(0)
 
     trainer.load_checkpoint("model")
-    data = np.load(args.data_train, allow_pickle=True).item()
-    board = torch.from_numpy(data["board"])
-    policy = torch.from_numpy(data["policy"])
-    value = torch.from_numpy(data["value"])
-
-    sample_cnt = board.shape[0]
-    logging.info(f"sample {sample_cnt}")
-
+    train_dataset = StreamingDataset(args.data_train, BATCH)
+    train_loader = DataLoader(train_dataset, batch_size=None)
     step = 0
-
-    for i in range(0, sample_cnt - BATCH + 1, BATCH):
-        idx = range(i, i + BATCH)
-        loss = trainer.train_step(board[idx], policy[idx], value[idx])
+    for b_board, b_policy, b_value in train_loader:
+        loss = trainer.train_step(b_board, b_policy, b_value)
         step += 1
 
         if step % 100 == 0:
@@ -154,24 +169,14 @@ def main(args):
         if step >= EPOCH:
             break
 
-    valid_data = np.load(args.data_valid, allow_pickle=True).item()
-    v_board = torch.from_numpy(valid_data["board"])
-    v_policy = torch.from_numpy(valid_data["policy"])
-    v_value = torch.from_numpy(valid_data["value"])
-
-    v_sample_cnt = v_board.shape[0]
-    v_step = 0
-    v_total_loss = 0.0
-    for i in range(0, v_sample_cnt - BATCH + 1, BATCH):
-        v_loss = trainer.eval_step(
-            v_board[i : i + BATCH],
-            v_policy[i : i + BATCH],
-            v_value[i : i + BATCH],
-        )
-        v_total_loss += v_loss
-        v_step += 1
-
-    logging.info(f"validation loss {v_total_loss / v_step:.4f}")
+    valid_dataset = StreamingDataset(args.data_valid, BATCH)
+    valid_loader = DataLoader(valid_dataset, batch_size=None)
+    step = 0
+    total_loss = 0.0
+    for b_board, b_policy, b_value in valid_loader:
+        total_loss += trainer.eval_step(b_board, b_policy, b_value)
+        step += 1
+    logging.info(f"validation loss {total_loss / step:.4f}")
 
     trainer.scheduler.step()
     logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")

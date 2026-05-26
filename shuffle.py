@@ -54,34 +54,50 @@ def shard(shard_input, shard_output, sample_rate):
 
 
 def merge(merge_input, merge_output, batch):
-    board_list = []
-    policy_list = []
-    value_list = []
+    row_sum = 0
+    shapes = {}
+    dtypes = {}
 
     for i in merge_input:
         data = np.load(i, allow_pickle=True).item()
-        board_list.append(data["board"])
-        policy_list.append(data["policy"])
-        value_list.append(data["value"])
+        row_sum += data["board"].shape[0]
+        if not shapes:
+            shapes["board"] = data["board"].shape[1:]
+            shapes["policy"] = data["policy"].shape[1:]
+            shapes["value"] = data["value"].shape[1:]
+            dtypes["board"] = data["board"].dtype
+            dtypes["policy"] = data["policy"].dtype
+            dtypes["value"] = data["value"].dtype
 
-    board = np.concatenate(board_list)
-    policy = np.concatenate(policy_list)
-    value = np.concatenate(value_list)
-
-    num_row = board.shape[0]
-    assert policy.shape[0] == num_row
-    assert value.shape[0] == num_row
-
-    batch_cnt = num_row // batch
-    keep_cnt = batch_cnt * batch
+    keep_cnt = row_sum // batch * batch
     rng = np.random.default_rng()
-    perm = rng.choice(num_row, size=keep_cnt, replace=False)
+    perm = rng.choice(row_sum, size=keep_cnt, replace=False)
+
+    inverse_perm = np.full(row_sum, -1, dtype=np.int64)
+    inverse_perm[perm] = np.arange(keep_cnt)
 
     save_dict = {
-        "board": board[perm],
-        "policy": policy[perm],
-        "value": value[perm],
+        "board": np.empty((keep_cnt,) + shapes["board"], dtype=dtypes["board"]),
+        "policy": np.empty((keep_cnt,) + shapes["policy"], dtype=dtypes["policy"]),
+        "value": np.empty((keep_cnt,) + shapes["value"], dtype=dtypes["value"]),
     }
+
+    offset = 0
+    for i in merge_input:
+        data = np.load(i, allow_pickle=True).item()
+        rows = data["board"].shape[0]
+
+        global_idx = np.arange(offset, offset + rows)
+        dst_idx = inverse_perm[global_idx]
+        mask = dst_idx != -1
+
+        if mask.any():
+            valid_dst = dst_idx[mask]
+            save_dict["board"][valid_dst] = data["board"][mask]
+            save_dict["policy"][valid_dst] = data["policy"][mask]
+            save_dict["value"][valid_dst] = data["value"][mask]
+
+        offset += rows
 
     np.save(merge_output, save_dict)
 
