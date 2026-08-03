@@ -1,13 +1,13 @@
 import argparse
 import hashlib
+import json
 import logging
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import json
-import numpy as np
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from network import AlphaGoZero
 

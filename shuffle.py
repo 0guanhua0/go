@@ -1,8 +1,9 @@
 import argparse
 import hashlib
 import multiprocessing
-import numpy as np
 import os
+
+import numpy as np
 import psutil
 
 

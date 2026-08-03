@@ -1,4 +1,5 @@
 import csv
+
 import matplotlib.pyplot as plt
 from whr import Base
 
