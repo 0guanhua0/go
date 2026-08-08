@@ -6,8 +6,7 @@ use crate::game::Game;
 use crate::mcts::MCTS;
 use crate::nn::Batcher;
 use anyhow::Result;
-use sgf_parse::SgfNode;
-use sgf_parse::go::{Move, Prop};
+use sgf_parser::{Action, Color, GameNode, GameTree, Outcome, SgfToken};
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +16,10 @@ use uuid::Uuid;
 fn get_model(model_dir: &str) -> String {
     let newest = fs::read_dir(model_dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.ok()
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "pt"))
+        })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
     newest.unwrap().path().to_string_lossy().to_string()
 }
@@ -28,14 +30,15 @@ fn save(
     winner: i8,
     board: usize,
     input_planes: usize,
-    sgf_root: &SgfNode<Prop>,
+    sgf_root: &GameTree,
 ) -> Result<()> {
     let game_id = Uuid::new_v4();
     fs::create_dir_all(dir)?;
 
     let path = format!("{}/{}.npz", dir, game_id);
     let sgf_path = format!("{}/{}.sgf", dir, game_id);
-    let _ = fs::write(&sgf_path, sgf_root.serialize());
+    let sgf_str: String = sgf_root.into();
+    let _ = fs::write(&sgf_path, sgf_str);
 
     let n = history.len();
     let feature_size = input_planes * board * board;
@@ -119,7 +122,7 @@ fn main() -> Result<()> {
 
     let mut handles = vec![];
 
-    for _thread_id in 0..game_thread {
+    for thread_id in 0..game_thread {
         let stats = stats.clone();
         let mode = mode.clone();
         let black_batcher = black_batcher.clone();
@@ -127,41 +130,35 @@ fn main() -> Result<()> {
 
         let handle = thread::spawn(move || {
             loop {
-                let black_batcher = black_batcher.clone();
-                let white_batcher = white_batcher.clone();
+                let eval_odd = mode == "eval" && thread_id % 2 == 1;
+                let (black_batcher, white_batcher) = if eval_odd {
+                    (white_batcher.clone(), black_batcher.clone())
+                } else {
+                    (black_batcher.clone(), white_batcher.clone())
+                };
 
                 let mut game = Game::new(board);
-                let mut mcts_black = MCTS::new(
-                    black_batcher.clone(),
-                    mcts_sim,
-                    device,
-                    input_planes,
-                    c_puct,
-                );
+                let mut mcts_black =
+                    MCTS::new(black_batcher.clone(), mcts_sim, input_planes, c_puct);
 
-                let mut mcts_white = MCTS::new(
-                    white_batcher.clone(),
-                    mcts_sim,
-                    device,
-                    input_planes,
-                    c_puct,
-                );
+                let mut mcts_white =
+                    MCTS::new(white_batcher.clone(), mcts_sim, input_planes, c_puct);
 
                 let mut history = Vec::new();
-                let mut sgf_root = SgfNode::new(
-                    vec![
-                        Prop::SZ((board as u8, board as u8)),
-                        Prop::PB(sgf_parse::SimpleText {
-                            text: black_batcher.model_id(),
-                        }),
-                        Prop::PW(sgf_parse::SimpleText {
-                            text: white_batcher.model_id(),
-                        }),
+                let mut sgf_root = GameTree::default();
+                sgf_root.nodes.push(GameNode {
+                    tokens: vec![
+                        SgfToken::Size(board as u32, board as u32),
+                        SgfToken::PlayerName {
+                            color: Color::Black,
+                            name: black_batcher.model_id(),
+                        },
+                        SgfToken::PlayerName {
+                            color: Color::White,
+                            name: white_batcher.model_id(),
+                        },
                     ],
-                    vec![],
-                    true,
-                );
-                let mut curr_node = &mut sgf_root;
+                });
 
                 while game.end() == false {
                     let player = game.player();
@@ -179,28 +176,26 @@ fn main() -> Result<()> {
 
                     history.push((feature, policy, player));
 
-                    let mut move_node = SgfNode::new(vec![], vec![], false);
-                    if idx == board * board {
-                        if player == 1 {
-                            move_node.properties.push(Prop::B(Move::Pass));
-                        } else {
-                            move_node.properties.push(Prop::W(Move::Pass));
-                        }
+                    let mut tokens = vec![];
+                    let color = if player == 1 {
+                        Color::Black
                     } else {
-                        let x = (idx % board) as u8;
-                        let y = (idx / board) as u8;
-                        if player == 1 {
-                            move_node
-                                .properties
-                                .push(Prop::B(Move::Move(sgf_parse::go::Point { x, y })));
-                        } else {
-                            move_node
-                                .properties
-                                .push(Prop::W(Move::Move(sgf_parse::go::Point { x, y })));
-                        }
+                        Color::White
+                    };
+                    if idx == board * board {
+                        tokens.push(SgfToken::Move {
+                            color,
+                            action: Action::Pass,
+                        });
+                    } else {
+                        let x = (idx % board) as u8 + 1;
+                        let y = (idx / board) as u8 + 1;
+                        tokens.push(SgfToken::Move {
+                            color,
+                            action: Action::Move(x, y),
+                        });
                     }
-                    curr_node.children.push(move_node);
-                    curr_node = curr_node.children.last_mut().unwrap();
+                    sgf_root.nodes.push(GameNode { tokens });
 
                     game.play(idx);
                     mcts_black.update_root(idx);
@@ -211,14 +206,20 @@ fn main() -> Result<()> {
                 let winner = if black > white { 1 } else { -1 };
                 if winner == 1 {
                     let diff = black - white;
-                    sgf_root.properties.push(Prop::RE(sgf_parse::SimpleText {
-                        text: format!("B+{}", diff),
-                    }));
+                    sgf_root.nodes[0]
+                        .tokens
+                        .push(SgfToken::Result(Outcome::WinnerByPoints(
+                            Color::Black,
+                            diff as f32,
+                        )));
                 } else if winner == -1 {
                     let diff = white - black;
-                    sgf_root.properties.push(Prop::RE(sgf_parse::SimpleText {
-                        text: format!("W+{}", diff),
-                    }));
+                    sgf_root.nodes[0]
+                        .tokens
+                        .push(SgfToken::Result(Outcome::WinnerByPoints(
+                            Color::White,
+                            diff as f32,
+                        )));
                 }
 
                 let dir = if mode == "selfplay" {
@@ -240,7 +241,7 @@ fn main() -> Result<()> {
                 if mode == "eval" {
                     let mut stats = stats.lock().unwrap();
                     stats.game += 1;
-                    if winner == -1 {
+                    if (eval_odd && winner == 1) || (!eval_odd && winner == -1) {
                         stats.eval_win += 1;
                     }
                     break;
@@ -249,11 +250,9 @@ fn main() -> Result<()> {
         });
         handles.push(handle);
     }
-
     for h in handles {
         h.join().unwrap();
     }
-
     if mode == "eval" {
         let stats = stats.lock().unwrap();
         println!(
@@ -270,7 +269,6 @@ fn main() -> Result<()> {
         );
         let rate = stats.eval_win as f32 / stats.game as f32;
         println!("new model win rate {:.2}", rate);
-
         let eval_threshold = std::env::var("EVAL_THRESHOLD")
             .unwrap()
             .parse::<f32>()
@@ -278,13 +276,16 @@ fn main() -> Result<()> {
         if rate > eval_threshold {
             let white_id = white_batcher.model_id();
             let black_id = black_batcher.model_id();
-
             fs::rename(
                 format!("eval/{}.pt", white_id),
                 format!("model/{}.pt", white_id),
             )
             .unwrap();
-
+            fs::rename(
+                format!("eval/{}.state", white_id),
+                format!("model/{}.state", white_id),
+            )
+            .unwrap();
             use std::io::Write;
             if let Ok(mut file) = fs::OpenOptions::new()
                 .create(true)
@@ -306,6 +307,5 @@ fn main() -> Result<()> {
             }
         }
     }
-
     Ok(())
 }

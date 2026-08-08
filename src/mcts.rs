@@ -36,7 +36,6 @@ pub struct MCTS {
     root: Node,
     simulations: usize,
     batcher: Arc<Batcher>,
-    device: Device,
     input_planes: usize,
     c_puct: f32,
 }
@@ -45,7 +44,6 @@ impl MCTS {
     pub fn new(
         batcher: Arc<Batcher>,
         simulations: usize,
-        device: Device,
         input_planes: usize,
         c_puct: f32,
     ) -> Self {
@@ -53,7 +51,6 @@ impl MCTS {
             root: Node::new(1.0),
             simulations,
             batcher,
-            device,
             input_planes,
             c_puct,
         }
@@ -61,57 +58,44 @@ impl MCTS {
 
     pub fn run(&mut self, game: &Game) -> usize {
         if !self.root.expand {
-            Self::expand_node(
-                &mut self.root,
-                game,
-                &self.batcher,
-                self.device,
-                self.input_planes,
-            );
+            Self::expand_node(&mut self.root, game, &self.batcher, self.input_planes);
         }
 
         for _ in 0..self.simulations {
             let mut search_path = Vec::new();
-            let mut scratch_game = game.clone();
-
+            let mut game_sim = game.clone();
             let value = {
                 let mut curr = &mut self.root;
-
-                while curr.expand && !curr.next.is_empty() {
+                while curr.expand && !curr.next.is_empty() && !game_sim.end() {
                     let best_move_idx = Self::select(curr, self.c_puct);
                     search_path.push(best_move_idx);
-
-                    scratch_game.play(best_move_idx);
-
+                    game_sim.play(best_move_idx);
                     curr = curr.next.get_mut(&best_move_idx).unwrap();
                 }
-
-                if !curr.expand {
-                    Self::expand_node(
-                        curr,
-                        &scratch_game,
-                        &self.batcher,
-                        self.device,
-                        self.input_planes,
-                    )
+                if game_sim.end() {
+                    let (black, white) = game_sim.get_score();
+                    let winner = if black > white { 1 } else { -1 };
+                    if game_sim.player() == winner {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                } else if !curr.expand {
+                    Self::expand_node(curr, &game_sim, &self.batcher, self.input_planes)
                 } else {
                     0.0
                 }
             };
-
             Self::backup(&mut self.root, &search_path, value);
         }
-
         let mut best_count = 0;
         let mut best_move_idx = 0;
-
         for (idx, n) in self.root.next.iter() {
             if n.visit_count > best_count {
                 best_count = n.visit_count;
                 best_move_idx = *idx;
             }
         }
-
         best_move_idx
     }
 
@@ -177,13 +161,7 @@ impl MCTS {
         best_idx
     }
 
-    fn expand_node(
-        node: &mut Node,
-        game: &Game,
-        batcher: &Batcher,
-        device: Device,
-        input_planes: usize,
-    ) -> f32 {
+    fn expand_node(node: &mut Node, game: &Game, batcher: &Batcher, input_planes: usize) -> f32 {
         let set_policy = |node: &mut Node, policy_vec: &[f32]| {
             let mut sum_exp = 0.0;
             let mut valid_moves = Vec::new();
@@ -205,9 +183,12 @@ impl MCTS {
         };
 
         let feature = Self::get_feature(game);
-        let input = Tensor::from_slice(&feature)
-            .view([1, input_planes as i64, game.size as i64, game.size as i64])
-            .to(device);
+        let input = Tensor::from_slice(&feature).view([
+            1,
+            input_planes as i64,
+            game.size as i64,
+            game.size as i64,
+        ]);
 
         let (policy, value) = batcher.evaluate(input);
 

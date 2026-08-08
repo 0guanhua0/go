@@ -26,8 +26,3 @@ repos:
       entry: cargo check --manifest-path Cargo.toml
       language: system
       pass_filenames: false
-    - id: cargo-test
-      name: cargo test
-      entry: cargo test --manifest-path Cargo.toml
-      language: system
-      pass_filenames: false

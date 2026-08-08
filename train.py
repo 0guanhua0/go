@@ -75,7 +75,6 @@ class Trainer:
         )
         self.model = AlphaGoZero(*net).to(self.device)
         self.model.eval()
-
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=INITIAL_LR,
@@ -85,47 +84,45 @@ class Trainer:
             self.optimizer, milestones=LR_MILESTONES, gamma=0.1
         )
 
-    def save_checkpoint(self, save_dir):
+    def save_model(self, path):
         self.model.eval()
         model_id = weight_hash(self.model.state_dict().values())
-        os.makedirs(save_dir, exist_ok=True)
-        filename = f"{save_dir}/{model_id}.pt"
-
-        example_input = torch.zeros(1, HISTORY * 2 + 1, BOARD, BOARD).to(self.device)
-
-        traced_model = torch.jit.trace(self.model, example_input)
-        traced_model.save(filename)
-        logging.info(f"checkpoint {filename}")
-
-    def load_checkpoint(self, load_dir):
-        model_files = [f for f in os.listdir(load_dir) if f.endswith(".pt")]
-
-        latest_model = max(
-            model_files, key=lambda f: os.path.getmtime(os.path.join(load_dir, f))
+        os.makedirs(path, exist_ok=True)
+        model_input = torch.zeros(1, HISTORY * 2 + 1, BOARD, BOARD).to(self.device)
+        torch.jit.trace(self.model, model_input).save(f"{path}/{model_id}.pt")
+        torch.save(
+            {
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+            },
+            f"{path}/{model_id}.state",
         )
-        model_path = os.path.join(load_dir, latest_model)
+        logging.info(f"save {model_id}")
 
-        jit_model = torch.jit.load(model_path, map_location=self.device)
-        self.model.load_state_dict(jit_model.state_dict())
-        logging.info(f"load {model_path}")
+    def load_model(self, path):
+        pt = [f for f in os.listdir(path) if f.endswith(".pt")]
+        model = max(pt, key=lambda f: os.path.getmtime(os.path.join(path, f)))
+        self.model.load_state_dict(
+            torch.jit.load(os.path.join(path, model)).state_dict()
+        )
+        state = torch.load(os.path.join(path, model.replace(".pt", ".state")))
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        logging.info(f"load {model}")
 
     def train_step(self, state, policy, value):
         self.model.train()
         state = state.to(self.device)
         policy = policy.to(self.device)
         value = value.to(self.device)
-
         self.optimizer.zero_grad()
         policy_next, value_next = self.model(state)
-
         policy_loss = F.cross_entropy(policy_next, policy)
         value_loss = F.mse_loss(value_next, value)
-
         l2_penalty = torch.tensor(0.0, device=self.device)
         for p in self.model.parameters():
             if p.requires_grad and p.dim() > 1:
                 l2_penalty += torch.sum(p.pow(2))
-
         loss = policy_loss + value_loss + L2_REGULARIZATION * l2_penalty
         loss.backward()
         self.optimizer.step()
@@ -150,25 +147,20 @@ class Trainer:
 def main(args):
     logging.basicConfig(**LOGGING_CONFIG)
     trainer = Trainer()
-
     if args.init:
-        trainer.save_checkpoint("model")
+        trainer.save_model("model")
         exit(0)
-
-    trainer.load_checkpoint("model")
+    trainer.load_model("model")
     train_dataset = StreamingDataset(args.data_train, BATCH)
     train_loader = DataLoader(train_dataset, batch_size=None)
     step = 0
     for b_board, b_policy, b_value in train_loader:
         loss = trainer.train_step(b_board, b_policy, b_value)
         step += 1
-
         if step % 100 == 0:
             logging.info(f"step {step} loss {loss:.4f}")
-
         if step >= EPOCH:
             break
-
     valid_dataset = StreamingDataset(args.data_valid, BATCH)
     valid_loader = DataLoader(valid_dataset, batch_size=None)
     step = 0
@@ -177,11 +169,9 @@ def main(args):
         total_loss += trainer.eval_step(b_board, b_policy, b_value)
         step += 1
     logging.info(f"validation loss {total_loss / step:.4f}")
-
     trainer.scheduler.step()
     logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
-
-    trainer.save_checkpoint("eval")
+    trainer.save_model("eval")
 
 
 if __name__ == "__main__":
