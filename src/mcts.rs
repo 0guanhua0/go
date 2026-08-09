@@ -119,6 +119,10 @@ impl MCTS {
         policy
     }
 
+    pub fn root_value(&self) -> f32 {
+        self.root.value()
+    }
+
     pub fn get_feature(game: &Game) -> Vec<f32> {
         let cap = game.cap;
         let input_planes = 2 * cap + 1;

@@ -35,6 +35,25 @@ def shard(shard_input, shard_output, sample_rate):
     policy = np.concatenate(policy_list, axis=0)
     value = np.concatenate(value_list, axis=0)
 
+    N, C, H, W = board.shape
+    policy_board, policy_pass = policy[:, :-1].reshape(N, H, W), policy[:, -1:]
+    board_aug, policy_aug, value_aug = [], [], []
+    for k in range(4):
+        for flip in (False, True):
+            b = np.rot90(board, k, axes=(2, 3))
+            p = np.rot90(policy_board, k, axes=(1, 2))
+            if flip:
+                b = np.flip(b, axis=3)
+                p = np.flip(p, axis=2)
+            board_aug.append(b)
+            policy_aug.append(
+                np.concatenate([p.reshape(N, H * W), policy_pass], axis=1)
+            )
+            value_aug.append(value)
+    board = np.concatenate(board_aug, axis=0)
+    policy = np.concatenate(policy_aug, axis=0)
+    value = np.concatenate(value_aug, axis=0)
+
     row_cnt = board.shape[0]
     assert row_cnt == policy.shape[0]
     assert row_cnt == value.shape[0]
@@ -132,11 +151,10 @@ if __name__ == "__main__":
     all_npz.sort(key=(lambda x: x[1].st_mtime), reverse=True)
     shuffle_input = []
     mem_cnt = 0
-    max_sample = mem * 2 << 5
     for path, stat, num_row in all_npz:
         shuffle_input.append((path, stat, num_row))
         mem_cnt += stat.st_size
-        if mem_cnt >= max_sample:
+        if mem_cnt >= mem * 2 << 5:
             break
 
     np.random.seed()
@@ -156,7 +174,7 @@ if __name__ == "__main__":
     for idx in range(len(shard_input)):
         shard_paths.append(os.path.join(tmp_dir, str(idx), "data.npy"))
 
-    sample_rate = min(1.0, gpu_mem / mem_cnt)
+    sample_rate = min(1.0, gpu_mem / (mem_cnt * 8))
     with multiprocessing.Pool(cpu_count) as pool:
         pool.starmap(
             shard,

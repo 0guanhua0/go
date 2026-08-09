@@ -5,7 +5,6 @@ import os
 
 import torch
 import torch.nn.functional as F
-import json
 import numpy as np
 from torch.utils.data import IterableDataset, DataLoader
 
@@ -37,11 +36,10 @@ BATCH = int(os.environ["BATCH"])
 BOARD = int(os.environ["BOARD"])
 CONV_FILTER = int(os.environ["CONV_FILTER"])
 DEVICE = os.environ["DEVICE"]
-EPOCH = int(os.environ["EPOCH"])
 HISTORY = int(os.environ["HISTORY"])
 INITIAL_LR = float(os.environ["INITIAL_LR"])
 L2_REGULARIZATION = float(os.environ["L2_REGULARIZATION"])
-LR_MILESTONES = json.loads(os.environ["LR_MILESTONES"])
+LR_MILESTONES = eval(os.environ["LR_MILESTONES"])
 RES_BLOCK = int(os.environ["RES_BLOCK"])
 
 LOGGING_CONFIG = {
@@ -134,14 +132,10 @@ class Trainer:
             state = state.to(self.device)
             policy = policy.to(self.device)
             value = value.to(self.device)
-
             policy_next, value_next = self.model(state)
-
-            policy_loss = F.cross_entropy(policy_next, policy)
-            value_loss = F.mse_loss(value_next, value)
-
-            loss = policy_loss + value_loss
-            return loss.item()
+            return F.cross_entropy(policy_next, policy).item(), F.mse_loss(
+                value_next, value
+            ).item()
 
 
 def main(args):
@@ -154,21 +148,23 @@ def main(args):
     train_dataset = StreamingDataset(args.data_train, BATCH)
     train_loader = DataLoader(train_dataset, batch_size=None)
     step = 0
-    for b_board, b_policy, b_value in train_loader:
-        loss = trainer.train_step(b_board, b_policy, b_value)
+    for board, policy, value in train_loader:
+        loss = trainer.train_step(board, policy, value)
         step += 1
         if step % 100 == 0:
             logging.info(f"step {step} loss {loss:.4f}")
-        if step >= EPOCH:
-            break
     valid_dataset = StreamingDataset(args.data_valid, BATCH)
     valid_loader = DataLoader(valid_dataset, batch_size=None)
     step = 0
-    total_loss = 0.0
-    for b_board, b_policy, b_value in valid_loader:
-        total_loss += trainer.eval_step(b_board, b_policy, b_value)
+    policy_loss, value_loss = 0.0, 0.0
+    for board, policy, value in valid_loader:
+        p, v = trainer.eval_step(board, policy, value)
+        policy_loss += p
+        value_loss += v
         step += 1
-    logging.info(f"validation loss {total_loss / step:.4f}")
+    logging.info(
+        f"validation policy loss {policy_loss / step:.4f} value loss {value_loss / step:.4f}"
+    )
     trainer.scheduler.step()
     logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
     trainer.save_model("eval")

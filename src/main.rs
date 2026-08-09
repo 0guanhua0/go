@@ -34,11 +34,9 @@ fn save(
 ) -> Result<()> {
     let game_id = Uuid::new_v4();
     fs::create_dir_all(dir)?;
-
     let path = format!("{}/{}.npz", dir, game_id);
     let sgf_path = format!("{}/{}.sgf", dir, game_id);
-    let sgf_str: String = sgf_root.into();
-    let _ = fs::write(&sgf_path, sgf_str);
+    fs::write(&sgf_path, Into::<String>::into(sgf_root))?;
 
     let n = history.len();
     let feature_size = input_planes * board * board;
@@ -94,6 +92,7 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .unwrap();
+    let resign = std::env::var("RESIGN").unwrap().parse::<f32>().unwrap();
     if mode == "eval" {
         game_thread = eval_game;
     }
@@ -144,6 +143,10 @@ fn main() -> Result<()> {
                 let mut mcts_white =
                     MCTS::new(white_batcher.clone(), mcts_sim, input_planes, c_puct);
 
+                let mut resign_count_black = 0;
+                let mut resign_count_white = 0;
+                let mut resigned_winner = 0;
+
                 let mut history = Vec::new();
                 let mut sgf_root = GameTree::default();
                 sgf_root.nodes.push(GameNode {
@@ -162,17 +165,42 @@ fn main() -> Result<()> {
 
                 while game.end() == false {
                     let player = game.player();
-                    let (feature, idx, policy) = if player == 1 {
+                    let (feature, idx, policy, value) = if player == 1 {
                         let feature = MCTS::get_feature(&game);
                         let idx = mcts_black.run(&game);
                         let policy = mcts_black.get_policy(&game);
-                        (feature, idx, policy)
+                        let value = mcts_black.root_value();
+                        (feature, idx, policy, value)
                     } else {
                         let feature = MCTS::get_feature(&game);
                         let idx = mcts_white.run(&game);
                         let policy = mcts_white.get_policy(&game);
-                        (feature, idx, policy)
+                        let value = mcts_white.root_value();
+                        (feature, idx, policy, value)
                     };
+
+                    if value < -resign {
+                        if player == 1 {
+                            resign_count_black += 1;
+                        } else {
+                            resign_count_white += 1;
+                        }
+                    } else {
+                        if player == 1 {
+                            resign_count_black = 0;
+                        } else {
+                            resign_count_white = 0;
+                        }
+                    }
+
+                    if resign_count_black >= 3 {
+                        resigned_winner = -1;
+                        break;
+                    }
+                    if resign_count_white >= 3 {
+                        resigned_winner = 1;
+                        break;
+                    }
 
                     history.push((feature, policy, player));
 
@@ -202,9 +230,24 @@ fn main() -> Result<()> {
                     mcts_white.update_root(idx);
                 }
 
-                let (black, white) = game.get_score();
-                let winner = if black > white { 1 } else { -1 };
-                if winner == 1 {
+                let winner = if resigned_winner != 0 {
+                    resigned_winner
+                } else {
+                    let (black, white) = game.get_score();
+                    if black > white { 1 } else { -1 }
+                };
+
+                if resigned_winner != 0 {
+                    let color = if winner == 1 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    };
+                    sgf_root.nodes[0]
+                        .tokens
+                        .push(SgfToken::Result(Outcome::WinnerByResign(color)));
+                } else if winner == 1 {
+                    let (black, white) = game.get_score();
                     let diff = black - white;
                     sgf_root.nodes[0]
                         .tokens
@@ -213,6 +256,7 @@ fn main() -> Result<()> {
                             diff as f32,
                         )));
                 } else if winner == -1 {
+                    let (black, white) = game.get_score();
                     let diff = white - black;
                     sgf_root.nodes[0]
                         .tokens
