@@ -20,7 +20,7 @@ def scan(dir, path_md5_min, path_md5_max):
                 yield (entry.path, entry.stat(), num_row)
 
 
-def shard(shard_input, shard_output, sample_rate):
+def shard(shard_input, shard_output):
     board_list = []
     policy_list = []
     value_list = []
@@ -58,9 +58,8 @@ def shard(shard_input, shard_output, sample_rate):
     assert row_cnt == policy.shape[0]
     assert row_cnt == value.shape[0]
 
-    keep_cnt = int(row_cnt * sample_rate)
     rng = np.random.default_rng()
-    perm = rng.choice(row_cnt, size=keep_cnt, replace=False)
+    perm = rng.permutation(row_cnt)
 
     save_dict = {
         "board": board[perm],
@@ -141,7 +140,6 @@ if __name__ == "__main__":
     mem = psutil.virtual_memory().available
     cpu_count = multiprocessing.cpu_count()
     cpu_mem = mem // cpu_count
-    gpu_mem = int(os.environ["GPU_MEM"])
 
     all_npz = []
     for d in dirs:
@@ -174,14 +172,10 @@ if __name__ == "__main__":
     for idx in range(len(shard_input)):
         shard_paths.append(os.path.join(tmp_dir, str(idx), "data.npy"))
 
-    sample_rate = min(1.0, gpu_mem / (mem_cnt * 8))
     with multiprocessing.Pool(cpu_count) as pool:
         pool.starmap(
             shard,
-            [
-                (group, shard_paths[idx], sample_rate)
-                for idx, group in enumerate(shard_input)
-            ],
+            [(group, shard_paths[idx]) for idx, group in enumerate(shard_input)],
         )
 
     merge(shard_paths, os.path.join(out_dir, "data.npy"), batch)

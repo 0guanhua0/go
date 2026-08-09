@@ -8,6 +8,7 @@ use crate::nn::Batcher;
 use anyhow::Result;
 use sgf_parser::{Action, Color, GameNode, GameTree, Outcome, SgfToken};
 use std::fs;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tch::Device;
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "selfplay".to_string());
 
     let batch = std::env::var("BATCH").unwrap().parse::<usize>().unwrap();
-    let mut game_thread = std::env::var("GAME_THREAD")
+    let game_thread = std::env::var("GAME_THREAD")
         .unwrap()
         .parse::<usize>()
         .unwrap();
@@ -88,14 +89,13 @@ fn main() -> Result<()> {
     let c_puct = std::env::var("C_PUCT").unwrap().parse::<f32>().unwrap();
     let history = std::env::var("HISTORY").unwrap().parse::<usize>().unwrap();
     let input_planes = history * 2 + 1;
-    let eval_game = std::env::var("EVAL_GAME")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
+    let eval_game = Arc::new(AtomicIsize::new(
+        std::env::var("EVAL_GAME")
+            .unwrap()
+            .parse::<isize>()
+            .unwrap(),
+    ));
     let resign = std::env::var("RESIGN").unwrap().parse::<f32>().unwrap();
-    if mode == "eval" {
-        game_thread = eval_game;
-    }
 
     struct EvalStats {
         game: usize,
@@ -121,15 +121,25 @@ fn main() -> Result<()> {
 
     let mut handles = vec![];
 
-    for thread_id in 0..game_thread {
+    for _ in 0..game_thread {
         let stats = stats.clone();
+        let eval_game = eval_game.clone();
         let mode = mode.clone();
         let black_batcher = black_batcher.clone();
         let white_batcher = white_batcher.clone();
 
         let handle = thread::spawn(move || {
             loop {
-                let eval_odd = mode == "eval" && thread_id % 2 == 1;
+                let game_id = if mode == "eval" {
+                    let x = eval_game.fetch_sub(1, Ordering::SeqCst);
+                    if x <= 0 {
+                        break;
+                    }
+                    x as usize
+                } else {
+                    0
+                };
+                let eval_odd = mode == "eval" && game_id % 2 == 1;
                 let (black_batcher, white_batcher) = if eval_odd {
                     (white_batcher.clone(), black_batcher.clone())
                 } else {
@@ -288,7 +298,6 @@ fn main() -> Result<()> {
                     if (eval_odd && winner == 1) || (!eval_odd && winner == -1) {
                         stats.eval_win += 1;
                     }
-                    break;
                 }
             }
         });
