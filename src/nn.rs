@@ -18,32 +18,24 @@ impl Drop for Batcher {
 }
 
 impl Batcher {
-    pub fn new(device: Device, batch_size: usize, model_path: &str) -> Self {
+    pub fn new(device: Device, model_path: &str) -> Self {
         let (tx, rx) = mpsc::channel::<(Tensor, mpsc::Sender<(Tensor, Tensor)>)>();
         let path = std::path::Path::new(model_path);
         let model = CModule::load_on_device(path, device).unwrap();
         let id = path.file_stem().unwrap().to_string_lossy().to_string();
-
         let model_id = Arc::new(Mutex::new(id));
-
         let thread_handle = thread::spawn(move || {
-            let mut queue = Vec::with_capacity(batch_size);
-
+            let mut queue = Vec::new();
             loop {
                 if let Ok(req) = rx.recv() {
                     queue.push(req);
-
-                    while queue.len() < batch_size {
-                        if let Ok(req) = rx.try_recv() {
-                            queue.push(req);
-                        } else {
-                            break;
-                        }
+                    while let Ok(req) = rx.try_recv() {
+                        queue.push(req);
                     }
                 } else {
                     break;
                 }
-
+                let batch_sizes: Vec<i64> = queue.iter().map(|(t, _)| t.size()[0]).collect();
                 let input: Vec<Tensor> = queue.iter().map(|(t, _)| t.shallow_clone()).collect();
                 let input = Tensor::cat(&input, 0).to(device);
                 let output = model.forward_is(&[IValue::from(input)]).unwrap();
@@ -55,13 +47,12 @@ impl Batcher {
                     (IValue::Tensor(p), IValue::Tensor(v)) => (p, v),
                     _ => panic!(),
                 };
-
-                let policy = p.split(1, 0);
-                let value = v.split(1, 0);
-                for (i, (_, response_tx)) in queue.drain(..).enumerate() {
-                    let p = policy[i].squeeze_dim(0);
-                    let v = value[i].squeeze_dim(0);
-                    let _ = response_tx.send((p, v));
+                let mut offset: i64 = 0;
+                for ((_, response_tx), &bs) in queue.drain(..).zip(batch_sizes.iter()) {
+                    let pi = p.narrow(0, offset, bs);
+                    let vi = v.narrow(0, offset, bs);
+                    offset += bs;
+                    let _ = response_tx.send((pi, vi));
                 }
             }
         });
@@ -77,7 +68,7 @@ impl Batcher {
         self.model_id.lock().unwrap().clone()
     }
 
-    pub fn evaluate(&self, input: Tensor) -> (Tensor, Tensor) {
+    pub fn eval(&self, input: Tensor) -> (Tensor, Tensor) {
         let (tx, rx) = mpsc::channel();
         if let Some(sender) = &self.sender {
             sender.send((input, tx)).unwrap();

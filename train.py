@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import hashlib
 import logging
 import os
@@ -77,6 +78,7 @@ class Trainer:
             self.model.parameters(),
             lr=INITIAL_LR,
             momentum=0.9,
+            weight_decay=1e-4,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=LR_MILESTONES, gamma=0.1
@@ -105,6 +107,7 @@ class Trainer:
         )
         state = torch.load(os.path.join(path, model.replace(".pt", ".state")))
         self.optimizer.load_state_dict(state["optimizer"])
+        state["scheduler"]["milestones"] = Counter(LR_MILESTONES)
         self.scheduler.load_state_dict(state["scheduler"])
         logging.info(f"load {model}")
 

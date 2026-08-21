@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 OUTDIR=$(date "+%Y%m%d-%H%M%S")
-
+rm -rf data/shuffle
 mkdir -p data/shuffle/"$OUTDIR".tmp/{valid,train} tmp/{valid,train}
 
 python3 ./shuffle.py data/selfplay/ \
@@ -19,5 +19,4 @@ python3 ./shuffle.py data/selfplay/ \
 	--tmp-dir tmp/train
 
 mv data/shuffle/"$OUTDIR".tmp data/shuffle/"$OUTDIR"
-ls -td data/shuffle/* | tail -n +5 | xargs rm -rf
 rm -rf tmp

@@ -152,7 +152,7 @@ if __name__ == "__main__":
     for path, stat, num_row in all_npz:
         shuffle_input.append((path, stat, num_row))
         mem_cnt += stat.st_size
-        if mem_cnt >= mem * 2 << 5:
+        if mem_cnt >= mem // 2:
             break
 
     np.random.seed()
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     for path, stat, num_row in shuffle_input:
         group.append(path)
         size += stat.st_size
-        if size > cpu_mem // 4:
+        if size > cpu_mem // 16:
             shard_input.append(group)
             group, size = [], 0
     if group:

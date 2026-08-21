@@ -30,7 +30,7 @@ fn save(
     history: &[(Vec<f32>, Vec<f32>, i8)],
     winner: i8,
     board: usize,
-    input_planes: usize,
+    input_plane: usize,
     sgf_root: &GameTree,
 ) -> Result<()> {
     let game_id = Uuid::new_v4();
@@ -40,7 +40,7 @@ fn save(
     fs::write(&sgf_path, Into::<String>::into(sgf_root))?;
 
     let n = history.len();
-    let feature_size = input_planes * board * board;
+    let feature_size = input_plane * board * board;
     let policy_size = board * board + 1;
     let mut board_data = Vec::with_capacity(n * feature_size);
     let mut policy_data = Vec::with_capacity(n * policy_size);
@@ -55,22 +55,22 @@ fn save(
 
     let board_tensor = tch::Tensor::from_slice(&board_data).view([
         n as i64,
-        input_planes as i64,
+        input_plane as i64,
         board as i64,
         board as i64,
     ]);
     let policy_tensor = tch::Tensor::from_slice(&policy_data).view([n as i64, policy_size as i64]);
     let value_tensor = tch::Tensor::from_slice(&value_data).view([n as i64, 1]);
-
+    let tmp_path = format!("{}.tmp", path);
     tch::Tensor::write_npz(
         &[
             ("board", &board_tensor),
             ("policy", &policy_tensor),
             ("value", &value_tensor),
         ],
-        &path,
+        &tmp_path,
     )?;
-
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 
@@ -79,16 +79,19 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "selfplay".to_string());
 
-    let batch = std::env::var("BATCH").unwrap().parse::<usize>().unwrap();
     let game_thread = std::env::var("GAME_THREAD")
         .unwrap()
         .parse::<usize>()
         .unwrap();
     let mcts_sim = std::env::var("MCTS_SIM").unwrap().parse::<usize>().unwrap();
+    let mcts_batch = std::env::var("MCTS_BATCH")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
     let board = std::env::var("BOARD").unwrap().parse::<usize>().unwrap();
     let c_puct = std::env::var("C_PUCT").unwrap().parse::<f32>().unwrap();
     let history = std::env::var("HISTORY").unwrap().parse::<usize>().unwrap();
-    let input_planes = history * 2 + 1;
+    let input_plane = history * 2 + 1;
     let eval_game = Arc::new(AtomicIsize::new(
         std::env::var("EVAL_GAME")
             .unwrap()
@@ -96,12 +99,12 @@ fn main() -> Result<()> {
             .unwrap(),
     ));
     let resign = std::env::var("RESIGN").unwrap().parse::<f32>().unwrap();
-
-    struct EvalStats {
+    let komi = std::env::var("KOMI").unwrap().parse::<f32>().unwrap();
+    struct Stat {
         game: usize,
         eval_win: usize,
     }
-    let stats = Arc::new(Mutex::new(EvalStats {
+    let stat = Arc::new(Mutex::new(Stat {
         game: 0,
         eval_win: 0,
     }));
@@ -112,47 +115,56 @@ fn main() -> Result<()> {
         "vulkan" => Device::Vulkan,
         _ => Device::Cpu,
     };
-    let black_batcher = Arc::new(Batcher::new(device, batch, &get_model("model")));
-    let white_batcher = if mode == "eval" {
-        Arc::new(Batcher::new(device, batch, &get_model("eval")))
+    let new_batcher = |dir| Arc::new(Batcher::new(device, &get_model(dir)));
+    let batcher_model = new_batcher("model");
+    let batcher_eval = if mode == "eval" {
+        Some(new_batcher("eval"))
     } else {
-        black_batcher.clone()
+        None
     };
 
     let mut handles = vec![];
-
     for _ in 0..game_thread {
-        let stats = stats.clone();
+        let stat = stat.clone();
         let eval_game = eval_game.clone();
         let mode = mode.clone();
-        let black_batcher = black_batcher.clone();
-        let white_batcher = white_batcher.clone();
-
+        let batcher_model = batcher_model.clone();
+        let batcher_eval = batcher_eval.clone();
         let handle = thread::spawn(move || {
             loop {
-                let game_id = if mode == "eval" {
-                    let x = eval_game.fetch_sub(1, Ordering::SeqCst);
-                    if x <= 0 {
+                let eval_odd = if mode == "eval" {
+                    let id = eval_game.fetch_sub(1, Ordering::SeqCst);
+                    if id <= 0 {
                         break;
                     }
-                    x as usize
+                    id % 2 == 1
                 } else {
-                    0
+                    false
                 };
-                let eval_odd = mode == "eval" && game_id % 2 == 1;
-                let (black_batcher, white_batcher) = if eval_odd {
-                    (white_batcher.clone(), black_batcher.clone())
+                let (batcher_black, batcher_white) = if mode == "eval" {
+                    if eval_odd {
+                        (batcher_eval.as_ref().unwrap(), &batcher_model)
+                    } else {
+                        (&batcher_model, batcher_eval.as_ref().unwrap())
+                    }
                 } else {
-                    (black_batcher.clone(), white_batcher.clone())
+                    (&batcher_model, &batcher_model)
                 };
-
                 let mut game = Game::new(board);
-                let mut mcts_black =
-                    MCTS::new(black_batcher.clone(), mcts_sim, input_planes, c_puct);
-
-                let mut mcts_white =
-                    MCTS::new(white_batcher.clone(), mcts_sim, input_planes, c_puct);
-
+                let mut mcts_black = MCTS::new(
+                    batcher_black.clone(),
+                    mcts_sim,
+                    mcts_batch,
+                    input_plane,
+                    c_puct,
+                );
+                let mut mcts_white = MCTS::new(
+                    batcher_white.clone(),
+                    mcts_sim,
+                    mcts_batch,
+                    input_plane,
+                    c_puct,
+                );
                 let mut resign_count_black = 0;
                 let mut resign_count_white = 0;
                 let mut resigned_winner = 0;
@@ -162,28 +174,31 @@ fn main() -> Result<()> {
                 sgf_root.nodes.push(GameNode {
                     tokens: vec![
                         SgfToken::Size(board as u32, board as u32),
+                        SgfToken::Komi(komi),
+                        SgfToken::Rule("Tromp-Taylor".into()),
                         SgfToken::PlayerName {
                             color: Color::Black,
-                            name: black_batcher.model_id(),
+                            name: batcher_black.model_id(),
                         },
                         SgfToken::PlayerName {
                             color: Color::White,
-                            name: white_batcher.model_id(),
+                            name: batcher_white.model_id(),
                         },
                     ],
                 });
 
                 while game.end() == false {
                     let player = game.player();
-                    let (feature, idx, policy, value) = if player == 1 {
+                    let add_noise = mode == "selfplay";
+                    let (feature, idx, policy, value) = if player == 1 || mode == "selfplay" {
                         let feature = MCTS::get_feature(&game);
-                        let idx = mcts_black.run(&game);
+                        let idx = mcts_black.run(&game, add_noise);
                         let policy = mcts_black.get_policy(&game);
                         let value = mcts_black.root_value();
                         (feature, idx, policy, value)
                     } else {
                         let feature = MCTS::get_feature(&game);
-                        let idx = mcts_white.run(&game);
+                        let idx = mcts_white.run(&game, add_noise);
                         let policy = mcts_white.get_policy(&game);
                         let value = mcts_white.root_value();
                         (feature, idx, policy, value)
@@ -211,9 +226,7 @@ fn main() -> Result<()> {
                         resigned_winner = 1;
                         break;
                     }
-
                     history.push((feature, policy, player));
-
                     let mut tokens = vec![];
                     let color = if player == 1 {
                         Color::Black
@@ -234,10 +247,11 @@ fn main() -> Result<()> {
                         });
                     }
                     sgf_root.nodes.push(GameNode { tokens });
-
                     game.play(idx);
                     mcts_black.update_root(idx);
-                    mcts_white.update_root(idx);
+                    if mode == "eval" {
+                        mcts_white.update_root(idx);
+                    }
                 }
 
                 let winner = if resigned_winner != 0 {
@@ -279,24 +293,23 @@ fn main() -> Result<()> {
                 let dir = if mode == "selfplay" {
                     format!(
                         "data/selfplay/{}_{}",
-                        black_batcher.model_id(),
-                        white_batcher.model_id()
+                        batcher_black.model_id(),
+                        batcher_white.model_id()
                     )
                 } else {
                     format!(
                         "data/eval/{}_{}",
-                        black_batcher.model_id(),
-                        white_batcher.model_id()
+                        batcher_black.model_id(),
+                        batcher_white.model_id()
                     )
                 };
 
-                let _ = save(&dir, &history, winner, board, input_planes, &sgf_root);
-
+                let _ = save(&dir, &history, winner, board, input_plane, &sgf_root);
                 if mode == "eval" {
-                    let mut stats = stats.lock().unwrap();
-                    stats.game += 1;
+                    let mut stat = stat.lock().unwrap();
+                    stat.game += 1;
                     if (eval_odd && winner == 1) || (!eval_odd && winner == -1) {
-                        stats.eval_win += 1;
+                        stat.eval_win += 1;
                     }
                 }
             }
@@ -307,36 +320,36 @@ fn main() -> Result<()> {
         h.join().unwrap();
     }
     if mode == "eval" {
-        let stats = stats.lock().unwrap();
+        let stat = stat.lock().unwrap();
         println!(
             "{} {}/{}",
-            black_batcher.model_id(),
-            stats.game - stats.eval_win,
-            stats.game
+            batcher_model.model_id(),
+            stat.game - stat.eval_win,
+            stat.game
         );
         println!(
             "{} {}/{}",
-            white_batcher.model_id(),
-            stats.eval_win,
-            stats.game
+            batcher_eval.as_ref().unwrap().model_id(),
+            stat.eval_win,
+            stat.game
         );
-        let rate = stats.eval_win as f32 / stats.game as f32;
+        let rate = stat.eval_win as f32 / stat.game as f32;
         println!("new model win rate {:.2}", rate);
         let eval_threshold = std::env::var("EVAL_THRESHOLD")
             .unwrap()
             .parse::<f32>()
             .unwrap();
         if rate > eval_threshold {
-            let white_id = white_batcher.model_id();
-            let black_id = black_batcher.model_id();
+            let new_id = batcher_eval.as_ref().unwrap().model_id();
+            let old_id = batcher_model.model_id();
             fs::rename(
-                format!("eval/{}.pt", white_id),
-                format!("model/{}.pt", white_id),
+                format!("eval/{}.pt", new_id),
+                format!("model/{}.pt", new_id),
             )
             .unwrap();
             fs::rename(
-                format!("eval/{}.state", white_id),
-                format!("model/{}.state", white_id),
+                format!("eval/{}.state", new_id),
+                format!("model/{}.state", new_id),
             )
             .unwrap();
             use std::io::Write;
@@ -350,11 +363,11 @@ fn main() -> Result<()> {
                     .unwrap()
                     .as_secs();
                 let mut log_data = String::new();
-                for _ in 0..(stats.game - stats.eval_win) {
-                    log_data.push_str(&format!("{},{},B,{}\n", black_id, white_id, time));
+                for _ in 0..(stat.game - stat.eval_win) {
+                    log_data.push_str(&format!("{},{},B,{}\n", old_id, new_id, time));
                 }
-                for _ in 0..stats.eval_win {
-                    log_data.push_str(&format!("{},{},W,{}\n", black_id, white_id, time));
+                for _ in 0..stat.eval_win {
+                    log_data.push_str(&format!("{},{},W,{}\n", old_id, new_id, time));
                 }
                 let _ = file.write_all(log_data.as_bytes());
             }
