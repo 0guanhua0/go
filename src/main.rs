@@ -116,8 +116,8 @@ fn main() -> Result<()> {
         _ => Device::Cpu,
     };
     let new_batcher = |dir| Arc::new(Batcher::new(device, &get_model(dir)));
-    let batcher_model = new_batcher("model");
-    let batcher_eval = if mode == "eval" {
+    let model_old = new_batcher("model");
+    let model_new = if mode == "eval" {
         Some(new_batcher("eval"))
     } else {
         None
@@ -128,8 +128,8 @@ fn main() -> Result<()> {
         let stat = stat.clone();
         let eval_game = eval_game.clone();
         let mode = mode.clone();
-        let batcher_model = batcher_model.clone();
-        let batcher_eval = batcher_eval.clone();
+        let model_old = model_old.clone();
+        let model_new = model_new.clone();
         let handle = thread::spawn(move || {
             loop {
                 let eval_odd = if mode == "eval" {
@@ -141,25 +141,25 @@ fn main() -> Result<()> {
                 } else {
                     false
                 };
-                let (batcher_black, batcher_white) = if mode == "eval" {
+                let (model_black, model_white) = if mode == "eval" {
                     if eval_odd {
-                        (batcher_eval.as_ref().unwrap(), &batcher_model)
+                        (model_new.as_ref().unwrap(), &model_old)
                     } else {
-                        (&batcher_model, batcher_eval.as_ref().unwrap())
+                        (&model_old, model_new.as_ref().unwrap())
                     }
                 } else {
-                    (&batcher_model, &batcher_model)
+                    (&model_old, &model_old)
                 };
                 let mut game = Game::new(board);
                 let mut mcts_black = MCTS::new(
-                    batcher_black.clone(),
+                    model_black.clone(),
                     mcts_sim,
                     mcts_batch,
                     input_plane,
                     c_puct,
                 );
                 let mut mcts_white = MCTS::new(
-                    batcher_white.clone(),
+                    model_white.clone(),
                     mcts_sim,
                     mcts_batch,
                     input_plane,
@@ -178,11 +178,11 @@ fn main() -> Result<()> {
                         SgfToken::Rule("Tromp-Taylor".into()),
                         SgfToken::PlayerName {
                             color: Color::Black,
-                            name: batcher_black.model_id(),
+                            name: model_black.model_id(),
                         },
                         SgfToken::PlayerName {
                             color: Color::White,
-                            name: batcher_white.model_id(),
+                            name: model_white.model_id(),
                         },
                     ],
                 });
@@ -293,14 +293,14 @@ fn main() -> Result<()> {
                 let dir = if mode == "selfplay" {
                     format!(
                         "data/selfplay/{}_{}",
-                        batcher_black.model_id(),
-                        batcher_white.model_id()
+                        model_black.model_id(),
+                        model_white.model_id()
                     )
                 } else {
                     format!(
                         "data/eval/{}_{}",
-                        batcher_black.model_id(),
-                        batcher_white.model_id()
+                        model_black.model_id(),
+                        model_white.model_id()
                     )
                 };
 
@@ -323,13 +323,13 @@ fn main() -> Result<()> {
         let stat = stat.lock().unwrap();
         println!(
             "{} {}/{}",
-            batcher_model.model_id(),
+            model_old.model_id(),
             stat.game - stat.eval_win,
             stat.game
         );
         println!(
             "{} {}/{}",
-            batcher_eval.as_ref().unwrap().model_id(),
+            model_new.as_ref().unwrap().model_id(),
             stat.eval_win,
             stat.game
         );
@@ -340,8 +340,8 @@ fn main() -> Result<()> {
             .parse::<f32>()
             .unwrap();
         if rate > eval_threshold {
-            let new_id = batcher_eval.as_ref().unwrap().model_id();
-            let old_id = batcher_model.model_id();
+            let new_id = model_new.as_ref().unwrap().model_id();
+            let old_id = model_old.model_id();
             fs::rename(
                 format!("eval/{}.pt", new_id),
                 format!("model/{}.pt", new_id),
