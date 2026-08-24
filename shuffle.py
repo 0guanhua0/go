@@ -1,8 +1,10 @@
 import argparse
 import hashlib
 import multiprocessing
-import numpy as np
 import os
+import shutil
+
+import numpy as np
 import psutil
 
 
@@ -24,100 +26,35 @@ def shard(shard_input, shard_output):
     board_list = []
     policy_list = []
     value_list = []
-
+    cnt = 0
     for i in shard_input:
         data = np.load(i, allow_pickle=True)
         board_list.append(data["board"])
         policy_list.append(data["policy"])
         value_list.append(data["value"])
-
-    board = np.concatenate(board_list, axis=0)
-    policy = np.concatenate(policy_list, axis=0)
-    value = np.concatenate(value_list, axis=0)
-
-    N, C, H, W = board.shape
-    policy_board, policy_pass = policy[:, :-1].reshape(N, H, W), policy[:, -1:]
-    board_aug, policy_aug, value_aug = [], [], []
-    for k in range(4):
-        for flip in (False, True):
-            b = np.rot90(board, k, axes=(2, 3))
-            p = np.rot90(policy_board, k, axes=(1, 2))
-            if flip:
-                b = np.flip(b, axis=3)
-                p = np.flip(p, axis=2)
-            board_aug.append(b)
-            policy_aug.append(
-                np.concatenate([p.reshape(N, H * W), policy_pass], axis=1)
-            )
-            value_aug.append(value)
-    board = np.concatenate(board_aug, axis=0)
-    policy = np.concatenate(policy_aug, axis=0)
-    value = np.concatenate(value_aug, axis=0)
-
-    row_cnt = board.shape[0]
-    assert row_cnt == policy.shape[0]
-    assert row_cnt == value.shape[0]
-
+        cnt += data["board"].shape[0]
+    _, C, H, W = board_list[0].shape
     rng = np.random.default_rng()
-    perm = rng.permutation(row_cnt)
+    perm = rng.permutation(cnt)
+    board = np.empty((cnt, C, H, W), dtype=board_list[0].dtype)
+    policy = np.empty((cnt, policy_list[0].shape[1]), dtype=policy_list[0].dtype)
+    value = np.empty((cnt, value_list[0].shape[1]), dtype=value_list[0].dtype)
 
+    cnt = 0
+    for b, p, v in zip(board_list, policy_list, value_list):
+        N = b.shape[0]
+        x = perm[cnt : cnt + N]
+        board[x] = b
+        policy[x] = p
+        value[x] = v
+        cnt += N
     save_dict = {
-        "board": board[perm],
-        "policy": policy[perm],
-        "value": value[perm],
+        "board": board,
+        "policy": policy,
+        "value": value,
     }
-
     os.makedirs(os.path.dirname(shard_output), exist_ok=True)
     np.save(shard_output, save_dict)
-
-
-def merge(merge_input, merge_output, batch):
-    row_sum = 0
-    shapes = {}
-    dtypes = {}
-
-    for i in merge_input:
-        data = np.load(i, allow_pickle=True).item()
-        row_sum += data["board"].shape[0]
-        if not shapes:
-            shapes["board"] = data["board"].shape[1:]
-            shapes["policy"] = data["policy"].shape[1:]
-            shapes["value"] = data["value"].shape[1:]
-            dtypes["board"] = data["board"].dtype
-            dtypes["policy"] = data["policy"].dtype
-            dtypes["value"] = data["value"].dtype
-
-    keep_cnt = row_sum // batch * batch
-    rng = np.random.default_rng()
-    perm = rng.choice(row_sum, size=keep_cnt, replace=False)
-
-    inverse_perm = np.full(row_sum, -1, dtype=np.int64)
-    inverse_perm[perm] = np.arange(keep_cnt)
-
-    save_dict = {
-        "board": np.empty((keep_cnt,) + shapes["board"], dtype=dtypes["board"]),
-        "policy": np.empty((keep_cnt,) + shapes["policy"], dtype=dtypes["policy"]),
-        "value": np.empty((keep_cnt,) + shapes["value"], dtype=dtypes["value"]),
-    }
-
-    offset = 0
-    for i in merge_input:
-        data = np.load(i, allow_pickle=True).item()
-        rows = data["board"].shape[0]
-
-        global_idx = np.arange(offset, offset + rows)
-        dst_idx = inverse_perm[global_idx]
-        mask = dst_idx != -1
-
-        if mask.any():
-            valid_dst = dst_idx[mask]
-            save_dict["board"][valid_dst] = data["board"][mask]
-            save_dict["policy"][valid_dst] = data["policy"][mask]
-            save_dict["value"][valid_dst] = data["value"][mask]
-
-        offset += rows
-
-    np.save(merge_output, save_dict)
 
 
 if __name__ == "__main__":
@@ -128,7 +65,6 @@ if __name__ == "__main__":
     parser.add_argument("--path-md5-max", type=float, required=True)
     parser.add_argument("--path-md5-min", type=float, required=True)
     parser.add_argument("--tmp-dir", required=True)
-
     args = parser.parse_args()
     dirs = args.dirs
     batch = args.batch
@@ -137,45 +73,36 @@ if __name__ == "__main__":
     path_md5_min = args.path_md5_min
     tmp_dir = args.tmp_dir
 
-    mem = psutil.virtual_memory().available
-    cpu_count = multiprocessing.cpu_count()
-    cpu_mem = mem // cpu_count
-
     all_npz = []
     for d in dirs:
         for path, stat, num_row in scan(d, path_md5_min, path_md5_max):
             all_npz.append((path, stat, num_row))
-
     all_npz.sort(key=(lambda x: x[1].st_mtime), reverse=True)
-    shuffle_input = []
-    mem_cnt = 0
-    for path, stat, num_row in all_npz:
-        shuffle_input.append((path, stat, num_row))
-        mem_cnt += stat.st_size
-        if mem_cnt >= mem // 2:
-            break
-
+    game_window = int(os.environ.get("GAME_WINDOW"))
+    shuffle_input = all_npz[:game_window]
     np.random.seed()
     np.random.shuffle(shuffle_input)
     shard_input = []
     group, size = [], 0
+    cpu_count = multiprocessing.cpu_count()
+    cpu_mem = psutil.virtual_memory().available // cpu_count
     for path, stat, num_row in shuffle_input:
         group.append(path)
         size += stat.st_size
-        if size > cpu_mem // 16:
+        if size > cpu_mem // 2:
             shard_input.append(group)
             group, size = [], 0
     if group:
         shard_input.append(group)
 
-    shard_paths = []
-    for idx in range(len(shard_input)):
-        shard_paths.append(os.path.join(tmp_dir, str(idx), "data.npy"))
-
+    shard_path = []
+    for x in range(len(shard_input)):
+        shard_path.append(os.path.join(tmp_dir, str(x), "data.npy"))
     with multiprocessing.Pool(cpu_count) as pool:
         pool.starmap(
             shard,
-            [(group, shard_paths[idx]) for idx, group in enumerate(shard_input)],
+            [(group, shard_path[x]) for x, group in enumerate(shard_input)],
         )
-
-    merge(shard_paths, os.path.join(out_dir, "data.npy"), batch)
+    os.makedirs(out_dir, exist_ok=True)
+    for x, f in enumerate(shard_path):
+        shutil.move(f, os.path.join(out_dir, f"data_{x}.npy"))

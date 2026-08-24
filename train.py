@@ -1,13 +1,15 @@
 import argparse
-from collections import Counter
 import hashlib
 import logging
 import os
+import random
+import sys
+from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from network import AlphaGoZero
 
@@ -18,19 +20,49 @@ class StreamingDataset(IterableDataset):
         self.batch_size = batch_size
 
     def __iter__(self):
-        data = np.load(self.path, allow_pickle=True).item()
-
-        board = torch.from_numpy(data["board"])
-        policy = torch.from_numpy(data["policy"])
-        value = torch.from_numpy(data["value"])
-
-        sample_cnt = board.shape[0]
-        for i in range(0, sample_cnt - self.batch_size + 1, self.batch_size):
-            yield (
-                board[i : i + self.batch_size],
-                policy[i : i + self.batch_size],
-                value[i : i + self.batch_size],
-            )
+        file = [
+            os.path.join(self.path, f)
+            for f in os.listdir(self.path)
+            if f.endswith(".npy")
+        ]
+        board_buf, policy_buf, value_buf = [], [], []
+        buf_len = 0
+        for f in file:
+            data = np.load(f, allow_pickle=True).item()
+            board_buf.append(torch.from_numpy(data["board"]))
+            policy_buf.append(torch.from_numpy(data["policy"]))
+            value_buf.append(torch.from_numpy(data["value"]))
+            buf_len += data["board"].shape[0]
+            while buf_len >= self.batch_size:
+                b = torch.cat(board_buf, dim=0)
+                p = torch.cat(policy_buf, dim=0)
+                v = torch.cat(value_buf, dim=0)
+                b_batch = b[: self.batch_size]
+                p_batch = p[: self.batch_size]
+                v_batch = v[: self.batch_size]
+                k = random.randint(0, 3)
+                flip = random.choice([False, True])
+                if k > 0 or flip:
+                    b_batch = torch.rot90(b_batch, k, dims=[2, 3])
+                    N = b_batch.shape[0]
+                    H = b_batch.shape[2]
+                    W = b_batch.shape[3]
+                    p_board = p_batch[:, :-1].view(N, H, W)
+                    p_board = torch.rot90(p_board, k, dims=[1, 2])
+                    if flip:
+                        b_batch = torch.flip(b_batch, dims=[3])
+                        p_board = torch.flip(p_board, dims=[2])
+                    p_batch = torch.cat([p_board.flatten(1), p_batch[:, -1:]], dim=1)
+                yield (
+                    b_batch,
+                    p_batch,
+                    v_batch,
+                )
+                b_buf = b[self.batch_size :]
+                p_buf = p[self.batch_size :]
+                v_buf = v[self.batch_size :]
+                board_buf, policy_buf, value_buf = [b_buf], [p_buf], [v_buf]
+                buf_len = b_buf.shape[0]
 
 
 BATCH = int(os.environ["BATCH"])
@@ -47,6 +79,9 @@ LOGGING_CONFIG = {
     "level": logging.INFO,
     "format": "%(asctime)s - %(processName)s - %(message)s",
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def weight_hash(weight):
@@ -97,7 +132,7 @@ class Trainer:
             },
             f"{path}/{model_id}.state",
         )
-        logging.info(f"save {model_id}")
+        logger.info(f"save {model_id}")
 
     def load_model(self, path):
         pt = [f for f in os.listdir(path) if f.endswith(".pt")]
@@ -107,9 +142,16 @@ class Trainer:
         )
         state = torch.load(os.path.join(path, model.replace(".pt", ".state")))
         self.optimizer.load_state_dict(state["optimizer"])
+        last_epoch = state["scheduler"]["last_epoch"]
+        milestone = sum(1 for x in LR_MILESTONES if x <= last_epoch)
+        lr = INITIAL_LR * (0.1**milestone)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+            group["initial_lr"] = INITIAL_LR
         state["scheduler"]["milestones"] = Counter(LR_MILESTONES)
+        state["scheduler"]["_last_lr"] = [lr]
         self.scheduler.load_state_dict(state["scheduler"])
-        logging.info(f"load {model}")
+        logger.info(f"load {model}")
 
     def train_step(self, state, policy, value):
         self.model.train()
@@ -146,30 +188,27 @@ def main(args):
     trainer = Trainer()
     if args.init:
         trainer.save_model("model")
-        exit(0)
+        sys.exit(0)
     trainer.load_model("model")
     train_dataset = StreamingDataset(args.data_train, BATCH)
     train_loader = DataLoader(train_dataset, batch_size=None)
-    step = 0
-    for board, policy, value in train_loader:
+    for step, (board, policy, value) in enumerate(train_loader, start=1):
         loss = trainer.train_step(board, policy, value)
-        step += 1
+        trainer.scheduler.step()
         if step % 100 == 0:
-            logging.info(f"step {step} loss {loss:.4f}")
+            logger.info(f"step {step} loss {loss:.4f}")
     valid_dataset = StreamingDataset(args.data_valid, BATCH)
     valid_loader = DataLoader(valid_dataset, batch_size=None)
-    step = 0
     policy_loss, value_loss = 0.0, 0.0
-    for board, policy, value in valid_loader:
+    step = 0
+    for step, (board, policy, value) in enumerate(valid_loader, start=1):
         p, v = trainer.eval_step(board, policy, value)
         policy_loss += p
         value_loss += v
-        step += 1
-    logging.info(
+    logger.info(
         f"validation policy loss {policy_loss / step:.4f} value loss {value_loss / step:.4f}"
     )
-    trainer.scheduler.step()
-    logging.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
+    logger.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
     trainer.save_model("eval")
 
 
