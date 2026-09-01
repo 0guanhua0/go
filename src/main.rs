@@ -192,13 +192,13 @@ fn main() -> Result<()> {
                     let add_noise = mode == "selfplay";
                     let (feature, idx, policy, value) = if player == 1 || mode == "selfplay" {
                         let feature = MCTS::get_feature(&game);
-                        let idx = mcts_black.run(&game, add_noise);
+                        let idx = mcts_black.run(&game, add_noise, history.len());
                         let policy = mcts_black.get_policy(&game);
                         let value = mcts_black.root_value();
                         (feature, idx, policy, value)
                     } else {
                         let feature = MCTS::get_feature(&game);
-                        let idx = mcts_white.run(&game, add_noise);
+                        let idx = mcts_white.run(&game, add_noise, history.len());
                         let policy = mcts_white.get_policy(&game);
                         let value = mcts_white.root_value();
                         (feature, idx, policy, value)

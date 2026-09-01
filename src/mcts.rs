@@ -56,7 +56,7 @@ impl MCTS {
             c_puct,
         }
     }
-    pub fn run(&mut self, game: &Game, add_noise: bool) -> usize {
+    pub fn run(&mut self, game: &Game, add_noise: bool, move_cnt: usize) -> usize {
         if !self.root.expand {
             Self::expand_node(&mut self.root, game, &self.batcher, self.input_plane);
         }
@@ -115,7 +115,28 @@ impl MCTS {
                     game.size as i64,
                     game.size as i64,
                 ]);
-                let (policy, value) = self.batcher.eval(input);
+                let sym = rand::random::<u8>() % 8;
+                let flip = sym >= 4;
+                let rot = (sym % 4) as i64;
+                let mut x = input;
+                if flip {
+                    x = x.flip([3]);
+                }
+                if rot > 0 {
+                    x = x.rot90(rot, &[2, 3]);
+                }
+                let (policy, value) = self.batcher.eval(x);
+                let size = game.size as i64;
+                let mut p_board = policy.narrow(1, 0, size * size).view([-1, size, size]);
+                let p_pass = policy.narrow(1, size * size, 1);
+                if rot > 0 {
+                    p_board = p_board.rot90(-rot, &[1, 2]);
+                }
+                if flip {
+                    p_board = p_board.flip([2]);
+                }
+                p_board = p_board.flatten(1, 2);
+                let policy = Tensor::cat(&[p_board, p_pass], 1);
                 let policy = policy.to(Device::Cpu).split(1, 0);
                 let value = value.to(Device::Cpu).split(1, 0);
                 for (i, (path, game_sim)) in pending.iter().enumerate() {
@@ -132,12 +153,33 @@ impl MCTS {
             }
             sim_cnt += batch_size;
         }
-        let mut max_cnt = 0;
+
         let mut max_act = 0;
-        for (x, n) in self.root.next.iter() {
-            if n.visit_count > max_cnt {
-                max_cnt = n.visit_count;
-                max_act = *x;
+        if add_noise && move_cnt < (game.size * game.size) / 10 {
+            let mut sum = 0.0;
+            let mut act = Vec::new();
+            let mut cdf = Vec::new();
+            for (&x, n) in self.root.next.iter() {
+                act.push(x);
+                sum += n.visit_count as f32;
+                cdf.push(sum);
+            }
+            let r = rand::random::<f32>() * sum;
+            let mut idx = 0;
+            while cdf[idx] < r {
+                idx += 1;
+            }
+            if idx >= act.len() {
+                idx = act.len().saturating_sub(1);
+            }
+            max_act = act[idx];
+        } else {
+            let mut max_cnt = 0;
+            for (&x, n) in self.root.next.iter() {
+                if n.visit_count > max_cnt {
+                    max_cnt = n.visit_count;
+                    max_act = x;
+                }
             }
         }
         max_act
@@ -236,7 +278,28 @@ impl MCTS {
             game.size as i64,
             game.size as i64,
         ]);
-        let (policy, _) = batcher.eval(input);
+        let sym = rand::random::<u8>() % 8;
+        let flip = sym >= 4;
+        let rot = (sym % 4) as i64;
+        let mut x = input;
+        if flip {
+            x = x.flip([3]);
+        }
+        if rot > 0 {
+            x = x.rot90(rot, &[2, 3]);
+        }
+        let (policy, _) = batcher.eval(x);
+        let size = game.size as i64;
+        let mut p_board = policy.narrow(1, 0, size * size).view([-1, size, size]);
+        let p_pass = policy.narrow(1, size * size, 1);
+        if rot > 0 {
+            p_board = p_board.rot90(-rot, &[1, 2]);
+        }
+        if flip {
+            p_board = p_board.flip([2]);
+        }
+        p_board = p_board.flatten(1, 2);
+        let policy = Tensor::cat(&[p_board, p_pass], 1);
         let policy = Vec::try_from(policy.squeeze_dim(0).to(Device::Cpu)).unwrap();
         Self::set_policy(node, game, &policy);
     }

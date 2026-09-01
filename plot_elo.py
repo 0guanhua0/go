@@ -14,36 +14,32 @@ def plot_elo():
             )
 
     game.sort(key=lambda x: x["time"])
+    start_time = game[0]["time"]
     model = []
-    seen = set()
+    model_hour = {}
     for g in game:
-        if g["p1"] not in seen:
-            model.append(g["p1"])
-            seen.add(g["p1"])
-        if g["p2"] not in seen:
-            model.append(g["p2"])
-            seen.add(g["p2"])
+        for x in (g["p1"], g["p2"]):
+            if x not in model_hour:
+                model.append(x)
+                model_hour[x] = int((g["time"] - start_time) / 3600.0)
 
-    model_to_day = {m_id: i for i, m_id in enumerate(model)}
     whr = Base()
-
     for g in game:
-        whr.create_game(g["p1"], g["p2"], g["winner"], model_to_day[g["p2"]])
-
+        whr.create_game(g["p1"], g["p2"], g["winner"], model_hour[g["p2"]])
     whr.iterate_until_converge(verbose=False)
 
-    elos = []
-    for m_id in model:
-        rating = whr.ratings_for_player(m_id)
-        day = model_to_day[m_id]
-        elo = min(rating, key=lambda x: abs(x[0] - day))[1]
-        elos.append(elo)
+    elo = []
+    hour = []
+    for m in model:
+        rating = whr.ratings_for_player(m)
+        h = model_hour[m]
+        elo.append(min(rating, key=lambda x: abs(x[0] - h))[1])
+        hour.append(h)
 
     plt.style.use("dark_background")
-    plt.xlabel("model", color="white")
+    plt.xlabel("hour", color="white")
     plt.ylabel("elo", color="white")
-    plt.xticks([])
-    plt.scatter(range(len(elos)), elos, color="white")
+    plt.scatter(hour, elo, color="white")
     plt.box(False)
     plt.savefig("elo.png", facecolor="black")
 
