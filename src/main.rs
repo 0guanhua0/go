@@ -342,12 +342,12 @@ fn main() -> Result<()> {
         if rate > eval_threshold {
             let new_id = model_new.as_ref().unwrap().model_id();
             let old_id = model_old.model_id();
-            fs::rename(
+            fs::copy(
                 format!("eval/{}.pt", new_id),
                 format!("model/{}.pt", new_id),
             )
             .unwrap();
-            fs::rename(
+            fs::copy(
                 format!("eval/{}.state", new_id),
                 format!("model/{}.state", new_id),
             )

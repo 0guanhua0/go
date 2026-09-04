@@ -171,17 +171,6 @@ class Trainer:
         self.optimizer.step()
         return loss.item()
 
-    def eval_step(self, state, policy, value):
-        self.model.eval()
-        with torch.no_grad():
-            state = state.to(self.device)
-            policy = policy.to(self.device)
-            value = value.to(self.device)
-            policy_next, value_next = self.model(state)
-            return F.cross_entropy(policy_next, policy).item(), F.mse_loss(
-                value_next, value
-            ).item()
-
 
 def main(args):
     logging.basicConfig(**LOGGING_CONFIG)
@@ -190,24 +179,13 @@ def main(args):
         trainer.save_model("model")
         sys.exit(0)
     trainer.load_model("model")
-    train_dataset = StreamingDataset(args.data_train, BATCH)
+    train_dataset = StreamingDataset(args.data, BATCH)
     train_loader = DataLoader(train_dataset, batch_size=None)
     for step, (board, policy, value) in enumerate(train_loader, start=1):
         loss = trainer.train_step(board, policy, value)
         trainer.scheduler.step()
         if step % 100 == 0:
             logger.info(f"step {step} loss {loss:.4f}")
-    valid_dataset = StreamingDataset(args.data_valid, BATCH)
-    valid_loader = DataLoader(valid_dataset, batch_size=None)
-    policy_loss, value_loss = 0.0, 0.0
-    step = 0
-    for step, (board, policy, value) in enumerate(valid_loader, start=1):
-        p, v = trainer.eval_step(board, policy, value)
-        policy_loss += p
-        value_loss += v
-    logger.info(
-        f"validation policy loss {policy_loss / step:.4f} value loss {value_loss / step:.4f}"
-    )
     logger.info(f"LR: {trainer.scheduler.get_last_lr()[0]}")
     trainer.save_model("eval")
 
@@ -215,7 +193,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--init", action="store_true")
-    parser.add_argument("--data-train")
-    parser.add_argument("--data-valid")
+    parser.add_argument("--data")
     args = parser.parse_args()
     main(args)

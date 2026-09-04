@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import multiprocessing
 import os
 import shutil
@@ -8,18 +7,14 @@ import numpy as np
 import psutil
 
 
-def scan(dir, path_md5_min, path_md5_max):
+def scan(dir):
     for entry in os.scandir(dir):
         if entry.is_dir():
-            yield from scan(entry.path, path_md5_min, path_md5_max)
+            yield from scan(entry.path)
         elif entry.name.endswith(".npz"):
-            path_md5 = (
-                int(hashlib.md5(entry.name.encode()).hexdigest()[:13], 16) / 2**52
-            )
-            if path_md5_min <= path_md5 < path_md5_max:
-                data = np.load(entry.path, allow_pickle=True)
-                num_row = next(iter(data.values())).shape[0]
-                yield (entry.path, entry.stat(), num_row)
+            data = np.load(entry.path, allow_pickle=True)
+            num_row = next(iter(data.values())).shape[0]
+            yield (entry.path, entry.stat(), num_row)
 
 
 def shard(shard_input, shard_output):
@@ -62,20 +57,16 @@ if __name__ == "__main__":
     parser.add_argument("dirs", nargs="+")
     parser.add_argument("--batch", type=int, required=True)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--path-md5-max", type=float, required=True)
-    parser.add_argument("--path-md5-min", type=float, required=True)
     parser.add_argument("--tmp-dir", required=True)
     args = parser.parse_args()
     dirs = args.dirs
     batch = args.batch
     out_dir = args.out_dir
-    path_md5_max = args.path_md5_max
-    path_md5_min = args.path_md5_min
     tmp_dir = args.tmp_dir
 
     all_npz = []
     for d in dirs:
-        for path, stat, num_row in scan(d, path_md5_min, path_md5_max):
+        for path, stat, num_row in scan(d):
             all_npz.append((path, stat, num_row))
     all_npz.sort(key=(lambda x: x[1].st_mtime), reverse=True)
     game_window = int(os.environ.get("GAME_WINDOW"))
