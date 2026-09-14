@@ -1,10 +1,10 @@
 import datetime
-from contextlib import suppress
 import os
 import shutil
 import subprocess
 import threading
 import time
+from contextlib import suppress
 
 BATCH = os.environ["BATCH"]
 shuffle_lock = threading.Lock()
