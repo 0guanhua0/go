@@ -1,4 +1,8 @@
 import csv
+import glob
+import os
+import random
+import subprocess
 
 import matplotlib.pyplot as plt
 from whr import Base
@@ -44,5 +48,21 @@ def plot_elo():
     plt.savefig("elo.svg", facecolor="black")
 
 
+def plot_game():
+    base = "data/eval"
+    sgf_dir = [os.path.join(base, d) for d in os.listdir(base)]
+    sgf = glob.glob(os.path.join(max(sgf_dir, key=os.path.getmtime), "*.sgf"))
+    for i, x in enumerate(random.sample(sgf, 4)):
+        cmd = [
+            os.path.expanduser("~/.cargo/bin/sgf-render"),
+            "-o",
+            f"kifu{i}.svg",
+            "--kifu",
+            x,
+        ]
+        subprocess.run(cmd)
+
+
 if __name__ == "__main__":
     plot_elo()
+    plot_game()

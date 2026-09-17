@@ -3,7 +3,7 @@ repos:
   rev: v0.15.0
   hooks:
     - id: ruff-check
-      args: [--fix]
+      args: [--fix, --extend-select=I]
     - id: ruff-format
 - repo: https://github.com/scop/pre-commit-shfmt
   rev: v3.12.0-2

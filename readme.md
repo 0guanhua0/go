@@ -4,5 +4,9 @@ KataGo
 
 Adversarial policies in Go
 
-# elo 9x9
+# 9x9
 ![elo](elo.svg)
+![kifu0](kifu0.svg)
+![kifu1](kifu1.svg)
+![kifu2](kifu2.svg)
+![kifu3](kifu3.svg)

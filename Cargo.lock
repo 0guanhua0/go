@@ -299,11 +299,9 @@ dependencies = [
  "anyhow",
  "rand 0.10.2",
  "rand_distr",
- "serde_json",
  "sgf-parser",
  "tch",
  "uuid",
- "zip",
 ]
 
 [[package]]
