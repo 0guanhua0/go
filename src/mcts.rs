@@ -169,9 +169,6 @@ impl MCTS {
             while cdf[idx] < r {
                 idx += 1;
             }
-            if idx >= act.len() {
-                idx = act.len().saturating_sub(1);
-            }
             max_act = act[idx];
         } else {
             let mut max_cnt = 0;

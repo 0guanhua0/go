@@ -23,7 +23,7 @@ def plot_elo():
                 model.append(x)
                 model_hour[x] = int((g["time"] - start_time) / 3600.0)
 
-    whr = Base()
+    whr = Base(config={"w2": 0.1})
     for g in game:
         whr.create_game(g["p1"], g["p2"], g["winner"], model_hour[g["p2"]])
     whr.iterate_until_converge(verbose=False)
@@ -41,7 +41,7 @@ def plot_elo():
     plt.ylabel("elo", color="white")
     plt.scatter(hour, elo, color="white")
     plt.box(False)
-    plt.savefig("elo.png", facecolor="black")
+    plt.savefig("elo.svg", facecolor="black")
 
 
 if __name__ == "__main__":
