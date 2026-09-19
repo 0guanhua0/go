@@ -14,17 +14,6 @@ use std::thread;
 use tch::Device;
 use uuid::Uuid;
 
-fn get_model(model_dir: &str) -> String {
-    let newest = fs::read_dir(model_dir)
-        .unwrap()
-        .filter_map(|e| {
-            e.ok()
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "pt"))
-        })
-        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
-    newest.unwrap().path().to_string_lossy().to_string()
-}
-
 fn save(
     dir: &str,
     history: &[(Vec<f32>, Vec<f32>, i8)],
@@ -75,10 +64,7 @@ fn save(
 }
 
 fn main() -> Result<()> {
-    let mode = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "selfplay".to_string());
-
+    let mode = std::env::args().nth(1).unwrap();
     let game_thread = std::env::var("GAME_THREAD")
         .unwrap()
         .parse::<usize>()
@@ -102,11 +88,13 @@ fn main() -> Result<()> {
     let komi = std::env::var("KOMI").unwrap().parse::<f32>().unwrap();
     struct Stat {
         game: usize,
-        eval_win: usize,
+        model0: usize,
+        model1: usize,
     }
     let stat = Arc::new(Mutex::new(Stat {
         game: 0,
-        eval_win: 0,
+        model0: 0,
+        model1: 0,
     }));
 
     let device = match std::env::var("DEVICE").unwrap().as_str() {
@@ -115,40 +103,27 @@ fn main() -> Result<()> {
         "vulkan" => Device::Vulkan,
         _ => Device::Cpu,
     };
-    let new_batcher = |dir| Arc::new(Batcher::new(device, &get_model(dir)));
-    let model_old = new_batcher("model");
-    let model_new = if mode == "eval" {
-        Some(new_batcher("eval"))
-    } else {
-        None
-    };
+    let arg_model0 = std::env::args().nth(2).unwrap();
+    let arg_model1 = std::env::args().nth(3).unwrap();
+    let model0 = Arc::new(Batcher::new(device, &arg_model0));
+    let model1 = Arc::new(Batcher::new(device, &arg_model1));
 
     let mut handles = vec![];
-    for _ in 0..game_thread {
+    for thread_id in 0..game_thread {
         let stat = stat.clone();
         let eval_game = eval_game.clone();
         let mode = mode.clone();
-        let model_old = model_old.clone();
-        let model_new = model_new.clone();
+        let model0 = model0.clone();
+        let model1 = model1.clone();
         let handle = thread::spawn(move || {
             loop {
-                let eval_odd = if mode == "eval" {
-                    let id = eval_game.fetch_sub(1, Ordering::SeqCst);
-                    if id <= 0 {
-                        break;
-                    }
-                    id % 2 == 1
+                if mode == "eval" && eval_game.fetch_sub(1, Ordering::SeqCst) <= 0 {
+                    break;
+                }
+                let (model_black, model_white) = if thread_id % 2 == 0 {
+                    (&model0, &model1)
                 } else {
-                    false
-                };
-                let (model_black, model_white) = if mode == "eval" {
-                    if eval_odd {
-                        (model_new.as_ref().unwrap(), &model_old)
-                    } else {
-                        (&model_old, model_new.as_ref().unwrap())
-                    }
-                } else {
-                    (&model_old, &model_old)
+                    (&model1, &model0)
                 };
                 let mut game = Game::new(board);
                 let mut mcts_black = MCTS::new(
@@ -305,12 +280,12 @@ fn main() -> Result<()> {
                 };
 
                 let _ = save(&dir, &history, winner, board, input_plane, &sgf_root);
-                if mode == "eval" {
-                    let mut stat = stat.lock().unwrap();
-                    stat.game += 1;
-                    if (eval_odd && winner == 1) || (!eval_odd && winner == -1) {
-                        stat.eval_win += 1;
-                    }
+                let mut stat = stat.lock().unwrap();
+                stat.game += 1;
+                if (thread_id % 2 == 0 && winner == 1) || (thread_id % 2 == 1 && winner == -1) {
+                    stat.model0 += 1;
+                } else {
+                    stat.model1 += 1;
                 }
             }
         });
@@ -319,59 +294,20 @@ fn main() -> Result<()> {
     for h in handles {
         h.join().unwrap();
     }
-    if mode == "eval" {
-        let stat = stat.lock().unwrap();
-        println!(
-            "{} {}/{}",
-            model_old.model_id(),
-            stat.game - stat.eval_win,
-            stat.game
-        );
-        println!(
-            "{} {}/{}",
-            model_new.as_ref().unwrap().model_id(),
-            stat.eval_win,
-            stat.game
-        );
-        let rate = stat.eval_win as f32 / stat.game as f32;
-        println!("new model win rate {:.2}", rate);
-        let eval_threshold = std::env::var("EVAL_THRESHOLD")
-            .unwrap()
-            .parse::<f32>()
-            .unwrap();
-        if rate > eval_threshold {
-            let new_id = model_new.as_ref().unwrap().model_id();
-            let old_id = model_old.model_id();
-            fs::copy(
-                format!("eval/{}.pt", new_id),
-                format!("model/{}.pt", new_id),
-            )
-            .unwrap();
-            fs::copy(
-                format!("eval/{}.state", new_id),
-                format!("model/{}.state", new_id),
-            )
-            .unwrap();
-            use std::io::Write;
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("whr_history.csv")
-            {
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let mut log_data = String::new();
-                for _ in 0..(stat.game - stat.eval_win) {
-                    log_data.push_str(&format!("{},{},B,{}\n", old_id, new_id, time));
-                }
-                for _ in 0..stat.eval_win {
-                    log_data.push_str(&format!("{},{},W,{}\n", old_id, new_id, time));
-                }
-                let _ = file.write_all(log_data.as_bytes());
-            }
-        }
-    }
+    let stat = stat.lock().unwrap();
+    println!(
+        "{} {}/{} {:.2}",
+        model0.model_id(),
+        stat.model0,
+        stat.game,
+        stat.model0 as f32 / stat.game as f32
+    );
+    println!(
+        "{} {}/{} {:.2}",
+        model1.model_id(),
+        stat.model1,
+        stat.game,
+        stat.model1 as f32 / stat.game as f32
+    );
     Ok(())
 }

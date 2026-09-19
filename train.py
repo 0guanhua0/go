@@ -177,6 +177,7 @@ def main(args):
     trainer = Trainer()
     if args.init:
         trainer.save_model("model")
+        trainer.save_model("eval")
         sys.exit(0)
     trainer.load_model("model")
     train_dataset = StreamingDataset(args.data, BATCH)
